@@ -1,0 +1,133 @@
+## Ignore Visual Studio build artifacts, user-specific files, and tooling.
+
+# Build results
+[Bb]in/
+[Oo]bj/
+[Rr]elease*/
+[Dd]ebug*/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]*/
+
+# VS build logs
+*.log
+*.tlog
+*.wrn
+*.err
+
+# Visual Studio cache/options
+.vs/
+*.vc.db
+*.vc.opendb
+*.VC.db
+
+# NuGet
+*.nupkg
+*.snupkg
+**/packages/*
+!**/packages/build/
+!**/packages/repositories.config
+
+# Microsoft Visual Studio generated files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build outputs from C/C++ projects
+*.obj
+*.pch
+*.pdb
+*.ipdb
+*.idb
+*.ilk
+*.iobj
+*.log
+*.tlog
+*.lastbuildstate
+*.cachefile
+*.manifest
+*.sbr
+*.tlh
+*.tli
+*.tmp
+
+# Static and dynamic libraries
+*.lib
+*.dll
+*.exp
+
+# Executables
+*.exe
+*.app
+*.apk
+*.ipa
+
+# Installer packages
+*.msi
+*.msix
+*.msixupload
+*.appx
+*.appxupload
+
+# Test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.coverage
+*.coveragexml
+
+# ReSharper / Rider
+_ReSharper*/
+*.ReSharper
+*.DotSettings.user
+.idea/
+
+# Rider / IntelliJ
+*.iml
+.idea/
+
+# StyleCop
+StyleCopReport.xml
+
+# NCrunch
+_NCrunch_*
+.*crunch*.local.xml
+
+# TeamCity
+_TeamCity*
+
+# DotCover
+*.dotCover
+
+# CodeRush
+.cr/
+
+# NDepend
+NDependOut/
+
+# VS Code
+.vscode/
+
+# Publish output
+**/publish/
+**/PublishOutput/
+
+# Local configuration
+appsettings.*.local.json
+
+# Logs & crash dumps
+*.stackdump
+*.dmp
+logs/
+
+# DebugView logs (if you choose to persist them)
+*.dbgview.log
+
+# Temporary files
+*.tmp
+*.temp
+~$*
+*.bak
+*.orig
+
