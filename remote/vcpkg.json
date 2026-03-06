@@ -1,0 +1,8 @@
+{
+  "name": "remote",
+  "version": "1.0",
+  "description": "Remote desktop DLL",
+  "dependencies": [
+    "libjpeg-turbo"
+  ]
+}
