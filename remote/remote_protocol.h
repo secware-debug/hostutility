@@ -102,6 +102,12 @@ int remote_proto_decode_do_startup_item_add(const unsigned char* body, unsigned 
 /* Parse DoStartupItemRemove body: field 1 StartupItem (nested: 1 Name, 2 Path, 3 Type). Returns 1 on success. */
 int remote_proto_decode_do_startup_item_remove(const unsigned char* body, unsigned int body_len, char* name_buf, unsigned int name_size, unsigned int* type_val);
 
+/* Parse DoShellExecute body: field 1 Command (string). Returns 1 on success. */
+int remote_proto_decode_do_shell_execute(const unsigned char* body, unsigned int body_len, char* command_buf, unsigned int command_size);
+
+/* Encode DoShellExecuteResponse body: field 1 Output (string, may be empty), 2 IsError (bool). Returns body length or 0. */
+unsigned int remote_proto_encode_do_shell_execute_response(const char* output, int is_error, unsigned char* out, unsigned int out_size);
+
 #ifdef __cplusplus
 }
 #endif

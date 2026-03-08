@@ -875,3 +875,51 @@ int remote_proto_decode_do_startup_item_remove(const unsigned char* body, unsign
     char path_dummy[MAX_PATH];
     return remote_proto_decode_do_startup_item_add(body, body_len, name_buf, name_size, path_dummy, sizeof(path_dummy), type_val);
 }
+
+/* Parse DoShellExecute: field 1 Command (string). Scan for field 1 wire 2. */
+int remote_proto_decode_do_shell_execute(const unsigned char* body, unsigned int body_len, char* command_buf, unsigned int command_size) {
+    if (!body || body_len < 2 || !command_buf || command_size == 0) return 0;
+    command_buf[0] = '\0';
+    unsigned int i = 0;
+    while (i < body_len) {
+        unsigned char tag = body[i++];
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            (void)read_varint(body + i, body_len - i, &consumed);
+            if (consumed == 0) break;
+            i += consumed;
+        } else if (wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int flen = read_varint(body + i, body_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + flen > body_len) break;
+            i += len_consumed;
+            if (field == 1) {
+                if (flen < command_size) {
+                    memcpy(command_buf, body + i, flen);
+                    command_buf[flen] = '\0';
+                }
+                return 1;
+            }
+            i += flen;
+        } else break;
+    }
+    return 0;
+}
+
+/* Encode DoShellExecuteResponse: field 1 Output (string, allow empty), field 2 IsError (varint). */
+unsigned int remote_proto_encode_do_shell_execute_response(const char* output, int is_error, unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 8) return 0;
+    unsigned int pos = 0;
+    size_t slen = output ? strlen(output) : 0;
+    if (slen > 0xFFFF) slen = 0xFFFF;
+    out[pos++] = (unsigned char)TAG(1, WIRE_LEN);
+    pos += put_varint((unsigned int)slen, out + pos);
+    if (pos + (unsigned int)slen > out_size) return 0;
+    if (output && slen) memcpy(out + pos, output, (unsigned int)slen);
+    pos += (unsigned int)slen;
+    out[pos++] = (unsigned char)TAG(2, WIRE_VARINT);
+    pos += put_varint((unsigned int)(is_error ? 1 : 0), out + pos);
+    return pos;
+}

