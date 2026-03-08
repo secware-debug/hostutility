@@ -56,8 +56,8 @@ unsigned int remote_proto_encode_get_drives_response(unsigned char* out, unsigne
 /* Encode GetSystemInfoResponse body (field 1 repeated key-value). Returns body length or 0. */
 unsigned int remote_proto_encode_get_system_info_response(unsigned char* out, unsigned int out_size);
 
-/* Parse GetDesktop body (after IMessage subtype): fill quality and display_index. Returns 1 on success. */
-int remote_proto_decode_get_desktop(const unsigned char* body, unsigned int body_len, int* quality, int* display_index);
+/* Parse GetDesktop body (after IMessage subtype): fill quality, display_index, create_new. Returns 1 on success. */
+int remote_proto_decode_get_desktop(const unsigned char* body, unsigned int body_len, int* quality, int* display_index, int* create_new);
 
 /* Encode GetDesktopResponse body: Image (4-byte LE length + codec first frame), Quality, Monitor, Resolution. image_data = 4-byte length + image bytes. Returns body length or 0. */
 unsigned int remote_proto_encode_get_desktop_response(const unsigned char* image_data, unsigned int image_len, int quality, int monitor, int width, int height, unsigned char* out, unsigned int out_size);

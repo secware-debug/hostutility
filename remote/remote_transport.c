@@ -208,9 +208,7 @@ static int do_send(transport_state_t* t, const unsigned char* data, unsigned int
 
 int remote_transport_send(remote_transport_handle_t h, const unsigned char* data, unsigned int len) {
     if (!h || !data) return 0;
-    int ok = do_send((transport_state_t*)h, data, len);
-    remote_log("[transport] send %u bytes: %s", len, ok ? "OK" : "FAIL");
-    return ok;
+    return do_send((transport_state_t*)h, data, len);
 }
 
 static int do_recv_byte(transport_state_t* t, unsigned char* buf, unsigned int len) {
@@ -261,9 +259,7 @@ static int do_recv_byte(transport_state_t* t, unsigned char* buf, unsigned int l
 
 int remote_transport_recv(remote_transport_handle_t h, unsigned char* buf, unsigned int len) {
     if (!h || !buf) return 0;
-    int ok = do_recv_byte((transport_state_t*)h, buf, len);
-    remote_log("[transport] recv %u bytes: %s", len, ok ? "OK" : "FAIL");
-    return ok;
+    return do_recv_byte((transport_state_t*)h, buf, len);
 }
 
 void remote_transport_close(remote_transport_handle_t h) {

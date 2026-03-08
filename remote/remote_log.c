@@ -7,11 +7,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-#ifdef _DEBUG
-#define REMOTE_LOG_ENABLED 1
-#else
+/* Set to 1 for debug logging. Per-frame logs (loop, transport send/recv) significantly slow remote desktop. */
 #define REMOTE_LOG_ENABLED 0
-#endif
 
 #if REMOTE_LOG_ENABLED
 static char s_buf[512];

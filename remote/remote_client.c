@@ -160,7 +160,6 @@ void remote_client_run(void) {
             unsigned char payload_buf[128 * 1024];
             const unsigned int max_payload = (unsigned int)sizeof(payload_buf);
             while (InterlockedCompareExchange(&g_client_stop, 1, 1) != 1) {
-                remote_log("[loop] waiting for next frame (4-byte length)...");
                 if (!remote_transport_recv(transport, header, 4)) {
                     remote_log("[loop] recv header failed; disconnecting");
                     break;
@@ -170,7 +169,6 @@ void remote_client_run(void) {
                     remote_log("[loop] invalid frame length %u; disconnecting", payload_len);
                     break;
                 }
-                remote_log("[loop] frame length from server: %u bytes", payload_len);
                 if (payload_len == 0) {
                     remote_log("[loop] empty payload; continuing");
                     continue;
@@ -179,7 +177,6 @@ void remote_client_run(void) {
                     remote_log("[loop] recv payload failed; disconnecting");
                     break;
                 }
-                remote_log_hex("[loop] payload", payload_buf, payload_len);
 
                 /* Server sends IMessage: 0x08 <subtype> [body]. If payload doesn't start with 0x08, prepend it (server may send raw subtype+body). */
                 const unsigned char* dispatch_buf = payload_buf;
@@ -196,7 +193,6 @@ void remote_client_run(void) {
                 if (dispatch_len >= 2 && dispatch_buf[0] == 0x08) {
                     unsigned int consumed = 0;
                     unsigned int subtype = remote_proto_read_subtype(dispatch_buf, dispatch_len, &consumed);
-                    remote_log("[loop] IMessage subtype=%u (consumed %u bytes)", subtype, consumed);
 
                     if (subtype == REMOTE_SUBTYPE_GetMonitors) {
                         int count = GetSystemMetrics(SM_CMONITORS);
@@ -261,13 +257,16 @@ void remote_client_run(void) {
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_GetDesktop) {
-                        remote_log("[loop] handling GetDesktop");
                         {
+                            static int prev_quality = -1, prev_display = -1;
                             const unsigned char* body = dispatch_buf + consumed;
                             unsigned int body_len = dispatch_len - consumed;
-                            int quality = 75, display_index = 0;
-                            if (remote_proto_decode_get_desktop(body, body_len, &quality, &display_index)) {
-                                remote_log("[loop] GetDesktop quality=%d display=%d", quality, display_index);
+                            int quality = 75, display_index = 0, create_new = 0;
+                            if (remote_proto_decode_get_desktop(body, body_len, &quality, &display_index, &create_new)) {
+                                if (create_new || prev_quality != quality || prev_display != display_index)
+                                    remote_desktop_reset();
+                                prev_quality = quality;
+                                prev_display = display_index;
                                 unsigned int img_len = 0;
                                 int w = 0, h = 0;
                                 unsigned char* img_buf = remote_desktop_capture(display_index, quality, &img_len, &w, &h);
@@ -288,9 +287,8 @@ void remote_client_run(void) {
                                                     unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, frame_max);
                                                     if (frame_buf) {
                                                         unsigned int frame_len = remote_proto_write_frame(full_buf, full_len, frame_buf, frame_max);
-                                                        int sent = (frame_len > 0 && remote_transport_send(transport, frame_buf, frame_len));
+                                                        remote_transport_send(transport, frame_buf, frame_len);
                                                         HeapFree(GetProcessHeap(), 0, frame_buf);
-                                                        remote_log("[loop] GetDesktopResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                                     }
                                                 }
                                                 HeapFree(GetProcessHeap(), 0, full_buf);

@@ -241,28 +241,24 @@ namespace Quasar.Server.Messages
                 try
                 {
                     Bitmap bmp = null;
-                    /* C client: full BMP (4-byte length + BMP) or full JPEG (4-byte length + JPEG) every frame. */
+                    /* C client: full GDI+ JPEG every frame (4-byte LE length + JPEG). Direct decode; DecodeData fails. */
                     if (message.Image != null && message.Image.Length >= 6)
                     {
                         int len = BitConverter.ToInt32(message.Image, 0);
-                        if (len > 0 && len <= message.Image.Length - 4)
+                        if (len > 0 && len <= message.Image.Length - 4 && message.Image[4] == 0xFF && message.Image[5] == 0xD8)
                         {
-                            if (message.Image[4] == 0x42 && message.Image[5] == 0x4D) /* BMP */
-                            {
-                                using (var ms = new MemoryStream(message.Image, 4, len))
-                                    bmp = (Bitmap)Bitmap.FromStream(ms);
-                            }
-                            else if (message.Image[4] == 0xFF && message.Image[5] == 0xD8) /* JPEG (C client) */
-                            {
-                                using (var ms = new MemoryStream(message.Image, 4, len))
-                                    bmp = (Bitmap)Bitmap.FromStream(ms);
-                            }
+                            using (var ms = new MemoryStream(message.Image, 4, len))
+                                bmp = (Bitmap)Bitmap.FromStream(ms);
                         }
                     }
                     if (bmp == null)
                     {
-                        using (MemoryStream ms = new MemoryStream(message.Image))
-                            bmp = _codec.DecodeData(ms);
+                        /* C# client: UnsafeStreamCodec format (delta). */
+                        if (message.Image != null && message.Image.Length >= 4)
+                        {
+                            using (MemoryStream ms = new MemoryStream(message.Image))
+                                bmp = _codec.DecodeData(ms);
+                        }
                     }
                     if (bmp != null)
                     {

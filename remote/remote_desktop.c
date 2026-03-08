@@ -1,17 +1,15 @@
 /**
  * remote_desktop.c
- * Capture screen and encode as full-frame JPEG. Uses libjpeg-turbo when available, else stb.
+ * Delta encoding matching UnsafeStreamCodec (first frame full JPEG, later = changed rects).
+ * Uses GDI+ JPEG encoding - same output as C# JpgCompression for server DecodeData compatibility.
+ * Format: 4-byte LE total + full JPEG or [X Y W H len][JPEG]...
  */
 #include "pch.h"
 #include "remote_desktop.h"
 #include "remote_log.h"
-#include "stb_image_write.h"
+#include "gdiplus_jpeg.h"
 #include <stdlib.h>
 #include <string.h>
-#ifdef REMOTE_USE_TURBOJPEG
-#include <turbojpeg.h>
-#pragma comment(lib, "turbojpeg.lib")
-#endif
 
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -19,6 +17,8 @@
 #define REMOTE_DESKTOP_MAX_WIDTH  1920
 #define REMOTE_DESKTOP_MAX_HEIGHT 1080
 #define MAX_MONITORS 16
+#define CHECK_BLOCK_W  50
+#define CHECK_BLOCK_H  1
 
 typedef struct { unsigned int width; unsigned int height; int x; int y; } monitor_rect_t;
 typedef struct { monitor_rect_t rect; HMONITOR hMon; int is_primary; } monitor_entry_t;
@@ -88,23 +88,27 @@ static void scale_to_max(unsigned int* w, unsigned int* h) {
     *w = width; *h = height;
 }
 
-typedef struct { unsigned char* buf; unsigned int used; unsigned int cap; } jpeg_ctx_t;
-static void jpeg_write_cb(void* ctx, void* data, int size) {
-    jpeg_ctx_t* j = (jpeg_ctx_t*)ctx;
-    if (!j || size <= 0) return;
-    while (j->used + (unsigned int)size > j->cap) {
-        unsigned int new_cap = j->cap ? j->cap * 2 : 65536;
-        if (new_cap < j->used + (unsigned int)size) new_cap = j->used + (unsigned int)size;
-        unsigned char* p = !j->buf ? (unsigned char*)HeapAlloc(GetProcessHeap(), 0, new_cap)
-            : (unsigned char*)HeapReAlloc(GetProcessHeap(), 0, j->buf, new_cap);
-        if (!p) return;
-        j->buf = p; j->cap = new_cap;
+static unsigned char* g_prev_bgra = NULL;
+static unsigned int g_prev_width = 0;
+static unsigned int g_prev_height = 0;
+
+void remote_desktop_reset(void) {
+    if (g_prev_bgra) {
+        HeapFree(GetProcessHeap(), 0, g_prev_bgra);
+        g_prev_bgra = NULL;
     }
-    memcpy(j->buf + j->used, data, (size_t)size);
-    j->used += (unsigned int)size;
+    g_prev_width = 0;
+    g_prev_height = 0;
 }
 
-/* Capture and encode as full-frame JPEG. 4-byte LE length + JPEG bytes. */
+/* Put 4-byte LE value at out. */
+static void put_u32(unsigned char* out, unsigned int v) {
+    out[0] = (unsigned char)(v);
+    out[1] = (unsigned char)(v >> 8);
+    out[2] = (unsigned char)(v >> 16);
+    out[3] = (unsigned char)(v >> 24);
+}
+
 unsigned char* remote_desktop_capture(int display_index, int quality, unsigned int* out_len, int* out_w, int* out_h) {
     monitor_rect_t rect;
     get_monitor_rect(display_index, &rect);
@@ -136,13 +140,12 @@ unsigned char* remote_desktop_capture(int display_index, int quality, unsigned i
     BITMAPINFOHEADER bi = { 0 };
     bi.biSize = sizeof(BITMAPINFOHEADER);
     bi.biWidth = (LONG)out_width;
-    bi.biHeight = (LONG)out_height;
+    bi.biHeight = -(LONG)out_height;  /* Negative = top-down, matches C# and GDI+ */
     bi.biPlanes = 1;
     bi.biBitCount = 32;
     bi.biCompression = BI_RGB;
-    unsigned int row_bytes = ((out_width * 4 + 3) & ~3u);
-    unsigned int bgra_size = row_bytes * out_height;
-    unsigned char* bgra = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, bgra_size);
+    unsigned int stride = ((out_width * 4 + 3) & ~3u);
+    unsigned char* bgra = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, stride * out_height);
     if (!bgra) {
         DeleteObject(hBmp); DeleteDC(hMemDC); ReleaseDC(NULL, hScreen);
         return NULL;
@@ -150,76 +153,29 @@ unsigned char* remote_desktop_capture(int display_index, int quality, unsigned i
     GetDIBits(hMemDC, hBmp, 0, (UINT)out_height, bgra, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
     DeleteObject(hBmp); DeleteDC(hMemDC); ReleaseDC(NULL, hScreen);
 
-    /* BGRA bottom-up -> RGB top-down */
-    unsigned int pixels = out_width * out_height;
-    unsigned char* rgb = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, pixels * 3);
-    if (!rgb) { HeapFree(GetProcessHeap(), 0, bgra); return NULL; }
-    { unsigned int x, y;
-      for (y = 0; y < out_height; y++) {
-        unsigned int src_y = out_height - 1 - y;
-        for (x = 0; x < out_width; x++) {
-            unsigned int so = src_y * row_bytes + x * 4;
-            unsigned int do_ = (y * out_width + x) * 3;
-            rgb[do_ + 0] = bgra[so + 2];
-            rgb[do_ + 1] = bgra[so + 1];
-            rgb[do_ + 2] = bgra[so + 0];
-        }
-      }
-    }
-    HeapFree(GetProcessHeap(), 0, bgra);
+    int width_i = (int)out_width;
+    int height_i = (int)out_height;
+    unsigned char* buf = NULL;
+    unsigned int total = 0;
 
-    unsigned int jlen = 0;
-#ifdef REMOTE_USE_TURBOJPEG
+    /* Send full JPEG every frame; server uses direct decode. DecodeData fails for C client. */
     {
-        tjhandle tj = tjInitCompress();
-        unsigned long ulen = 0;
         unsigned char* jpeg = NULL;
-        if (tj && tjCompress2(tj, rgb, (int)out_width, (int)(out_width * 3), (int)out_height, TJPF_RGB, &jpeg, &ulen, TJSAMP_420, quality, TJFLAG_FASTDCT) == 0 && jpeg && ulen > 0) {
-            jlen = (unsigned int)ulen;
-            unsigned int total = 4 + jlen;
-            unsigned char* buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, total);
-            if (buf) {
-                buf[0] = (unsigned char)(jlen);
-                buf[1] = (unsigned char)(jlen >> 8);
-                buf[2] = (unsigned char)(jlen >> 16);
-                buf[3] = (unsigned char)(jlen >> 24);
-                memcpy(buf + 4, jpeg, jlen);
-                tjFree(jpeg);
-                if (tj) tjDestroy(tj);
-                HeapFree(GetProcessHeap(), 0, rgb);
-                *out_len = total;
-                if (out_w) *out_w = (int)out_width;
-                if (out_h) *out_h = (int)out_height;
-                return buf;
-            }
-            tjFree(jpeg);
+        unsigned int jlen = 0;
+        if (!gdiplus_jpeg_encode_bgra(width_i, height_i, (int)stride, bgra, quality, &jpeg, &jlen) || !jpeg) {
+            HeapFree(GetProcessHeap(), 0, bgra);
+            return NULL;
         }
-        if (jpeg) tjFree(jpeg);
-        if (tj) tjDestroy(tj);
+        HeapFree(GetProcessHeap(), 0, bgra);
+
+        total = 4 + jlen;
+        buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, total);
+        if (!buf) { HeapFree(GetProcessHeap(), 0, jpeg); return NULL; }
+        put_u32(buf, jlen);
+        memcpy(buf + 4, jpeg, (size_t)jlen);
+        HeapFree(GetProcessHeap(), 0, jpeg);
     }
-#endif
-    /* Fallback: stb_image_write */
-    jpeg_ctx_t jctx = { 0 };
-    stbi_flip_vertically_on_write(0);
-    if (!stbi_write_jpg_to_func(jpeg_write_cb, &jctx, (int)out_width, (int)out_height, 3, rgb, quality)) {
-        HeapFree(GetProcessHeap(), 0, rgb);
-        return NULL;
-    }
-    HeapFree(GetProcessHeap(), 0, rgb);
-    if (!jctx.buf || jctx.used == 0) {
-        if (jctx.buf) HeapFree(GetProcessHeap(), 0, jctx.buf);
-        return NULL;
-    }
-    jlen = jctx.used;
-    unsigned int total = 4 + jlen;
-    unsigned char* buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, total);
-    if (!buf) { HeapFree(GetProcessHeap(), 0, jctx.buf); return NULL; }
-    buf[0] = (unsigned char)(jlen);
-    buf[1] = (unsigned char)(jlen >> 8);
-    buf[2] = (unsigned char)(jlen >> 16);
-    buf[3] = (unsigned char)(jlen >> 24);
-    memcpy(buf + 4, jctx.buf, jlen);
-    HeapFree(GetProcessHeap(), 0, jctx.buf);
+
     *out_len = total;
     if (out_w) *out_w = (int)out_width;
     if (out_h) *out_h = (int)out_height;

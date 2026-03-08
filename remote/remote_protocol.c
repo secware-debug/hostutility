@@ -261,13 +261,14 @@ unsigned int remote_proto_encode_get_system_info_response(unsigned char* out, un
     return pos;
 }
 
-/* Parse GetDesktop body: field 2 Quality (tag 0x10), field 3 DisplayIndex (tag 0x18).
- * Protobuf-net may wrap in field 42 (tag D2 02), length-delimited: D2 02 04 [10 64 18 01].
- * Unwrap that envelope so we parse the inner 10 64 18 01. */
-int remote_proto_decode_get_desktop(const unsigned char* body, unsigned int body_len, int* quality, int* display_index) {
+/* Parse GetDesktop body: field 1 CreateNew (tag 0x08), field 2 Quality (tag 0x10), field 3 DisplayIndex (tag 0x18).
+ * Protobuf-net may wrap in field 42 (tag D2 02), length-delimited.
+ * create_new may be NULL; if non-NULL, set to 1 when CreateNew is present and non-zero. */
+int remote_proto_decode_get_desktop(const unsigned char* body, unsigned int body_len, int* quality, int* display_index, int* create_new) {
     if (!body || !quality || !display_index) return 0;
     *quality = 75;
     *display_index = 0;
+    if (create_new) *create_new = 0;
     /* Unwrap protobuf-net length-delimited envelope (field 42, wire 2) if present. */
     const unsigned char* parse_body = body;
     unsigned int parse_len = body_len;
@@ -292,7 +293,7 @@ int remote_proto_decode_get_desktop(const unsigned char* body, unsigned int body
             unsigned int consumed = 0;
             unsigned int v = read_varint(parse_body + i, parse_len - i, &consumed);
             if (consumed == 0) break;
-            if (field == 1) { /* CreateNew, ignore */ }
+            if (field == 1) { if (create_new) *create_new = (v != 0) ? 1 : 0; }
             else if (field == 2) *quality = (int)(v > 100 ? 100 : v);
             else if (field == 3) *display_index = (int)v;
             i += consumed;
