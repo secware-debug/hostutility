@@ -10,9 +10,11 @@
 #include "remote_client.h"
 #include "remote_log.h"
 #include "remote_desktop.h"
+#include <ShlObj.h>
 #include <Shellapi.h>
 #include <stdio.h>
 
+#pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #include <stdlib.h>
 #include <string.h>
@@ -322,6 +324,103 @@ void remote_client_run(void) {
                                     remote_log("[loop] GetProcessesResponse prepend_imessage failed");
                             } else
                                 remote_log("[loop] GetProcessesResponse encode failed");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoStartupItemAdd) {
+                        remote_log("[loop] handling DoStartupItemAdd");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            char name_buf[260], path_buf[MAX_PATH];
+                            unsigned int type_val = 0;
+                            if (remote_proto_decode_do_startup_item_add(body, body_len, name_buf, sizeof(name_buf), path_buf, sizeof(path_buf), &type_val)) {
+                                int ok = 0;
+                                HKEY hive = NULL;
+                                const char* key_path = NULL;
+                                switch (type_val) {
+                                    case 0: hive = HKEY_LOCAL_MACHINE; key_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"; break;
+                                    case 1: hive = HKEY_LOCAL_MACHINE; key_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"; break;
+                                    case 2: hive = HKEY_CURRENT_USER; key_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"; break;
+                                    case 3: hive = HKEY_CURRENT_USER; key_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"; break;
+                                    case 5: hive = HKEY_LOCAL_MACHINE; key_path = "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run"; break;
+                                    case 6: hive = HKEY_LOCAL_MACHINE; key_path = "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce"; break;
+                                    case 4: {
+                                        char startup_path[MAX_PATH];
+                                        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_STARTUP, NULL, 0, startup_path))) {
+                                            char lnk_path[MAX_PATH];
+                                            _snprintf_s(lnk_path, sizeof(lnk_path), _TRUNCATE, "%s\\%s.url", startup_path, name_buf);
+                                            FILE* f = NULL;
+                                            if (fopen_s(&f, lnk_path, "w") == 0 && f) {
+                                                char path_for_url[MAX_PATH];
+                                                size_t k;
+                                                for (k = 0; path_buf[k] && k < sizeof(path_for_url) - 1; k++)
+                                                    path_for_url[k] = (path_buf[k] == '\\') ? '/' : path_buf[k];
+                                                path_for_url[k] = '\0';
+                                                fprintf(f, "[InternetShortcut]\r\nURL=file:///%s\r\nIconIndex=0\r\nIconFile=%s\r\n", path_for_url, path_for_url);
+                                                fclose(f);
+                                                ok = 1;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    default: break;
+                                }
+                                if (key_path) {
+                                    HKEY hKey;
+                                    if (RegOpenKeyExA(hive, key_path, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                                        if (RegSetValueExA(hKey, name_buf, 0, REG_SZ, (const BYTE*)path_buf, (DWORD)(strlen(path_buf) + 1)) == ERROR_SUCCESS)
+                                            ok = 1;
+                                        RegCloseKey(hKey);
+                                    }
+                                }
+                                remote_log("[loop] DoStartupItemAdd result=%s", ok ? "OK" : "FAIL");
+                            } else {
+                                remote_log("[loop] DoStartupItemAdd decode failed (body_len=%u)", (unsigned)body_len);
+                                remote_log_hex("DoStartupItemAdd body", body, body_len > 64 ? 64 : body_len);
+                            }
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoStartupItemRemove) {
+                        remote_log("[loop] handling DoStartupItemRemove");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            char name_buf[260];
+                            unsigned int type_val = 0;
+                            if (remote_proto_decode_do_startup_item_remove(body, body_len, name_buf, sizeof(name_buf), &type_val)) {
+                                int ok = 0;
+                                HKEY hive = NULL;
+                                const char* key_path = NULL;
+                                switch (type_val) {
+                                    case 0: hive = HKEY_LOCAL_MACHINE; key_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"; break;
+                                    case 1: hive = HKEY_LOCAL_MACHINE; key_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"; break;
+                                    case 2: hive = HKEY_CURRENT_USER; key_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"; break;
+                                    case 3: hive = HKEY_CURRENT_USER; key_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"; break;
+                                    case 5: hive = HKEY_LOCAL_MACHINE; key_path = "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run"; break;
+                                    case 6: hive = HKEY_LOCAL_MACHINE; key_path = "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce"; break;
+                                    case 4: {
+                                        char startup_path[MAX_PATH];
+                                        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_STARTUP, NULL, 0, startup_path))) {
+                                            char full_path[MAX_PATH];
+                                            _snprintf_s(full_path, sizeof(full_path), _TRUNCATE, "%s\\%s", startup_path, name_buf);
+                                            if (DeleteFileA(full_path)) ok = 1;
+                                        }
+                                        break;
+                                    }
+                                    default: break;
+                                }
+                                if (key_path) {
+                                    HKEY hKey;
+                                    if (RegOpenKeyExA(hive, key_path, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                                        if (RegDeleteValueA(hKey, name_buf) == ERROR_SUCCESS) ok = 1;
+                                        RegCloseKey(hKey);
+                                    }
+                                }
+                                remote_log("[loop] DoStartupItemRemove result=%s", ok ? "OK" : "FAIL");
+                            } else {
+                                remote_log("[loop] DoStartupItemRemove decode failed (body_len=%u)", (unsigned)body_len);
+                                remote_log_hex("DoStartupItemRemove body", body, body_len > 64 ? 64 : body_len);
+                            }
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_GetStartupItems) {

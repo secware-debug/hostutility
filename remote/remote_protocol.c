@@ -809,3 +809,69 @@ unsigned int remote_proto_encode_do_process_response(int action, int result, uns
     pos += put_varint((unsigned int)(result ? 1 : 0), out + pos);
     return pos;
 }
+
+/* Parse StartupItem nested message: field 1 Name, 2 Path, 3 Type. Fills name_buf, path_buf, type_val. */
+static int parse_startup_item(const unsigned char* buf, unsigned int len, char* name_buf, unsigned int name_size, char* path_buf, unsigned int path_size, unsigned int* type_val) {
+    if (!buf || !name_buf || !name_size || !path_buf || !path_size || !type_val) return 0;
+    name_buf[0] = '\0';
+    path_buf[0] = '\0';
+    *type_val = 0;
+    unsigned int i = 0;
+    while (i + 2 <= len) {
+        unsigned char tag = buf[i++];
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(buf + i, len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 3) *type_val = v;
+            i += consumed;
+        } else if (wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int flen = read_varint(buf + i, len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + flen > len) break;
+            i += len_consumed;
+            if (field == 1) {
+                if (flen < name_size) { memcpy(name_buf, buf + i, flen); name_buf[flen] = '\0'; }
+            } else if (field == 2) {
+                if (flen < path_size) { memcpy(path_buf, buf + i, flen); path_buf[flen] = '\0'; }
+            }
+            i += flen;
+        } else break;
+    }
+    return (name_buf[0] != '\0') ? 1 : 0;
+}
+
+/* Parse DoStartupItemAdd: field 1 StartupItem (tag 0x0A). Scan for any field 1 wire 2 in body (protobuf field order may vary). */
+int remote_proto_decode_do_startup_item_add(const unsigned char* body, unsigned int body_len, char* name_buf, unsigned int name_size, char* path_buf, unsigned int path_size, unsigned int* type_val) {
+    if (!body || body_len < 2 || !name_buf || !path_buf || !type_val) return 0;
+    unsigned int i = 0;
+    while (i < body_len) {
+        unsigned char tag = body[i++];
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            (void)read_varint(body + i, body_len - i, &consumed);
+            if (consumed == 0) break;
+            i += consumed;
+        } else if (wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int flen = read_varint(body + i, body_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + flen > body_len) break;
+            i += len_consumed;
+            if (field == 1 && parse_startup_item(body + i, flen, name_buf, name_size, path_buf, path_size, type_val))
+                return 1;
+            i += flen;
+        } else break;
+    }
+    return 0;
+}
+
+/* Parse DoStartupItemRemove: field 1 StartupItem (0x0A len msg). */
+int remote_proto_decode_do_startup_item_remove(const unsigned char* body, unsigned int body_len, char* name_buf, unsigned int name_size, unsigned int* type_val) {
+    if (!body || body_len < 3 || !name_buf || !type_val) return 0;
+    char path_dummy[MAX_PATH];
+    return remote_proto_decode_do_startup_item_add(body, body_len, name_buf, name_size, path_dummy, sizeof(path_dummy), type_val);
+}

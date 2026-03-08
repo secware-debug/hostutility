@@ -96,6 +96,12 @@ int remote_proto_decode_do_process_start(const unsigned char* body, unsigned int
 /* Encode DoProcessResponse body: field 1 Action (0=Start, 1=End), 2 Result (0=false, 1=true). Returns body length or 0. */
 unsigned int remote_proto_encode_do_process_response(int action, int result, unsigned char* out, unsigned int out_size);
 
+/* Parse DoStartupItemAdd body: field 1 StartupItem (nested: 1 Name, 2 Path, 3 Type). Returns 1 on success. */
+int remote_proto_decode_do_startup_item_add(const unsigned char* body, unsigned int body_len, char* name_buf, unsigned int name_size, char* path_buf, unsigned int path_size, unsigned int* type_val);
+
+/* Parse DoStartupItemRemove body: field 1 StartupItem (nested: 1 Name, 2 Path, 3 Type). Returns 1 on success. */
+int remote_proto_decode_do_startup_item_remove(const unsigned char* body, unsigned int body_len, char* name_buf, unsigned int name_size, unsigned int* type_val);
+
 #ifdef __cplusplus
 }
 #endif
