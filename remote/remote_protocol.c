@@ -6,7 +6,11 @@
 #include "pch.h"
 #include "remote_protocol.h"
 #include "remote_log.h"
+#include <ShlObj.h>
 #include <stdio.h>
+
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
 #include <string.h>
 
 /* Prepend IMessage subtype (0x08 + varint) then copy body. Returns total length or 0. */
@@ -565,5 +569,103 @@ unsigned int remote_proto_encode_file_transfer_complete(int id, const char* file
     out[pos++] = (unsigned char)TAG(1, WIRE_VARINT);
     pos += put_varint((unsigned int)id, out + pos);
     pos += put_string(out + pos, out_size - pos, 2, file_path);
+    return pos;
+}
+
+/* StartupType enum (matches Quasar.Common.Enums.StartupType) */
+#define REMOTE_STARTUP_LocalMachineRun      0
+#define REMOTE_STARTUP_LocalMachineRunOnce  1
+#define REMOTE_STARTUP_CurrentUserRun       2
+#define REMOTE_STARTUP_CurrentUserRunOnce   3
+#define REMOTE_STARTUP_StartMenu            4
+#define REMOTE_STARTUP_LocalMachineRunX86   5
+#define REMOTE_STARTUP_LocalMachineRunOnceX86 6
+
+/* Put one StartupItem message. Returns byte count or 0. */
+static unsigned int put_startup_item(unsigned char* out, unsigned int out_size, const char* name, const char* path, unsigned int type_val) {
+    if (!out || out_size < 8) return 0;
+    unsigned char item_buf[1024];
+    unsigned int item_pos = 0;
+    unsigned int n;
+    n = put_string(item_buf + item_pos, sizeof(item_buf) - item_pos, 1, name);
+    if (n == 0) return 0;
+    item_pos += n;
+    n = put_string(item_buf + item_pos, sizeof(item_buf) - item_pos, 2, path);
+    if (n == 0) return 0;
+    item_pos += n;
+    item_buf[item_pos++] = (unsigned char)TAG(3, WIRE_VARINT);
+    item_pos += put_varint(type_val, item_buf + item_pos);
+    if (item_pos > out_size - 2) return 0;
+    unsigned int pos = 0;
+    out[pos++] = (unsigned char)TAG(1, WIRE_LEN);
+    pos += put_varint(item_pos, out + pos);
+    if (pos + item_pos > out_size) return 0;
+    memcpy(out + pos, item_buf, item_pos);
+    return pos + item_pos;
+}
+
+/* Enumerate registry key values, add each as StartupItem. key_path relative to hive. */
+static unsigned int add_registry_startup_items(HKEY hive, const char* key_path, unsigned int type_val,
+    unsigned char* out, unsigned int out_size, unsigned int* pos) {
+    HKEY hKey = NULL;
+    if (RegOpenKeyExA(hive, key_path, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return *pos;
+    char name_buf[512];
+    char value_buf[2048];
+    DWORD name_len, value_len;
+    DWORD i = 0;
+    while (1) {
+        name_len = (DWORD)sizeof(name_buf);
+        value_len = (DWORD)sizeof(value_buf);
+        if (RegEnumValueA(hKey, i, name_buf, &name_len, NULL, NULL, (LPBYTE)value_buf, &value_len) != ERROR_SUCCESS)
+            break;
+        name_buf[name_len < sizeof(name_buf) ? name_len : sizeof(name_buf) - 1] = '\0';
+        value_buf[value_len < sizeof(value_buf) ? value_len : sizeof(value_buf) - 1] = '\0';
+        unsigned int n = put_startup_item(out + *pos, out_size - *pos, name_buf, value_buf, type_val);
+        if (n == 0) break;
+        *pos += n;
+        i++;
+    }
+    RegCloseKey(hKey);
+    return *pos;
+}
+
+unsigned int remote_proto_encode_get_startup_items_response(unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 64) return 0;
+    unsigned int pos = 0;
+    add_registry_startup_items(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        REMOTE_STARTUP_LocalMachineRun, out, out_size, &pos);
+    add_registry_startup_items(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        REMOTE_STARTUP_LocalMachineRunOnce, out, out_size, &pos);
+    add_registry_startup_items(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        REMOTE_STARTUP_CurrentUserRun, out, out_size, &pos);
+    add_registry_startup_items(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        REMOTE_STARTUP_CurrentUserRunOnce, out, out_size, &pos);
+    add_registry_startup_items(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run",
+        REMOTE_STARTUP_LocalMachineRunX86, out, out_size, &pos);
+    add_registry_startup_items(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        REMOTE_STARTUP_LocalMachineRunOnceX86, out, out_size, &pos);
+    /* Startup folder */
+    {
+        char startup_path[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_STARTUP, NULL, 0, startup_path))) {
+            char search_path[MAX_PATH + 4];
+            _snprintf_s(search_path, sizeof(search_path), _TRUNCATE, "%s\\*", startup_path);
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA(search_path, &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    if (_stricmp(fd.cFileName, "desktop.ini") == 0) continue;
+                    char full_path[MAX_PATH];
+                    _snprintf_s(full_path, sizeof(full_path), _TRUNCATE, "%s\\%s", startup_path, fd.cFileName);
+                    unsigned int n = put_startup_item(out + pos, out_size - pos, fd.cFileName, full_path, REMOTE_STARTUP_StartMenu);
+                    if (n == 0) break;
+                    pos += n;
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+        }
+    }
     return pos;
 }

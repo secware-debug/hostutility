@@ -342,6 +342,48 @@ namespace Quasar.Server.Networking
             return true;
         }
 
+        /* Fallback: C client GetStartupItemsResponse = 08 3C (subtype 60) + field 1 repeated StartupItem (0x0A len msg). Each StartupItem: 0x0A Name, 0x12 Path, 0x18 Type. */
+        private static bool TryParseRawGetStartupItemsResponse(byte[] payload, int start, int length, out GetStartupItemsResponse result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 60) return false;
+            var items = new List<StartupItem>();
+            while (offset + 2 <= end && payload[offset] == 0x0A)
+            {
+                offset++;
+                if (!TryReadVarint(payload, ref offset, end, out int msgLen) || offset + msgLen > end) break;
+                int msgEnd = offset + msgLen;
+                string name = null, path = null;
+                int typeVal = 0;
+                while (offset < msgEnd)
+                {
+                    if (offset >= msgEnd) break;
+                    if (!TryReadVarint(payload, ref offset, msgEnd, out int tag)) break;
+                    int field = tag >> 3;
+                    int wire = tag & 7;
+                    if (wire == 0)
+                    {
+                        if (!TryReadVarint(payload, ref offset, msgEnd, out int v)) break;
+                        if (field == 3) typeVal = v;
+                        continue;
+                    }
+                    if (wire != 2) break;
+                    if (!TryReadVarint(payload, ref offset, msgEnd, out int len) || offset + len > msgEnd) break;
+                    string s = Encoding.UTF8.GetString(payload, offset, len);
+                    offset += len;
+                    if (field == 1) name = s;
+                    else if (field == 2) path = s;
+                }
+                if (name != null && path != null)
+                    items.Add(new StartupItem { Name = name, Path = path, Type = (StartupType)typeVal });
+                offset = msgEnd;
+            }
+            result = new GetStartupItemsResponse { StartupItems = items };
+            return true;
+        }
+
         /* Fallback: C client GetDesktopResponse = 08 2B (subtype 43) + field 1 Image (0x0A bytes) + field 2 Quality (0x10 varint) + field 3 Monitor (0x18 varint) + field 4 Resolution (0x22 len msg). */
         private static bool TryParseRawGetDesktopResponse(byte[] payload, int start, int length, out GetDesktopResponse result)
         {
@@ -849,6 +891,10 @@ namespace Quasar.Server.Networking
                                         else if (TryParseRawGetDirectoryResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawDir))
                                         {
                                             message = rawDir;
+                                        }
+                                        else if (TryParseRawGetStartupItemsResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawStartup))
+                                        {
+                                            message = rawStartup;
                                         }
                                         else if (TryParseRawGetDesktopResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawDesktop))
                                         {

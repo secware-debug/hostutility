@@ -81,6 +81,9 @@ unsigned int remote_proto_encode_file_transfer_chunk(int id, const char* file_pa
 /* Encode FileTransferComplete body: Id, FilePath. Returns body length or 0. */
 unsigned int remote_proto_encode_file_transfer_complete(int id, const char* file_path, unsigned char* out, unsigned int out_size);
 
+/* Collect startup items from registry + Startup folder, encode GetStartupItemsResponse body. Returns body length or 0. */
+unsigned int remote_proto_encode_get_startup_items_response(unsigned char* out, unsigned int out_size);
+
 #ifdef __cplusplus
 }
 #endif

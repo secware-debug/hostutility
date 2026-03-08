@@ -236,6 +236,26 @@ void remote_client_run(void) {
                                 remote_log("[loop] GetDrivesResponse encode failed (no drives?)");
                         }
                     }
+                    else if (subtype == REMOTE_SUBTYPE_GetStartupItems) {
+                        remote_log("[loop] handling GetStartupItems");
+                        {
+                            unsigned char resp_body[8192];
+                            unsigned int resp_body_len = remote_proto_encode_get_startup_items_response(resp_body, sizeof(resp_body));
+                            if (resp_body_len > 0) {
+                                unsigned char full_msg[8300];
+                                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg),
+                                    REMOTE_SUBTYPE_GetStartupItemsResponse, resp_body, resp_body_len);
+                                if (full_len > 0) {
+                                    unsigned char frame[8304];
+                                    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    remote_log("[loop] GetStartupItemsResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
+                                } else
+                                    remote_log("[loop] GetStartupItemsResponse prepend_imessage failed");
+                            } else
+                                remote_log("[loop] GetStartupItemsResponse encode failed");
+                        }
+                    }
                     else if (subtype == REMOTE_SUBTYPE_GetSystemInfo) {
                         remote_log("[loop] handling GetSystemInfo");
                         {
