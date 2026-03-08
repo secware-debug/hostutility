@@ -7,6 +7,7 @@
 #include "remote_protocol.h"
 #include "remote_log.h"
 #include <ShlObj.h>
+#include <TlHelp32.h>
 #include <stdio.h>
 
 #pragma comment(lib, "advapi32.lib")
@@ -667,5 +668,144 @@ unsigned int remote_proto_encode_get_startup_items_response(unsigned char* out, 
             }
         }
     }
+    return pos;
+}
+
+/* GetProcessesResponse: field 1 repeated Process. Process: field 1 Name (string), 2 Id (varint), 3 MainWindowTitle (string). */
+static unsigned int put_process_item(unsigned char* out, unsigned int out_size, const char* name, int pid, const char* main_window_title) {
+    if (!out || out_size < 16) return 0;
+    unsigned char item_buf[768];
+    unsigned int item_pos = 0;
+    unsigned int n;
+    n = put_string(item_buf + item_pos, sizeof(item_buf) - item_pos, 1, name);
+    if (n == 0) return 0;
+    item_pos += n;
+    item_buf[item_pos++] = (unsigned char)TAG(2, WIRE_VARINT);
+    item_pos += put_varint((unsigned int)(pid < 0 ? 0 : pid), item_buf + item_pos);
+    if (main_window_title && main_window_title[0]) {
+        n = put_string(item_buf + item_pos, sizeof(item_buf) - item_pos, 3, main_window_title);
+        if (n > 0) item_pos += n;
+    }
+    if (item_pos > out_size - 2) return 0;
+    unsigned int pos = 0;
+    out[pos++] = (unsigned char)TAG(1, WIRE_LEN);
+    pos += put_varint(item_pos, out + pos);
+    if (pos + item_pos > out_size) return 0;
+    memcpy(out + pos, item_buf, item_pos);
+    return pos + item_pos;
+}
+
+unsigned int remote_proto_encode_get_processes_response(unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 256) return 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+    unsigned int pos = 0;
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
+    if (Process32First(hSnap, &pe)) {
+        do {
+            char name_buf[260];
+            char title_buf[256];
+            WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, name_buf, (int)sizeof(name_buf), NULL, NULL);
+            name_buf[sizeof(name_buf) - 1] = '\0';
+            {
+                size_t name_len = strlen(name_buf);
+                if (name_len >= 4 && _stricmp(name_buf + name_len - 4, ".exe") != 0) {
+                    if (name_len + 4 < sizeof(name_buf)) {
+                        memcpy(name_buf + name_len, ".exe", 5);
+                    }
+                }
+            }
+            title_buf[0] = '\0';
+            {
+                HWND hwnd = NULL;
+                DWORD procId = pe.th32ProcessID;
+                WCHAR title_w[256];
+                while ((hwnd = FindWindowExW(NULL, hwnd, NULL, NULL)) != NULL) {
+                    DWORD wndPid;
+                    GetWindowThreadProcessId(hwnd, &wndPid);
+                    if (wndPid == procId) {
+                        if (GetWindowTextW(hwnd, title_w, 256) > 0)
+                            WideCharToMultiByte(CP_UTF8, 0, title_w, -1, title_buf, (int)sizeof(title_buf), NULL, NULL);
+                        title_buf[sizeof(title_buf) - 1] = '\0';
+                        break;
+                    }
+                }
+            }
+            unsigned int n = put_process_item(out + pos, out_size - pos, name_buf, (int)pe.th32ProcessID, title_buf[0] ? title_buf : NULL);
+            if (n == 0) break;
+            pos += n;
+        } while (Process32Next(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    return pos;
+}
+
+/* Parse DoProcessEnd: field 1 Pid (varint). */
+int remote_proto_decode_do_process_end(const unsigned char* body, unsigned int body_len, int* pid) {
+    if (!body || !pid || body_len < 2) return 0;
+    *pid = 0;
+    unsigned int i = 0;
+    while (i + 2 <= body_len) {
+        unsigned char tag = body[i++];
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(body + i, body_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 1) { *pid = (int)v; return 1; }
+            i += consumed;
+        } else if (wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int len = read_varint(body + i, body_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + len > body_len) break;
+            i += len_consumed + len;
+        } else break;
+    }
+    return 0;
+}
+
+/* Parse DoProcessStart: field 1 DownloadUrl (string), 2 FilePath (string), 3 IsUpdate (varint). */
+int remote_proto_decode_do_process_start(const unsigned char* body, unsigned int body_len, char* file_path_buf, unsigned int file_path_size, int* is_update) {
+    if (!body || !file_path_buf || !file_path_size || !is_update) return 0;
+    file_path_buf[0] = '\0';
+    *is_update = 0;
+    unsigned int i = 0;
+    while (i + 2 <= body_len) {
+        unsigned char tag = body[i++];
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(body + i, body_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 3) *is_update = (v != 0) ? 1 : 0;
+            i += consumed;
+        } else if (wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int len = read_varint(body + i, body_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + len > body_len) break;
+            i += len_consumed;
+            if (field == 2) {
+                if (len < file_path_size) {
+                    memcpy(file_path_buf, body + i, len);
+                    file_path_buf[len] = '\0';
+                }
+            }
+            i += len;
+        } else break;
+    }
+    return 1;
+}
+
+/* Encode DoProcessResponse: field 1 Action (varint), 2 Result (varint). */
+unsigned int remote_proto_encode_do_process_response(int action, int result, unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 8) return 0;
+    unsigned int pos = 0;
+    out[pos++] = (unsigned char)TAG(1, WIRE_VARINT);
+    pos += put_varint((unsigned int)(action < 0 ? 0 : (action > 1 ? 1 : action)), out + pos);
+    out[pos++] = (unsigned char)TAG(2, WIRE_VARINT);
+    pos += put_varint((unsigned int)(result ? 1 : 0), out + pos);
     return pos;
 }

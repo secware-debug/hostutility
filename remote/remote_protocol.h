@@ -84,6 +84,18 @@ unsigned int remote_proto_encode_file_transfer_complete(int id, const char* file
 /* Collect startup items from registry + Startup folder, encode GetStartupItemsResponse body. Returns body length or 0. */
 unsigned int remote_proto_encode_get_startup_items_response(unsigned char* out, unsigned int out_size);
 
+/* Enumerate processes, encode GetProcessesResponse body (field 1 repeated Process). Each Process: Name, Id, MainWindowTitle. Returns body length or 0. */
+unsigned int remote_proto_encode_get_processes_response(unsigned char* out, unsigned int out_size);
+
+/* Parse DoProcessEnd body (field 1 Pid). Returns 1 on success. */
+int remote_proto_decode_do_process_end(const unsigned char* body, unsigned int body_len, int* pid);
+
+/* Parse DoProcessStart body: field 1 DownloadUrl, 2 FilePath, 3 IsUpdate. Returns 1 on success. */
+int remote_proto_decode_do_process_start(const unsigned char* body, unsigned int body_len, char* file_path_buf, unsigned int file_path_size, int* is_update);
+
+/* Encode DoProcessResponse body: field 1 Action (0=Start, 1=End), 2 Result (0=false, 1=true). Returns body length or 0. */
+unsigned int remote_proto_encode_do_process_response(int action, int result, unsigned char* out, unsigned int out_size);
+
 #ifdef __cplusplus
 }
 #endif

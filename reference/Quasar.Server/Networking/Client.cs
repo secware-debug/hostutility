@@ -342,6 +342,77 @@ namespace Quasar.Server.Networking
             return true;
         }
 
+        /* Fallback: C client DoProcessResponse = 08 13 (subtype 19) + field 1 Action (varint), 2 Result (varint). */
+        private static bool TryParseRawDoProcessResponse(byte[] payload, int start, int length, out DoProcessResponse result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 19) return false;
+            int action = 0;
+            bool res = false;
+            while (offset < end)
+            {
+                if (!TryReadVarint(payload, ref offset, end, out int tag)) break;
+                int field = tag >> 3;
+                int wire = tag & 7;
+                if (wire == 0)
+                {
+                    if (!TryReadVarint(payload, ref offset, end, out int v)) break;
+                    if (field == 1) action = v;
+                    else if (field == 2) res = (v != 0);
+                    continue;
+                }
+                if (wire != 2) break;
+                if (!TryReadVarint(payload, ref offset, end, out int len) || offset + len > end) break;
+                offset += len;
+            }
+            result = new DoProcessResponse { Action = (ProcessAction)action, Result = res };
+            return true;
+        }
+
+        /* Fallback: C client GetProcessesResponse = 08 37 (subtype 55) + field 1 repeated Process (0x0A len msg). Each Process: 0x0A Name, 0x10 Id, 0x1A MainWindowTitle. */
+        private static bool TryParseRawGetProcessesResponse(byte[] payload, int start, int length, out GetProcessesResponse result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 55) return false;
+            var processes = new List<Common.Models.Process>();
+            while (offset + 2 <= end && payload[offset] == 0x0A)
+            {
+                offset++;
+                if (!TryReadVarint(payload, ref offset, end, out int msgLen) || offset + msgLen > end) break;
+                int msgEnd = offset + msgLen;
+                string name = null, mainWindowTitle = null;
+                int id = 0;
+                while (offset < msgEnd)
+                {
+                    if (offset >= msgEnd) break;
+                    if (!TryReadVarint(payload, ref offset, msgEnd, out int tag)) break;
+                    int field = tag >> 3;
+                    int wire = tag & 7;
+                    if (wire == 0)
+                    {
+                        if (!TryReadVarint(payload, ref offset, msgEnd, out int v)) break;
+                        if (field == 2) id = v;
+                        continue;
+                    }
+                    if (wire != 2) break;
+                    if (!TryReadVarint(payload, ref offset, msgEnd, out int len) || offset + len > msgEnd) break;
+                    string s = Encoding.UTF8.GetString(payload, offset, len);
+                    offset += len;
+                    if (field == 1) name = s;
+                    else if (field == 3) mainWindowTitle = s;
+                }
+                if (name != null)
+                    processes.Add(new Common.Models.Process { Name = name, Id = id, MainWindowTitle = mainWindowTitle ?? "" });
+                offset = msgEnd;
+            }
+            result = new GetProcessesResponse { Processes = processes.ToArray() };
+            return true;
+        }
+
         /* Fallback: C client GetStartupItemsResponse = 08 3C (subtype 60) + field 1 repeated StartupItem (0x0A len msg). Each StartupItem: 0x0A Name, 0x12 Path, 0x18 Type. */
         private static bool TryParseRawGetStartupItemsResponse(byte[] payload, int start, int length, out GetStartupItemsResponse result)
         {
@@ -891,6 +962,14 @@ namespace Quasar.Server.Networking
                                         else if (TryParseRawGetDirectoryResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawDir))
                                         {
                                             message = rawDir;
+                                        }
+                                        else if (TryParseRawDoProcessResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawDoProcess))
+                                        {
+                                            message = rawDoProcess;
+                                        }
+                                        else if (TryParseRawGetProcessesResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawProcesses))
+                                        {
+                                            message = rawProcesses;
                                         }
                                         else if (TryParseRawGetStartupItemsResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawStartup))
                                         {
