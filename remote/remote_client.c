@@ -22,6 +22,7 @@
 #include <string.h>
 
 static volatile long g_client_stop = 0;
+static volatile long g_request_reconnect = 0;
 
 /* Single active upload slot (server uploading file to client). */
 typedef struct { int id; HANDLE hFile; char path[MAX_PATH]; long long fileSize; long long transferred; int active; } upload_slot_t;
@@ -167,6 +168,10 @@ void remote_client_run(void) {
             unsigned char payload_buf[128 * 1024];
             const unsigned int max_payload = (unsigned int)sizeof(payload_buf);
             while (InterlockedCompareExchange(&g_client_stop, 1, 1) != 1) {
+                if (InterlockedCompareExchange(&g_request_reconnect, 1, 1) == 1) {
+                    remote_log("[loop] reconnect requested; breaking to reconnect");
+                    break;
+                }
                 if (!remote_transport_recv(transport, header, 4)) {
                     remote_log("[loop] recv header failed; disconnecting");
                     break;
@@ -405,6 +410,28 @@ void remote_client_run(void) {
                             } else
                                 remote_log("[loop] GetConnectionsResponse encode failed");
                         }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoAskElevate) {
+                        remote_log("[loop] handling DoAskElevate");
+                        if (!IsUserAnAdmin()) {
+                            char exe_path[MAX_PATH];
+                            if (GetModuleFileNameA(NULL, exe_path, MAX_PATH) && exe_path[0]) {
+                                HINSTANCE r = ShellExecuteA(NULL, "runas", exe_path, NULL, NULL, SW_HIDE);
+                                if ((UINT_PTR)r > 32) {
+                                    InterlockedExchange(&g_client_stop, 1);
+                                    remote_transport_close(transport);
+                                }
+                            }
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoClientDisconnect) {
+                        remote_log("[loop] handling DoClientDisconnect");
+                        InterlockedExchange(&g_client_stop, 1);
+                        remote_transport_close(transport);
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoClientReconnect) {
+                        remote_log("[loop] handling DoClientReconnect");
+                        InterlockedExchange(&g_request_reconnect, 1);
                     }
                     else if (subtype == REMOTE_SUBTYPE_DoShutdownAction) {
                         remote_log("[loop] handling DoShutdownAction");
@@ -816,9 +843,14 @@ void remote_client_run(void) {
         }
         upload_close();
         remote_transport_close(transport);
-        /* Reconnect: do not break; continue to retry connection so client reconnects when viewer is restarted. */
-        remote_log("[reconnect] disconnected; reconnecting in 5s...");
-        Sleep(5000);
+        /* Reconnect: continue to retry connection. Shorter delay if reconnect was requested. */
+        if (InterlockedCompareExchange(&g_request_reconnect, 0, 1) == 1) {
+            remote_log("[reconnect] reconnect requested; reconnecting in 1s...");
+            Sleep(1000);
+        } else {
+            remote_log("[reconnect] disconnected; reconnecting in 5s...");
+            Sleep(5000);
+        }
         continue;
     }
 }
