@@ -8,10 +8,15 @@
 #include "remote_log.h"
 #include <ShlObj.h>
 #include <TlHelp32.h>
+#include <iphlpapi.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <stdio.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 #include <string.h>
 
 /* Prepend IMessage subtype (0x08 + varint) then copy body. Returns total length or 0. */
@@ -922,4 +927,168 @@ unsigned int remote_proto_encode_do_shell_execute_response(const char* output, i
     out[pos++] = (unsigned char)TAG(2, WIRE_VARINT);
     pos += put_varint((unsigned int)(is_error ? 1 : 0), out + pos);
     return pos;
+}
+
+/* GetConnectionsResponse: field 1 repeated TcpConnection. Each: 1 ProcessName, 2 LocalAddress, 3 LocalPort, 4 RemoteAddress, 5 RemotePort, 6 State. */
+static unsigned int put_tcp_connection(unsigned char* out, unsigned int out_size, const char* process_name,
+    const char* local_addr, unsigned int local_port, const char* remote_addr, unsigned int remote_port, unsigned int state) {
+    if (!out || out_size < 64) return 0;
+    unsigned char conn_buf[512];
+    unsigned int conn_pos = 0;
+    unsigned int n;
+    n = put_string(conn_buf + conn_pos, sizeof(conn_buf) - conn_pos, 1, process_name);
+    if (!n) return 0;
+    conn_pos += n;
+    n = put_string(conn_buf + conn_pos, sizeof(conn_buf) - conn_pos, 2, local_addr);
+    if (!n) return 0;
+    conn_pos += n;
+    conn_buf[conn_pos++] = (unsigned char)TAG(3, WIRE_VARINT);
+    conn_pos += put_varint(local_port, conn_buf + conn_pos);
+    n = put_string(conn_buf + conn_pos, sizeof(conn_buf) - conn_pos, 4, remote_addr);
+    if (!n) return 0;
+    conn_pos += n;
+    conn_buf[conn_pos++] = (unsigned char)TAG(5, WIRE_VARINT);
+    conn_pos += put_varint(remote_port, conn_buf + conn_pos);
+    conn_buf[conn_pos++] = (unsigned char)TAG(6, WIRE_VARINT);
+    conn_pos += put_varint(state, conn_buf + conn_pos);
+    unsigned int pos = 0;
+    out[pos++] = (unsigned char)TAG(1, WIRE_LEN);
+    pos += put_varint(conn_pos, out + pos);
+    if (pos + conn_pos > out_size) return 0;
+    memcpy(out + pos, conn_buf, conn_pos);
+    return pos + conn_pos;
+}
+
+unsigned int remote_proto_encode_get_connections_response(unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 256) return 0;
+    DWORD size = 0;
+    if (GetExtendedTcpTable(NULL, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER)
+        return 0;
+    MIB_TCPTABLE_OWNER_PID* table = (MIB_TCPTABLE_OWNER_PID*)HeapAlloc(GetProcessHeap(), 0, size);
+    if (!table) return 0;
+    if (GetExtendedTcpTable(table, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
+        HeapFree(GetProcessHeap(), 0, table);
+        return 0;
+    }
+    unsigned int pos = 0;
+    char local_ip[32], remote_ip[32];
+    char process_name[260];
+    DWORD i;
+    for (i = 0; i < table->dwNumEntries && pos + 600 < out_size; i++) {
+        MIB_TCPROW_OWNER_PID* row = &table->table[i];
+        struct in_addr la, ra;
+        la.S_un.S_addr = row->dwLocalAddr;
+        ra.S_un.S_addr = row->dwRemoteAddr;
+        InetNtopA(AF_INET, &la, local_ip, sizeof(local_ip));
+        InetNtopA(AF_INET, &ra, remote_ip, sizeof(remote_ip));
+        unsigned short lp = ntohs((u_short)(row->dwLocalPort & 0xFFFF));
+        unsigned short rp = ntohs((u_short)(row->dwRemotePort & 0xFFFF));
+        _snprintf_s(process_name, sizeof(process_name), _TRUNCATE, "PID: %u", (unsigned)row->dwOwningPid);
+        {
+            char full_path[MAX_PATH];
+            DWORD len = (DWORD)sizeof(full_path);
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, row->dwOwningPid);
+            if (h && QueryFullProcessImageNameA(h, 0, full_path, &len) && len > 0) {
+                const char* base = strrchr(full_path, '\\');
+                base = base ? base + 1 : full_path;
+                if (*base) _snprintf_s(process_name, sizeof(process_name), _TRUNCATE, "%s", base);
+            }
+            if (h) CloseHandle(h);
+        }
+        unsigned int conn_len = put_tcp_connection(out + pos, out_size - pos, process_name, local_ip, lp, remote_ip, rp, (unsigned)row->dwState);
+        if (conn_len == 0) break;
+        pos += conn_len;
+    }
+    HeapFree(GetProcessHeap(), 0, table);
+    return pos;
+}
+
+/* Parse DoCloseConnection: field 1 LocalAddress (string), 2 LocalPort (varint), 3 RemoteAddress (string), 4 RemotePort (varint).
+ * Server may wrap in field 8 (0x42) length-delimited envelope; unwrap if present. */
+int remote_proto_decode_do_close_connection(const unsigned char* body, unsigned int body_len,
+    char* local_addr_buf, unsigned int local_addr_size, unsigned short* local_port,
+    char* remote_addr_buf, unsigned int remote_addr_size, unsigned short* remote_port) {
+    if (!body || body_len < 2 || !local_addr_buf || !local_port || !remote_addr_buf || !remote_port) return 0;
+    local_addr_buf[0] = '\0';
+    remote_addr_buf[0] = '\0';
+    *local_port = 0;
+    *remote_port = 0;
+    /* Unwrap field 8 (0x42) envelope if present */
+    const unsigned char* parse = body;
+    unsigned int parse_len = body_len;
+    if (body_len >= 3 && body[0] == 0x42) {
+        unsigned int len_consumed = 0;
+        unsigned int inner_len = read_varint(body + 1, body_len - 1, &len_consumed);
+        if (len_consumed > 0 && 1 + len_consumed + inner_len <= body_len) {
+            parse = body + 1 + len_consumed;
+            parse_len = inner_len;
+        }
+    }
+    unsigned int i = 0;
+    while (i < parse_len) {
+        unsigned char tag = parse[i++];
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(parse + i, parse_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 2) *local_port = (unsigned short)(v & 0xFFFF);
+            else if (field == 4) *remote_port = (unsigned short)(v & 0xFFFF);
+            i += consumed;
+        } else if (wire == 5) {
+            if (i + 4 > parse_len) break;
+            if (field == 2) *local_port = (unsigned short)(parse[i] | (parse[i+1] << 8));
+            else if (field == 4) *remote_port = (unsigned short)(parse[i] | (parse[i+1] << 8));
+            i += 4;
+        } else if (wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int flen = read_varint(parse + i, parse_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + flen > parse_len) break;
+            i += len_consumed;
+            if (field == 1) {
+                if (flen < local_addr_size) { memcpy(local_addr_buf, parse + i, flen); local_addr_buf[flen] = '\0'; }
+            } else if (field == 3) {
+                if (flen < remote_addr_size) { memcpy(remote_addr_buf, parse + i, flen); remote_addr_buf[flen] = '\0'; }
+            }
+            i += flen;
+        } else break;
+    }
+    return (local_addr_buf[0] != '\0' && remote_addr_buf[0] != '\0') ? 1 : 0;
+}
+
+/* Close TCP connection: find row matching local+remote, set state to DELETE_TCB, call SetTcpEntry. Requires admin. */
+int remote_proto_close_tcp_connection(const char* local_addr, unsigned short local_port, const char* remote_addr, unsigned short remote_port) {
+    if (!local_addr || !remote_addr) return 0;
+    struct in_addr la, ra;
+    if (InetPtonA(AF_INET, local_addr, &la) != 1 || InetPtonA(AF_INET, remote_addr, &ra) != 1) return 0;
+    DWORD dwLocalAddr = la.S_un.S_addr;
+    DWORD dwRemoteAddr = ra.S_un.S_addr;
+    DWORD size = 0;
+    if (GetExtendedTcpTable(NULL, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER) return 0;
+    MIB_TCPTABLE_OWNER_PID* table = (MIB_TCPTABLE_OWNER_PID*)HeapAlloc(GetProcessHeap(), 0, size);
+    if (!table) return 0;
+    if (GetExtendedTcpTable(table, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
+        HeapFree(GetProcessHeap(), 0, table);
+        return 0;
+    }
+    int ok = 0;
+    DWORD i;
+    for (i = 0; i < table->dwNumEntries; i++) {
+        MIB_TCPROW_OWNER_PID* row = &table->table[i];
+        unsigned short lp = ntohs((u_short)(row->dwLocalPort & 0xFFFF));
+        unsigned short rp = ntohs((u_short)(row->dwRemotePort & 0xFFFF));
+        if (row->dwLocalAddr == dwLocalAddr && row->dwRemoteAddr == dwRemoteAddr && lp == local_port && rp == remote_port) {
+            MIB_TCPROW tcprow;
+            tcprow.dwState = MIB_TCP_STATE_DELETE_TCB;
+            tcprow.dwLocalAddr = row->dwLocalAddr;
+            tcprow.dwLocalPort = row->dwLocalPort;
+            tcprow.dwRemoteAddr = row->dwRemoteAddr;
+            tcprow.dwRemotePort = row->dwRemotePort;
+            if (SetTcpEntry(&tcprow) == NO_ERROR) ok = 1;
+            break;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, table);
+    return ok;
 }

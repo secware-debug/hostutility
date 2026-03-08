@@ -379,6 +379,69 @@ void remote_client_run(void) {
                                 remote_log("[loop] GetProcessesResponse encode failed");
                         }
                     }
+                    else if (subtype == REMOTE_SUBTYPE_GetConnections) {
+                        remote_log("[loop] handling GetConnections");
+                        {
+                            unsigned char resp_body[65536];
+                            unsigned int resp_body_len = remote_proto_encode_get_connections_response(resp_body, sizeof(resp_body));
+                            if (resp_body_len > 0) {
+                                unsigned char* full_msg = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 8 + resp_body_len);
+                                if (full_msg) {
+                                    unsigned int full_len = remote_proto_prepend_imessage(full_msg, 8 + resp_body_len,
+                                        REMOTE_SUBTYPE_GetConnectionsResponse, resp_body, resp_body_len);
+                                    if (full_len > 0) {
+                                        unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
+                                        if (frame_buf) {
+                                            unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
+                                            int sent = (frame_len > 0 && remote_transport_send(transport, frame_buf, frame_len));
+                                            HeapFree(GetProcessHeap(), 0, frame_buf);
+                                            remote_log("[loop] GetConnectionsResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
+                                        }
+                                    }
+                                    HeapFree(GetProcessHeap(), 0, full_msg);
+                                }
+                            } else
+                                remote_log("[loop] GetConnectionsResponse encode failed");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoCloseConnection) {
+                        remote_log("[loop] handling DoCloseConnection");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            char local_addr[64], remote_addr[64];
+                            unsigned short local_port = 0, remote_port = 0;
+                            if (remote_proto_decode_do_close_connection(body, body_len,
+                                    local_addr, sizeof(local_addr), &local_port,
+                                    remote_addr, sizeof(remote_addr), &remote_port)) {
+                                int ok = remote_proto_close_tcp_connection(local_addr, local_port, remote_addr, remote_port);
+                                remote_log("[loop] DoCloseConnection result=%s (admin required)", ok ? "OK" : "FAIL");
+                                if (ok) {
+                                    unsigned char resp_body[65536];
+                                    unsigned int resp_body_len = remote_proto_encode_get_connections_response(resp_body, sizeof(resp_body));
+                                    if (resp_body_len > 0) {
+                                        unsigned char* full_msg = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 8 + resp_body_len);
+                                        if (full_msg) {
+                                            unsigned int full_len = remote_proto_prepend_imessage(full_msg, 8 + resp_body_len,
+                                                REMOTE_SUBTYPE_GetConnectionsResponse, resp_body, resp_body_len);
+                                            if (full_len > 0) {
+                                                unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
+                                                if (frame_buf) {
+                                                    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
+                                                    remote_transport_send(transport, frame_buf, frame_len);
+                                                    HeapFree(GetProcessHeap(), 0, frame_buf);
+                                                }
+                                            }
+                                            HeapFree(GetProcessHeap(), 0, full_msg);
+                                        }
+                                    }
+                                }
+                            } else {
+                                remote_log("[loop] DoCloseConnection decode failed (body_len=%u)", (unsigned)body_len);
+                                remote_log_hex("DoCloseConnection body", body, body_len > 64 ? 64 : body_len);
+                            }
+                        }
+                    }
                     else if (subtype == REMOTE_SUBTYPE_DoStartupItemAdd) {
                         remote_log("[loop] handling DoStartupItemAdd");
                         {

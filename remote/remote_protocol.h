@@ -108,6 +108,17 @@ int remote_proto_decode_do_shell_execute(const unsigned char* body, unsigned int
 /* Encode DoShellExecuteResponse body: field 1 Output (string, may be empty), 2 IsError (bool). Returns body length or 0. */
 unsigned int remote_proto_encode_do_shell_execute_response(const char* output, int is_error, unsigned char* out, unsigned int out_size);
 
+/* Enumerate TCP connections via GetExtendedTcpTable, encode GetConnectionsResponse body. Returns body length or 0. */
+unsigned int remote_proto_encode_get_connections_response(unsigned char* out, unsigned int out_size);
+
+/* Parse DoCloseConnection body: field 1 LocalAddress, 2 LocalPort, 3 RemoteAddress, 4 RemotePort. Returns 1 on success. */
+int remote_proto_decode_do_close_connection(const unsigned char* body, unsigned int body_len,
+    char* local_addr_buf, unsigned int local_addr_size, unsigned short* local_port,
+    char* remote_addr_buf, unsigned int remote_addr_size, unsigned short* remote_port);
+
+/* Close TCP connection by setting state to DELETE_TCB. Requires admin. Returns 1 on success. */
+int remote_proto_close_tcp_connection(const char* local_addr, unsigned short local_port, const char* remote_addr, unsigned short remote_port);
+
 #ifdef __cplusplus
 }
 #endif

