@@ -119,6 +119,9 @@ int remote_proto_decode_do_close_connection(const unsigned char* body, unsigned 
 /* Close TCP connection by setting state to DELETE_TCB. Requires admin. Returns 1 on success. */
 int remote_proto_close_tcp_connection(const char* local_addr, unsigned short local_port, const char* remote_addr, unsigned short remote_port);
 
+/* Parse DoShutdownAction body: field 1 Action (varint). 0=Shutdown, 1=Restart, 2=Standby. Returns 1 on success. */
+int remote_proto_decode_do_shutdown_action(const unsigned char* body, unsigned int body_len, unsigned int* action);
+
 #ifdef __cplusplus
 }
 #endif

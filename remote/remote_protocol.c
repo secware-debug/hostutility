@@ -1092,3 +1092,45 @@ int remote_proto_close_tcp_connection(const char* local_addr, unsigned short loc
     HeapFree(GetProcessHeap(), 0, table);
     return ok;
 }
+
+/* Parse DoShutdownAction: field 1 Action (varint). Unwrap field 8 (0x42) envelope if present. */
+int remote_proto_decode_do_shutdown_action(const unsigned char* body, unsigned int body_len, unsigned int* action) {
+    if (!body || body_len < 1 || !action) return 0;
+    *action = 0;
+    const unsigned char* parse = body;
+    unsigned int parse_len = body_len;
+    if (body_len >= 3 && body[0] == 0x42) {
+        unsigned int len_consumed = 0;
+        unsigned int inner_len = read_varint(body + 1, body_len - 1, &len_consumed);
+        if (len_consumed > 0 && 1 + len_consumed + inner_len <= body_len) {
+            parse = body + 1 + len_consumed;
+            parse_len = inner_len;
+        }
+    }
+    unsigned int i = 0;
+    while (i < parse_len) {
+        unsigned char tag = parse[i++];
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(parse + i, parse_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 1) { *action = (v <= 2) ? v : 0; return 1; }
+            i += consumed;
+        } else if (wire == 5 && i + 4 <= parse_len) {
+            if (field == 1) {
+                unsigned int v = (unsigned int)(parse[i] | (parse[i+1]<<8) | (parse[i+2]<<16) | (parse[i+3]<<24));
+                *action = (v <= 2) ? v : 0;
+                return 1;
+            }
+            i += 4;
+        } else if (wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int flen = read_varint(parse + i, parse_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + flen > parse_len) break;
+            i += len_consumed + flen;
+        } else break;
+    }
+    return 0;
+}

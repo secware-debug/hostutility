@@ -12,10 +12,12 @@
 #include "remote_desktop.h"
 #include <ShlObj.h>
 #include <Shellapi.h>
+#include <PowrProf.h>
 #include <stdio.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "powrprof.lib")
 #include <stdlib.h>
 #include <string.h>
 
@@ -402,6 +404,27 @@ void remote_client_run(void) {
                                 }
                             } else
                                 remote_log("[loop] GetConnectionsResponse encode failed");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoShutdownAction) {
+                        remote_log("[loop] handling DoShutdownAction");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            unsigned int action = 0;
+                            if (remote_proto_decode_do_shutdown_action(body, body_len, &action)) {
+                                switch (action) {
+                                    case 0: /* Shutdown */
+                                        ShellExecuteA(NULL, "open", "shutdown", "/s /t 0", NULL, SW_HIDE);
+                                        break;
+                                    case 1: /* Restart */
+                                        ShellExecuteA(NULL, "open", "shutdown", "/r /t 0", NULL, SW_HIDE);
+                                        break;
+                                    case 2: /* Standby */
+                                        SetSuspendState(FALSE, TRUE, TRUE);
+                                        break;
+                                }
+                            }
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_DoCloseConnection) {
