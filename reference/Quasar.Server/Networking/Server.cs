@@ -1,4 +1,4 @@
-﻿using Quasar.Common.Extensions;
+using Quasar.Common.Extensions;
 using Quasar.Common.Messages;
 using System;
 using System.Collections.Generic;
@@ -217,6 +217,8 @@ namespace Quasar.Server.Networking
         {
             ServerCertificate = serverCertificate;
             TypeRegistry.AddTypesToSerializer(typeof(IMessage), TypeRegistry.GetPacketTypes(typeof(IMessage)).ToArray());
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoInitKernelInput), 121);
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(KernelInputInitResponse), 122);
         }
 
         /// <summary>

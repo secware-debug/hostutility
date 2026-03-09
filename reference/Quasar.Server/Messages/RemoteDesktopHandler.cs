@@ -126,16 +126,32 @@ namespace Quasar.Server.Messages
         private UnsafeStreamCodec _codec;
 
         /// <summary>
+        /// Input injection mode: User (SendInput) or Kernel (interception driver).
+        /// </summary>
+        public RemoteControlMode InputMode { get; set; }
+
+        private volatile bool _pendingKernelInit;
+        private int _pendingQuality;
+        private int _pendingDisplay;
+
+        /// <summary>
+        /// Raised when Kernel mode init fails on the client. Handler runs on UI thread. Form should show error and revert start.
+        /// </summary>
+        public event Action<string> KernelInitFailed;
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="RemoteDesktopHandler"/> class using the given client.
         /// </summary>
         /// <param name="client">The associated client.</param>
-        public RemoteDesktopHandler(Client client) : base(true)
+        /// <param name="inputMode">How to inject keyboard/mouse input on the client (User or Kernel).</param>
+        public RemoteDesktopHandler(Client client, RemoteControlMode inputMode = RemoteControlMode.User) : base(true)
         {
             _client = client;
+            InputMode = inputMode;
         }
 
         /// <inheritdoc />
-        public override bool CanExecute(IMessage message) => message is GetDesktopResponse || message is GetMonitorsResponse;
+        public override bool CanExecute(IMessage message) => message is GetDesktopResponse || message is GetMonitorsResponse || message is KernelInputInitResponse;
 
         /// <inheritdoc />
         public override bool CanExecuteFrom(ISender sender) => _client.Equals(sender);
@@ -151,11 +167,15 @@ namespace Quasar.Server.Messages
                 case GetMonitorsResponse m:
                     Execute(sender, m);
                     break;
+                case KernelInputInitResponse k:
+                    Execute(sender, k);
+                    break;
             }
         }
 
         /// <summary>
         /// Begins receiving frames from the client using the specified quality and display.
+        /// For Kernel mode: first sends DoInitKernelInput and waits for KernelInputInitResponse. On failure, raises KernelInitFailed.
         /// </summary>
         /// <param name="quality">The quality of the remote desktop frames.</param>
         /// <param name="display">The display to receive frames from.</param>
@@ -163,11 +183,22 @@ namespace Quasar.Server.Messages
         {
             lock (_syncLock)
             {
-                IsStarted = true;
                 RequestedQuality = quality;
                 RequestedDisplayIndex = display;
                 _codec?.Dispose();
                 _codec = null;
+
+                if (InputMode == RemoteControlMode.Kernel)
+                {
+                    _pendingKernelInit = true;
+                    _pendingQuality = quality;
+                    _pendingDisplay = display;
+                    _client.Send(new DoInitKernelInput());
+                    return;
+                }
+
+                IsStarted = true;
+                _client.Send(new DoSetRemoteControlMode { Mode = InputMode });
                 _client.Send(new GetDesktop { CreateNew = true, Quality = quality, DisplayIndex = display });
             }
         }
@@ -192,6 +223,15 @@ namespace Quasar.Server.Messages
         }
 
         /// <summary>
+        /// Sets the input injection mode and notifies the client. Call when switching between User/Kernel.
+        /// </summary>
+        public void SetInputMode(RemoteControlMode mode)
+        {
+            InputMode = mode;
+            _client.Send(new DoSetRemoteControlMode { Mode = mode });
+        }
+
+        /// <summary>
         /// Sends a mouse event to the specified display of the client.
         /// </summary>
         /// <param name="mouseAction">The mouse action to send.</param>
@@ -203,14 +243,18 @@ namespace Quasar.Server.Messages
         {
             lock (_syncLock)
             {
+                if (_codec == null || _codec.Resolution == null) return;
+                var local = LocalResolution;
+                if (local.Width <= 0 || local.Height <= 0) return;
                 _client.Send(new DoMouseEvent
                 {
                     Action = mouseAction,
                     IsMouseDown = isMouseDown,
                     // calculate remote width & height
-                    X = x * _codec.Resolution.Width / LocalResolution.Width,
-                    Y = y * _codec.Resolution.Height / LocalResolution.Height,
-                    MonitorIndex = displayIndex
+                    X = x * _codec.Resolution.Width / local.Width,
+                    Y = y * _codec.Resolution.Height / local.Height,
+                    MonitorIndex = displayIndex,
+                    Mode = InputMode
                 });
             }
         }
@@ -222,7 +266,7 @@ namespace Quasar.Server.Messages
         /// <param name="keyDown">Indicates whether it's a keydown or keyup event.</param>
         public void SendKeyboardEvent(byte keyCode, bool keyDown)
         {
-            _client.Send(new DoKeyboardEvent {Key = keyCode, KeyDown = keyDown});
+            _client.Send(new DoKeyboardEvent {Key = keyCode, KeyDown = keyDown, Mode = InputMode});
         }
 
         private void Execute(ISender client, GetDesktopResponse message)
@@ -281,6 +325,31 @@ namespace Quasar.Server.Messages
         private void Execute(ISender client, GetMonitorsResponse message)
         {
             OnDisplaysChanged(message.Number);
+        }
+
+        private void Execute(ISender client, KernelInputInitResponse message)
+        {
+            lock (_syncLock)
+            {
+                if (!_pendingKernelInit) return;
+                _pendingKernelInit = false;
+
+                if (message.Success)
+                {
+                    IsStarted = true;
+                    _client.Send(new DoSetRemoteControlMode { Mode = InputMode });
+                    _client.Send(new GetDesktop { CreateNew = true, Quality = _pendingQuality, DisplayIndex = _pendingDisplay });
+                    return;
+                }
+
+                string err = string.IsNullOrEmpty(message.ErrorMessage)
+                    ? "Interception driver initialization failed (driver not installed, wrong bitness, or insufficient privileges)."
+                    : message.ErrorMessage;
+                SynchronizationContext.Post(_ =>
+                {
+                    KernelInitFailed?.Invoke((string)_);
+                }, err);
+            }
         }
 
         /// <summary>

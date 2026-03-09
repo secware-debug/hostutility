@@ -1,4 +1,4 @@
-﻿using ProtoBuf;
+using ProtoBuf;
 using Quasar.Common.Enums;
 
 namespace Quasar.Common.Messages
@@ -20,5 +20,9 @@ namespace Quasar.Common.Messages
 
         [ProtoMember(5)]
         public int MonitorIndex { get; set; }
+
+        /// <summary>0=User (SendInput), 1=Kernel (interception). Used for this event if present.</summary>
+        [ProtoMember(6)]
+        public RemoteControlMode Mode { get; set; }
     }
 }

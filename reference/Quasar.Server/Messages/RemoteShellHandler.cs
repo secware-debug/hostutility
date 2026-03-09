@@ -1,4 +1,4 @@
-﻿using Quasar.Common.Messages;
+using Quasar.Common.Messages;
 using Quasar.Common.Networking;
 using Quasar.Server.Networking;
 
@@ -75,6 +75,7 @@ namespace Quasar.Server.Messages
         /// <param name="command">The command to execute.</param>
         public void SendCommand(string command)
         {
+            if (string.IsNullOrWhiteSpace(command)) return;
             _client.Send(new DoShellExecute {Command = command});
         }
 

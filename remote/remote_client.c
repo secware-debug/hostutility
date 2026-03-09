@@ -10,6 +10,7 @@
 #include "remote_client.h"
 #include "remote_log.h"
 #include "remote_desktop.h"
+#include "remote_input_interception.h"
 #include <ShlObj.h>
 #include <Shellapi.h>
 #include <PowrProf.h>
@@ -48,6 +49,10 @@ static void restore_input_desktop(input_desktop_scope_t* s) {
 
 static volatile long g_client_stop = 0;
 static volatile long g_request_reconnect = 0;
+/* 0=User (SendInput/mouse_event/keybd_event), 1=Kernel (interception driver). Set by DoSetRemoteControlMode. */
+static volatile int g_remote_control_mode = 0;
+/* Throttle input-path log for mouse move to avoid spam. */
+static DWORD g_last_mouse_path_log_tick = 0;
 
 /* Single active upload slot (server uploading file to client). */
 typedef struct { int id; HANDLE hFile; char path[MAX_PATH]; long long fileSize; long long transferred; int active; } upload_slot_t;
@@ -263,12 +268,42 @@ void remote_client_run(void) {
                                 remote_log("[loop] GetMonitorsResponse encode failed");
                         }
                     }
+                    else if (subtype == REMOTE_SUBTYPE_DoInitKernelInput) {
+                        remote_log("[loop] handling DoInitKernelInput (Start with Kernel mode)");
+                        int ok = remote_input_interception_init();
+                        const char* err = ok ? "" : "Interception driver init failed (driver not installed, wrong bitness, or insufficient privileges).";
+                        {
+                            unsigned char resp_body[256];
+                            unsigned int resp_body_len = remote_proto_encode_kernel_input_init_response(ok, err, resp_body, sizeof(resp_body));
+                            if (resp_body_len > 0) {
+                                unsigned char full_msg[320];
+                                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg),
+                                    REMOTE_SUBTYPE_KernelInputInitResponse, resp_body, resp_body_len);
+                                if (full_len > 0) {
+                                    unsigned char frame[324];
+                                    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    remote_log("[loop] KernelInputInitResponse sent: success=%d, send %s", ok, sent ? "OK" : "FAIL");
+                                }
+                            }
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoSetRemoteControlMode) {
+                        unsigned int mode = 0;
+                        if (remote_proto_decode_do_set_remote_control_mode(dispatch_buf + consumed, dispatch_len - consumed, &mode)) {
+                            g_remote_control_mode = (int)mode;
+                            remote_log("[loop] DoSetRemoteControlMode: mode=%s (interception init done earlier on Start)", mode ? "Kernel (interception)" : "User (SendInput)");
+                        } else {
+                            remote_log("[loop] DoSetRemoteControlMode decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
+                            remote_log_hex("DoSetRemoteControlMode body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
+                        }
+                    }
                     else if (subtype == REMOTE_SUBTYPE_DoMouseEvent) {
                         remote_log("[loop] handling DoMouseEvent (body_len=%u)", (unsigned)(dispatch_len - consumed));
                         remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
                         unsigned int act = 0;
-                        int is_down = 0, mx = 0, my = 0, mon = 0;
-                        if (remote_proto_decode_do_mouse_event(dispatch_buf + consumed, dispatch_len - consumed, &act, &is_down, &mx, &my, &mon)) {
+                        int is_down = 0, mx = 0, my = 0, mon = 0, evt_mode = -1;
+                        if (remote_proto_decode_do_mouse_event(dispatch_buf + consumed, dispatch_len - consumed, &act, &is_down, &mx, &my, &mon, &evt_mode)) {
                             int mon_x = 0, mon_y = 0;
                             unsigned int mon_w = 0, mon_h = 0;
                             remote_desktop_get_monitor_bounds(mon, &mon_x, &mon_y, &mon_w, &mon_h);
@@ -277,21 +312,43 @@ void remote_client_run(void) {
                             remote_log("[loop] DoMouseEvent decoded: act=%u is_down=%d mx=%d my=%d mon=%d -> px=%d py=%d (mon_bounds x=%d y=%d w=%u h=%u)",
                                 act, is_down, mx, my, mon, px, py, mon_x, mon_y, mon_w, mon_h);
 
-                            input_desktop_scope_t scope = switch_to_input_desktop();
-                            if (act == 4) {
-                                SetCursorPos(px, py);
-                            } else {
-                                SetCursorPos(px, py);
-                                if (act == 0 || act == 1)
-                                    mouse_event(is_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-                                else if (act == 2 || act == 3)
-                                    mouse_event(is_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
-                                else if (act == 5)
-                                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, 120, 0);
-                                else if (act == 6)
-                                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)-120, 0);
+                            int effective_mode = (evt_mode >= 0) ? evt_mode : (int)g_remote_control_mode;
+                            {
+                                int use_kernel = (effective_mode == 1 && remote_input_interception_is_ready());
+                                DWORD now = GetTickCount();
+                                int do_log = (act != 4) || (now - g_last_mouse_path_log_tick > 2000);
+                                if (do_log) {
+                                    g_last_mouse_path_log_tick = now;
+                                    remote_log("[loop] DoMouseEvent -> input via %s", use_kernel ? "Kernel (interception driver)" : "User (SetCursorPos/mouse_event)");
+                                }
                             }
-                            if (scope.to_close) restore_input_desktop(&scope);
+                            if (effective_mode == 1 && remote_input_interception_is_ready()) {
+                                if (act == 4)
+                                    remote_input_interception_mouse_move(px, py);
+                                else {
+                                    remote_input_interception_mouse_move(px, py);
+                                    if (act == 0 || act == 1) remote_input_interception_mouse_button(0, is_down);
+                                    else if (act == 2 || act == 3) remote_input_interception_mouse_button(1, is_down);
+                                    else if (act == 5) remote_input_interception_mouse_wheel(120);
+                                    else if (act == 6) remote_input_interception_mouse_wheel(-120);
+                                }
+                            } else {
+                                input_desktop_scope_t scope = switch_to_input_desktop();
+                                if (act == 4) {
+                                    SetCursorPos(px, py);
+                                } else {
+                                    SetCursorPos(px, py);
+                                    if (act == 0 || act == 1)
+                                        mouse_event(is_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                                    else if (act == 2 || act == 3)
+                                        mouse_event(is_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+                                    else if (act == 5)
+                                        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, 120, 0);
+                                    else if (act == 6)
+                                        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)-120, 0);
+                                }
+                                if (scope.to_close) restore_input_desktop(&scope);
+                            }
                         } else {
                             remote_log("[loop] DoMouseEvent decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
                             remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
@@ -301,12 +358,20 @@ void remote_client_run(void) {
                         remote_log("[loop] handling DoKeyboardEvent (body_len=%u)", (unsigned)(dispatch_len - consumed));
                         remote_log_hex("DoKeyboardEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
                         unsigned char key = 0;
-                        int key_down = 0;
-                        if (remote_proto_decode_do_keyboard_event(dispatch_buf + consumed, dispatch_len - consumed, &key, &key_down)) {
-                            remote_log("[loop] DoKeyboardEvent decoded: key=%u (0x%02X) key_down=%d", (unsigned)key, (unsigned)key, key_down);
-                            input_desktop_scope_t scope = switch_to_input_desktop();
-                            keybd_event((BYTE)key, 0, key_down ? 0 : KEYEVENTF_KEYUP, 0);
-                            if (scope.to_close) restore_input_desktop(&scope);
+                        int key_down = 0, evt_mode = -1;
+                        if (remote_proto_decode_do_keyboard_event(dispatch_buf + consumed, dispatch_len - consumed, &key, &key_down, &evt_mode)) {
+                            int effective_mode = (evt_mode >= 0) ? evt_mode : (int)g_remote_control_mode;
+                            remote_log("[loop] DoKeyboardEvent decoded: key=%u (0x%02X) key_down=%d mode=%d", (unsigned)key, (unsigned)key, key_down, effective_mode);
+                            if (effective_mode == 1 && remote_input_interception_is_ready()) {
+                                remote_log("[loop] DoKeyboardEvent -> input via Kernel (interception driver)");
+                                remote_input_interception_key(key, key_down);
+                            } else {
+                                remote_log("[loop] DoKeyboardEvent -> input via User (keybd_event) [mode=%d interception_ready=%d]",
+                                    effective_mode, remote_input_interception_is_ready());
+                                input_desktop_scope_t scope = switch_to_input_desktop();
+                                keybd_event((BYTE)key, 0, key_down ? 0 : KEYEVENTF_KEYUP, 0);
+                                if (scope.to_close) restore_input_desktop(&scope);
+                            }
                         } else {
                             remote_log("[loop] DoKeyboardEvent decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
                             remote_log_hex("DoKeyboardEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
@@ -442,8 +507,10 @@ void remote_client_run(void) {
                                         HeapFree(GetProcessHeap(), 0, full_msg);
                                     }
                                 }
-                            } else
-                                remote_log("[loop] DoShellExecute decode failed");
+                            } else {
+                                remote_log("[loop] DoShellExecute decode failed (body_len=%u)", (unsigned)body_len);
+                                remote_log_hex("DoShellExecute body", body, body_len);
+                            }
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_GetProcesses) {

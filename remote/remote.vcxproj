@@ -148,6 +148,8 @@
     <ClInclude Include="remote_client.h" />
     <ClInclude Include="remote_log.h" />
     <ClInclude Include="remote_desktop.h" />
+    <ClInclude Include="remote_input_interception.h" />
+    <ClInclude Include="interception\interception.h" />
     <ClInclude Include="gdiplus_jpeg.h" />
     <ClInclude Include="stb_image_write.h" />
   </ItemGroup>
@@ -172,6 +174,12 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="remote_desktop.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="interception\interception_api.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="remote_input_interception.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="gdiplus_jpeg.cpp" />

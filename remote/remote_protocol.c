@@ -19,6 +19,10 @@
 #pragma comment(lib, "ws2_32.lib")
 #include <string.h>
 
+/* Forward declaration for unwrap used by decoders below. */
+static void unwrap_optional_42(const unsigned char* body, unsigned int body_len,
+    const unsigned char** parse, unsigned int* parse_len);
+
 /* Prepend IMessage subtype (0x08 + varint) then copy body. Returns total length or 0. */
 unsigned int remote_proto_prepend_imessage(unsigned char* out, unsigned int out_size, unsigned int subtype_index, const unsigned char* body, unsigned int body_len) {
     if (!out || out_size < 2) return 0;
@@ -893,28 +897,47 @@ int remote_proto_decode_do_startup_item_remove(const unsigned char* body, unsign
     return remote_proto_decode_do_startup_item_add(body, body_len, name_buf, name_size, path_dummy, sizeof(path_dummy), type_val);
 }
 
-/* Parse DoShellExecute: field 1 Command (string). Scan for field 1 wire 2. */
+/* Parse DoShellExecute: field 1 Command (string). Unwrap 0x42 only. Do NOT unwrap BA/6A - they can
+ * contain multiple top-level fields (e.g. BA 01 02 08 01 = field 23 + field 1). Parse top-level directly. */
 int remote_proto_decode_do_shell_execute(const unsigned char* body, unsigned int body_len, char* command_buf, unsigned int command_size) {
-    if (!body || body_len < 2 || !command_buf || command_size == 0) return 0;
+    if (!body || body_len < 1 || !command_buf || command_size == 0) return 0;
     command_buf[0] = '\0';
+    const unsigned char* parse = body;
+    unsigned int parse_len = body_len;
+    unwrap_optional_42(body, body_len, &parse, &parse_len);
+    /* Direct field 1 (0x0A) string: common when no wrapper. */
+    if (parse_len >= 2 && parse[0] == 0x0A) {
+        unsigned int len_consumed = 0;
+        unsigned int flen = read_varint(parse + 1, parse_len - 1, &len_consumed);
+        if (len_consumed > 0 && 1u + len_consumed + flen <= parse_len && flen < command_size) {
+            memcpy(command_buf, parse + 1 + len_consumed, flen);
+            command_buf[flen] = '\0';
+            return 1;
+        }
+    }
     unsigned int i = 0;
-    while (i < body_len) {
-        unsigned char tag = body[i++];
+    while (i < parse_len) {
+        unsigned char tag = parse[i++];
         unsigned int wire = tag & 7;
         unsigned int field = tag >> 3;
         if (wire == 0) {
             unsigned int consumed = 0;
-            (void)read_varint(body + i, body_len - i, &consumed);
+            unsigned int v = read_varint(parse + i, parse_len - i, &consumed);
             if (consumed == 0) break;
+            if (field == 1) {
+                /* Server may send Command as varint 0/1 for empty (protobuf-net quirk). */
+                command_buf[0] = '\0';
+                return 1;
+            }
             i += consumed;
         } else if (wire == 2) {
             unsigned int len_consumed = 0;
-            unsigned int flen = read_varint(body + i, body_len - i, &len_consumed);
-            if (len_consumed == 0 || i + len_consumed + flen > body_len) break;
+            unsigned int flen = read_varint(parse + i, parse_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + flen > parse_len) break;
             i += len_consumed;
             if (field == 1) {
                 if (flen < command_size) {
-                    memcpy(command_buf, body + i, flen);
+                    memcpy(command_buf, parse + i, flen);
                     command_buf[flen] = '\0';
                 }
                 return 1;
@@ -938,6 +961,23 @@ unsigned int remote_proto_encode_do_shell_execute_response(const char* output, i
     pos += (unsigned int)slen;
     out[pos++] = (unsigned char)TAG(2, WIRE_VARINT);
     pos += put_varint((unsigned int)(is_error ? 1 : 0), out + pos);
+    return pos;
+}
+
+unsigned int remote_proto_encode_kernel_input_init_response(int success, const char* error_message, unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 16) return 0;
+    unsigned int pos = 0;
+    out[pos++] = (unsigned char)TAG(1, WIRE_VARINT);
+    pos += put_varint((unsigned int)(success ? 1 : 0), out + pos);
+    size_t slen = error_message ? strlen(error_message) : 0;
+    if (slen > 0xFFFF) slen = 0xFFFF;
+    if (slen > 0) {
+        out[pos++] = (unsigned char)TAG(2, WIRE_LEN);
+        pos += put_varint((unsigned int)slen, out + pos);
+        if (pos + (unsigned int)slen > out_size) return 0;
+        memcpy(out + pos, error_message, (unsigned int)slen);
+        pos += (unsigned int)slen;
+    }
     return pos;
 }
 
@@ -1084,11 +1124,11 @@ static void unwrap_optional_42(const unsigned char* body, unsigned int body_len,
     }
 }
 
-/* Parse DoMouseEvent: Action, IsMouseDown, X, Y, MonitorIndex. */
+/* Parse DoMouseEvent: Action, IsMouseDown, X, Y, MonitorIndex, Mode. */
 int remote_proto_decode_do_mouse_event(const unsigned char* body, unsigned int body_len,
-    unsigned int* action, int* is_mouse_down, int* x, int* y, int* monitor_index) {
-    if (!body || body_len < 1 || !action || !is_mouse_down || !x || !y || !monitor_index) return 0;
-    *action = 0; *is_mouse_down = 0; *x = 0; *y = 0; *monitor_index = 0;
+    unsigned int* action, int* is_mouse_down, int* x, int* y, int* monitor_index, int* mode) {
+    if (!body || body_len < 1 || !action || !is_mouse_down || !x || !y || !monitor_index || !mode) return 0;
+    *action = 0; *is_mouse_down = 0; *x = 0; *y = 0; *monitor_index = 0; *mode = -1;
     const unsigned char* parse; unsigned int parse_len;
     unwrap_optional_42(body, body_len, &parse, &parse_len);
     /* Some serializers wrap the actual DoMouseEvent message in field 15 (tag 0x7A). Unwrap if present. */
@@ -1113,10 +1153,11 @@ int remote_proto_decode_do_mouse_event(const unsigned char* body, unsigned int b
             else if (field == 3) *x = (int)(v & 0x7FFFFFFFu);
             else if (field == 4) *y = (int)(v & 0x7FFFFFFFu);
             else if (field == 5) *monitor_index = (int)(v & 0x7FFFFFFFu);
+            else if (field == 6) *mode = (v <= 1) ? (int)v : -1;
             i += consumed;
         } else if (wire == 5 && i + 4 <= parse_len) {
             unsigned int v = (unsigned int)(parse[i]|(parse[i+1]<<8)|(parse[i+2]<<16)|(parse[i+3]<<24));
-            if (field == 1) *action = v; else if (field == 3) *x = (int)v; else if (field == 4) *y = (int)v; else if (field == 5) *monitor_index = (int)v;
+            if (field == 1) *action = v; else if (field == 3) *x = (int)v; else if (field == 4) *y = (int)v; else if (field == 5) *monitor_index = (int)v; else if (field == 6) *mode = (v <= 1) ? (int)v : -1;
             i += 4;
         } else if (wire == 2) {
             unsigned int lc = 0, flen = read_varint(parse + i, parse_len - i, &lc);
@@ -1127,10 +1168,10 @@ int remote_proto_decode_do_mouse_event(const unsigned char* body, unsigned int b
     return 1;
 }
 
-/* Parse DoKeyboardEvent: Key, KeyDown. */
-int remote_proto_decode_do_keyboard_event(const unsigned char* body, unsigned int body_len, unsigned char* key, int* key_down) {
-    if (!body || body_len < 1 || !key || !key_down) return 0;
-    *key = 0; *key_down = 0;
+/* Parse DoKeyboardEvent: Key, KeyDown, Mode. */
+int remote_proto_decode_do_keyboard_event(const unsigned char* body, unsigned int body_len, unsigned char* key, int* key_down, int* mode) {
+    if (!body || body_len < 1 || !key || !key_down || !mode) return 0;
+    *key = 0; *key_down = 0; *mode = -1;
     const unsigned char* parse; unsigned int parse_len;
     unwrap_optional_42(body, body_len, &parse, &parse_len);
     /* Some serializers wrap the actual DoKeyboardEvent message in field 13 (tag 0x6A). Unwrap if present. */
@@ -1152,6 +1193,7 @@ int remote_proto_decode_do_keyboard_event(const unsigned char* body, unsigned in
             if (consumed == 0) break;
             if (field == 1) *key = (unsigned char)(v & 0xFF);
             else if (field == 2) *key_down = (v != 0);
+            else if (field == 3) *mode = (v <= 1) ? (int)v : -1;
             i += consumed;
         } else if (wire == 2) {
             unsigned int lc = 0, flen = read_varint(parse + i, parse_len - i, &lc);
@@ -1196,6 +1238,40 @@ int remote_proto_close_tcp_connection(const char* local_addr, unsigned short loc
     }
     HeapFree(GetProcessHeap(), 0, table);
     return ok;
+}
+
+/* Parse DoSetRemoteControlMode: field 1 Mode (0=User, 1=Kernel). Unwrap 0x42 or field 29 envelope if present. */
+int remote_proto_decode_do_set_remote_control_mode(const unsigned char* body, unsigned int body_len, unsigned int* mode) {
+    if (!body || body_len < 1 || !mode) return 0;
+    *mode = 0;
+    const unsigned char* parse = body;
+    unsigned int parse_len = body_len;
+    unwrap_optional_42(body, body_len, &parse, &parse_len);
+    if (parse_len >= 2 && parse[0] == 0xE8) {
+        unsigned int len_consumed = 0;
+        unsigned int inner_len = read_varint(parse + 1, parse_len - 1, &len_consumed);
+        if (len_consumed > 0 && 1u + len_consumed + inner_len <= parse_len) {
+            parse = parse + 1 + len_consumed;
+            parse_len = inner_len;
+        }
+    }
+    unsigned int i = 0;
+    while (i < parse_len) {
+        unsigned char tag = parse[i++];
+        unsigned int wire = tag & 7, field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(parse + i, parse_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 1) { *mode = (v <= 1) ? v : 0; return 1; }
+            i += consumed;
+        } else if (wire == 2) {
+            unsigned int lc = 0, flen = read_varint(parse + i, parse_len - i, &lc);
+            if (lc == 0 || i + lc + flen > parse_len) break;
+            i += lc + flen;
+        } else break;
+    }
+    return 0;
 }
 
 /* Parse DoShutdownAction: field 1 Action (varint). Unwrap field 8 (0x42) envelope if present. */

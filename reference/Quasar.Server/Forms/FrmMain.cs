@@ -643,7 +643,17 @@ namespace Quasar.Server.Forms
         {
             foreach (Client c in GetSelectedClients())
             {
-                var frmRd = FrmRemoteDesktop.CreateNewOrGetExisting(c);
+                var frmRd = FrmRemoteDesktop.CreateNewOrGetExisting(c, RemoteControlMode.User);
+                frmRd.Show();
+                frmRd.Focus();
+            }
+        }
+
+        private void remoteDesktopKernelToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            foreach (Client c in GetSelectedClients())
+            {
+                var frmRd = FrmRemoteDesktop.CreateNewOrGetExisting(c, RemoteControlMode.Kernel);
                 frmRd.Show();
                 frmRd.Focus();
             }

@@ -40,14 +40,33 @@ namespace Quasar.Common.Messages
         }
 
         /// <summary>
+        /// Adds a type with an explicit subtype number. Use for extension messages (e.g. C client protocol) to avoid shifting existing indices.
+        /// </summary>
+        public static void AddTypeWithExplicitSubtype(Type parent, Type type, int fieldNumber)
+        {
+            if (type == null || parent == null)
+                throw new ArgumentNullException();
+            if (RuntimeTypeModel.Default[parent].GetSubtypes().Any(st => st.DerivedType.Type == type))
+                return;
+            RuntimeTypeModel.Default[parent].AddSubType(fieldNumber, type);
+        }
+
+        private static readonly HashSet<Type> ExcludedFromBatch = new HashSet<Type>
+        {
+            typeof(DoInitKernelInput),
+            typeof(KernelInputInitResponse)
+        };
+
+        /// <summary>
         /// Returns all concrete IMessage types in a deterministic order (by FullName)
         /// so that subtype indices are stable and match the C client's protocol table.
+        /// Excluded types (e.g. DoInitKernelInput, KernelInputInitResponse) must be added with AddTypeWithExplicitSubtype.
         /// </summary>
         public static IEnumerable<Type> GetPacketTypes(Type type)
         {
             return AppDomain.CurrentDomain.GetAssemblies()
                 .SelectMany(s => s.GetTypes())
-                .Where(p => type.IsAssignableFrom(p) && !p.IsInterface && !p.IsAbstract)
+                .Where(p => type.IsAssignableFrom(p) && !p.IsInterface && !p.IsAbstract && !ExcludedFromBatch.Contains(p))
                 .OrderBy(p => p.FullName, StringComparer.Ordinal);
         }
 

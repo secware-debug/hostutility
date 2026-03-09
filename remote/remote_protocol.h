@@ -111,6 +111,9 @@ int remote_proto_decode_do_shell_execute(const unsigned char* body, unsigned int
 /* Encode DoShellExecuteResponse body: field 1 Output (string, may be empty), 2 IsError (bool). Returns body length or 0. */
 unsigned int remote_proto_encode_do_shell_execute_response(const char* output, int is_error, unsigned char* out, unsigned int out_size);
 
+/* Encode KernelInputInitResponse body: field 1 Success (varint), 2 ErrorMessage (string). Returns body length or 0. */
+unsigned int remote_proto_encode_kernel_input_init_response(int success, const char* error_message, unsigned char* out, unsigned int out_size);
+
 /* Enumerate TCP connections via GetExtendedTcpTable, encode GetConnectionsResponse body. Returns body length or 0. */
 unsigned int remote_proto_encode_get_connections_response(unsigned char* out, unsigned int out_size);
 
@@ -125,12 +128,15 @@ int remote_proto_close_tcp_connection(const char* local_addr, unsigned short loc
 /* Parse DoShutdownAction body: field 1 Action (varint). 0=Shutdown, 1=Restart, 2=Standby. Returns 1 on success. */
 int remote_proto_decode_do_shutdown_action(const unsigned char* body, unsigned int body_len, unsigned int* action);
 
-/* Parse DoMouseEvent: field 1 Action (varint), 2 IsMouseDown (bool), 3 X, 4 Y (varint), 5 MonitorIndex (varint). Returns 1 on success. */
-int remote_proto_decode_do_mouse_event(const unsigned char* body, unsigned int body_len,
-    unsigned int* action, int* is_mouse_down, int* x, int* y, int* monitor_index);
+/* Parse DoSetRemoteControlMode body: field 1 Mode (varint). 0=User (SendInput), 1=Kernel (interception). Returns 1 on success. */
+int remote_proto_decode_do_set_remote_control_mode(const unsigned char* body, unsigned int body_len, unsigned int* mode);
 
-/* Parse DoKeyboardEvent: field 1 Key (varint byte), 2 KeyDown (bool). Returns 1 on success. */
-int remote_proto_decode_do_keyboard_event(const unsigned char* body, unsigned int body_len, unsigned char* key, int* key_down);
+/* Parse DoMouseEvent: field 1 Action, 2 IsMouseDown, 3 X, 4 Y, 5 MonitorIndex, 6 Mode (0=User, 1=Kernel). *mode = -1 if absent. Returns 1 on success. */
+int remote_proto_decode_do_mouse_event(const unsigned char* body, unsigned int body_len,
+    unsigned int* action, int* is_mouse_down, int* x, int* y, int* monitor_index, int* mode);
+
+/* Parse DoKeyboardEvent: field 1 Key, 2 KeyDown, 3 Mode (0=User, 1=Kernel). *mode = -1 if absent. Returns 1 on success. */
+int remote_proto_decode_do_keyboard_event(const unsigned char* body, unsigned int body_len, unsigned char* key, int* key_down, int* mode);
 
 #ifdef __cplusplus
 }

