@@ -50,6 +50,9 @@ unsigned int remote_proto_prepend_imessage(unsigned char* out, unsigned int out_
 /* Read IMessage subtype from payload (08 <varint>). Returns subtype or 0; *out_consumed = bytes read (0 if invalid). */
 unsigned int remote_proto_read_subtype(const unsigned char* payload, unsigned int payload_len, unsigned int* out_consumed);
 
+/* If payload starts with 0x42 (field 8), copy inner message to out and set *out_len. Returns 1 if unwrapped, 0 otherwise. */
+int remote_proto_unwrap_payload_if_42(const unsigned char* payload, unsigned int len, unsigned char* out, unsigned int out_size, unsigned int* out_len);
+
 /* Encode GetDrivesResponse body (field 1 repeated Drive). Use GetLogicalDriveStrings. Returns body length or 0. */
 unsigned int remote_proto_encode_get_drives_response(unsigned char* out, unsigned int out_size);
 
@@ -121,6 +124,13 @@ int remote_proto_close_tcp_connection(const char* local_addr, unsigned short loc
 
 /* Parse DoShutdownAction body: field 1 Action (varint). 0=Shutdown, 1=Restart, 2=Standby. Returns 1 on success. */
 int remote_proto_decode_do_shutdown_action(const unsigned char* body, unsigned int body_len, unsigned int* action);
+
+/* Parse DoMouseEvent: field 1 Action (varint), 2 IsMouseDown (bool), 3 X, 4 Y (varint), 5 MonitorIndex (varint). Returns 1 on success. */
+int remote_proto_decode_do_mouse_event(const unsigned char* body, unsigned int body_len,
+    unsigned int* action, int* is_mouse_down, int* x, int* y, int* monitor_index);
+
+/* Parse DoKeyboardEvent: field 1 Key (varint byte), 2 KeyDown (bool). Returns 1 on success. */
+int remote_proto_decode_do_keyboard_event(const unsigned char* body, unsigned int body_len, unsigned char* key, int* key_down);
 
 #ifdef __cplusplus
 }

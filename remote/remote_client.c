@@ -21,6 +21,31 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef DESKTOP_JOURNALPLAYBACK
+#define DESKTOP_JOURNALPLAYBACK 0x0020
+#endif
+
+typedef struct { HDESK to_restore; HDESK to_close; } input_desktop_scope_t;
+
+/* Switch current thread to the desktop that receives user input (required for mouse/keyboard injection to work). */
+static input_desktop_scope_t switch_to_input_desktop(void) {
+    input_desktop_scope_t s = { NULL, NULL };
+    HDESK hInput = OpenInputDesktop(0, FALSE, DESKTOP_JOURNALPLAYBACK | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS);
+    if (!hInput) {
+        remote_log("[loop] OpenInputDesktop failed (GetLastError=%lu), input may not be visible", (unsigned long)GetLastError());
+        return s;
+    }
+    s.to_close = hInput;
+    s.to_restore = GetThreadDesktop(GetCurrentThreadId());
+    if (!SetThreadDesktop(hInput)) { CloseDesktop(hInput); s.to_close = NULL; return s; }
+    return s;
+}
+
+static void restore_input_desktop(input_desktop_scope_t* s) {
+    if (s->to_restore) SetThreadDesktop(s->to_restore);
+    if (s->to_close) CloseDesktop(s->to_close);
+}
+
 static volatile long g_client_stop = 0;
 static volatile long g_request_reconnect = 0;
 
@@ -194,12 +219,22 @@ void remote_client_run(void) {
                 const unsigned char* dispatch_buf = payload_buf;
                 unsigned int dispatch_len = payload_len;
                 unsigned char prefixed_buf[260];
+                unsigned char unwrapped_buf[512];
                 if (payload_len >= 1 && payload_len <= sizeof(prefixed_buf) - 1 && payload_buf[0] != 0x08) {
                     prefixed_buf[0] = 0x08;
                     memcpy(prefixed_buf + 1, payload_buf, payload_len);
                     dispatch_buf = prefixed_buf;
                     dispatch_len = payload_len + 1;
                     remote_log("[loop] payload missing 0x08 prefix; prepended for dispatch (len now %u)", dispatch_len);
+                }
+                /* If server sent message wrapped in field 8 (0x42), unwrap so we see 0x08 <subtype> ... */
+                if (dispatch_len >= 3 && dispatch_buf[0] == 0x42) {
+                    unsigned int unwrapped_len = 0;
+                    if (remote_proto_unwrap_payload_if_42(dispatch_buf, dispatch_len, unwrapped_buf, sizeof(unwrapped_buf), &unwrapped_len)) {
+                        dispatch_buf = unwrapped_buf;
+                        dispatch_len = unwrapped_len;
+                        remote_log("[loop] unwrapped 0x42 payload; dispatch_len=%u", dispatch_len);
+                    }
                 }
 
                 if (dispatch_len >= 2 && dispatch_buf[0] == 0x08) {
@@ -226,6 +261,55 @@ void remote_client_run(void) {
                                     remote_log("[loop] GetMonitorsResponse prepend_imessage failed");
                             } else
                                 remote_log("[loop] GetMonitorsResponse encode failed");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoMouseEvent) {
+                        remote_log("[loop] handling DoMouseEvent (body_len=%u)", (unsigned)(dispatch_len - consumed));
+                        remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
+                        unsigned int act = 0;
+                        int is_down = 0, mx = 0, my = 0, mon = 0;
+                        if (remote_proto_decode_do_mouse_event(dispatch_buf + consumed, dispatch_len - consumed, &act, &is_down, &mx, &my, &mon)) {
+                            int mon_x = 0, mon_y = 0;
+                            unsigned int mon_w = 0, mon_h = 0;
+                            remote_desktop_get_monitor_bounds(mon, &mon_x, &mon_y, &mon_w, &mon_h);
+                            int px = mon_x + mx;
+                            int py = mon_y + my;
+                            remote_log("[loop] DoMouseEvent decoded: act=%u is_down=%d mx=%d my=%d mon=%d -> px=%d py=%d (mon_bounds x=%d y=%d w=%u h=%u)",
+                                act, is_down, mx, my, mon, px, py, mon_x, mon_y, mon_w, mon_h);
+
+                            input_desktop_scope_t scope = switch_to_input_desktop();
+                            if (act == 4) {
+                                SetCursorPos(px, py);
+                            } else {
+                                SetCursorPos(px, py);
+                                if (act == 0 || act == 1)
+                                    mouse_event(is_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                                else if (act == 2 || act == 3)
+                                    mouse_event(is_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+                                else if (act == 5)
+                                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, 120, 0);
+                                else if (act == 6)
+                                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)-120, 0);
+                            }
+                            if (scope.to_close) restore_input_desktop(&scope);
+                        } else {
+                            remote_log("[loop] DoMouseEvent decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
+                            remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoKeyboardEvent) {
+                        remote_log("[loop] handling DoKeyboardEvent (body_len=%u)", (unsigned)(dispatch_len - consumed));
+                        remote_log_hex("DoKeyboardEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
+                        unsigned char key = 0;
+                        int key_down = 0;
+                        if (remote_proto_decode_do_keyboard_event(dispatch_buf + consumed, dispatch_len - consumed, &key, &key_down)) {
+                            remote_log("[loop] DoKeyboardEvent decoded: key=%u (0x%02X) key_down=%d", (unsigned)key, (unsigned)key, key_down);
+                            input_desktop_scope_t scope = switch_to_input_desktop();
+                            keybd_event((BYTE)key, 0, key_down ? 0 : KEYEVENTF_KEYUP, 0);
+                            if (scope.to_close) restore_input_desktop(&scope);
+                        } else {
+                            remote_log("[loop] DoKeyboardEvent decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
+                            remote_log_hex("DoKeyboardEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_GetDrives) {

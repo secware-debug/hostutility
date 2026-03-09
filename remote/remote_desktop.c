@@ -71,6 +71,16 @@ static void get_monitor_rect(int display_index, monitor_rect_t* out) {
     }
 }
 
+void remote_desktop_get_monitor_bounds(int display_index, int* out_x, int* out_y, unsigned int* out_width, unsigned int* out_height) {
+    monitor_rect_t r;
+    if (!out_x || !out_y || !out_width || !out_height) return;
+    get_monitor_rect(display_index, &r);
+    *out_x = r.x;
+    *out_y = r.y;
+    *out_width = r.width;
+    *out_height = r.height;
+}
+
 static void scale_to_max(unsigned int* w, unsigned int* h) {
     unsigned int width = *w, height = *h;
     if (width <= REMOTE_DESKTOP_MAX_WIDTH && height <= REMOTE_DESKTOP_MAX_HEIGHT) return;
