@@ -28,6 +28,7 @@ namespace Quasar.Server.Forms
             this.btnMouse = new System.Windows.Forms.Button();
             this.panelTop = new System.Windows.Forms.Panel();
             this.btnKeyboard = new System.Windows.Forms.Button();
+            this.cbMonitors = new System.Windows.Forms.ComboBox();
             this.btnHide = new System.Windows.Forms.Button();
             this.btnShow = new System.Windows.Forms.Button();
             this.toolTipButtons = new System.Windows.Forms.ToolTip(this.components);
@@ -118,6 +119,7 @@ namespace Quasar.Server.Forms
             //
             this.panelTop.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
             this.panelTop.Controls.Add(this.btnKeyboard);
+            this.panelTop.Controls.Add(this.cbMonitors);
             this.panelTop.Controls.Add(this.btnHide);
             this.panelTop.Controls.Add(this.lblQualityShow);
             this.panelTop.Controls.Add(this.btnMouse);
@@ -142,6 +144,16 @@ namespace Quasar.Server.Forms
             this.toolTipButtons.SetToolTip(this.btnKeyboard, "Enable keyboard input.");
             this.btnKeyboard.UseVisualStyleBackColor = true;
             this.btnKeyboard.Click += new System.EventHandler(this.btnKeyboard_Click);
+            //
+            // cbMonitors
+            //
+            this.cbMonitors.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
+            this.cbMonitors.FormattingEnabled = true;
+            this.cbMonitors.Location = new System.Drawing.Point(15, 30);
+            this.cbMonitors.Name = "cbMonitors";
+            this.cbMonitors.Size = new System.Drawing.Size(149, 21);
+            this.cbMonitors.TabIndex = 8;
+            this.cbMonitors.TabStop = false;
             //
             // btnHide
             //
@@ -219,6 +231,7 @@ namespace Quasar.Server.Forms
         private System.Windows.Forms.Panel panelTop;
         private System.Windows.Forms.Button btnHide;
         private System.Windows.Forms.Button btnShow;
+        private System.Windows.Forms.ComboBox cbMonitors;
         private System.Windows.Forms.Button btnKeyboard;
         private System.Windows.Forms.ToolTip toolTipButtons;
         private Controls.RapidPictureBox picDesktop;

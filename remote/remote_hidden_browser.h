@@ -10,8 +10,8 @@
 extern "C" {
 #endif
 
-/* Start or reuse ghost browser. Returns 1 on success, 0 on failure. */
-int remote_hidden_browser_start(const char* profile, const char* url, int ghost_alpha);
+/* Start or reuse ghost browser. display_index: 0-based monitor. Returns 1 on success, 0 on failure. */
+int remote_hidden_browser_start(const char* profile, const char* url, int ghost_alpha, int display_index);
 
 /* Capture current frame as JPEG. out_data = 4-byte LE length + JPEG. Returns total size or 0. */
 unsigned int remote_hidden_browser_capture_frame(unsigned char* out_data, unsigned int out_size, int quality);

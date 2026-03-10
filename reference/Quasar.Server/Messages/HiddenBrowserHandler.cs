@@ -12,15 +12,20 @@ namespace Quasar.Server.Messages
     {
         public bool IsStarted { get; set; }
         private volatile int _requestedQuality = 75;
+        private volatile int _requestedDisplayIndex;
         private readonly object _syncLock = new object();
         private readonly object _sizeLock = new object();
         private Size _localResolution;
         private readonly Client _client;
         private volatile bool _pendingKernelInit;
         private int _pendingQuality;
+        private int _pendingDisplayIndex;
         private int _lastWidth, _lastHeight;
 
         public int RequestedQuality { get => _requestedQuality; set => _requestedQuality = value; }
+        public int RequestedDisplayIndex { get => _requestedDisplayIndex; set => _requestedDisplayIndex = value; }
+
+        public event EventHandler<int> DisplaysChanged;
         public Size LocalResolution
         {
             get { lock (_sizeLock) return _localResolution; }
@@ -37,7 +42,7 @@ namespace Quasar.Server.Messages
         }
 
         public override bool CanExecute(IMessage message) =>
-            message is GetHiddenBrowserResponse || message is KernelInputInitResponse || message is CloseHiddenBrowserResult;
+            message is GetHiddenBrowserResponse || message is KernelInputInitResponse || message is CloseHiddenBrowserResult || message is GetMonitorsResponse;
 
         public override bool CanExecuteFrom(ISender sender) => _client.Equals(sender);
 
@@ -54,7 +59,21 @@ namespace Quasar.Server.Messages
                 case CloseHiddenBrowserResult c:
                     Execute(c);
                     break;
+                case GetMonitorsResponse m:
+                    Execute(m);
+                    break;
             }
+        }
+
+        private void Execute(GetMonitorsResponse message)
+        {
+            var n = message?.Number ?? 0;
+            SynchronizationContext.Post(_ => DisplaysChanged?.Invoke(this, (int)_), n);
+        }
+
+        public void RefreshDisplays()
+        {
+            _client.Send(new GetMonitors());
         }
 
         private void Execute(CloseHiddenBrowserResult message)
@@ -68,13 +87,15 @@ namespace Quasar.Server.Messages
             }, Tuple.Create(result, msg));
         }
 
-        public void BeginStream(int quality)
+        public void BeginStream(int quality, int displayIndex)
         {
             lock (_syncLock)
             {
                 _pendingKernelInit = true;
                 _pendingQuality = quality;
+                _pendingDisplayIndex = displayIndex;
                 RequestedQuality = quality;
+                RequestedDisplayIndex = displayIndex;
                 _client.Send(new DoInitKernelInput());
             }
         }
@@ -90,8 +111,8 @@ namespace Quasar.Server.Messages
                 {
                     IsStarted = true;
                     _client.Send(new DoSetRemoteControlMode { Mode = RemoteControlMode.Kernel });
-                    _client.Send(new DoStartHiddenBrowser { Quality = _pendingQuality });
-                    _client.Send(new GetHiddenBrowser { Quality = _pendingQuality });
+                    _client.Send(new DoStartHiddenBrowser { Quality = _pendingQuality, DisplayIndex = _pendingDisplayIndex });
+                    _client.Send(new GetHiddenBrowser { Quality = _pendingQuality, DisplayIndex = _pendingDisplayIndex });
                     return;
                 }
                 string err = string.IsNullOrEmpty(message.ErrorMessage)
@@ -131,7 +152,7 @@ namespace Quasar.Server.Messages
                 }
                 catch { }
                 message.Image = null;
-                sender.Send(new GetHiddenBrowser { Quality = RequestedQuality });
+                sender.Send(new GetHiddenBrowser { Quality = RequestedQuality, DisplayIndex = RequestedDisplayIndex });
             }
         }
 

