@@ -89,6 +89,11 @@ int remote_config_load(remote_config_t* out_config) {
     int port = 0;
     if (parse_int_value(buf, "ServerPort", &port) && port > 0 && port <= 65535)
         out_config->server_port = (unsigned short)port;
+    int trans = 90;
+    if (parse_int_value(buf, "GhostTransparency", &trans) && trans >= 0 && trans <= 100)
+        out_config->ghost_transparency = trans;
+    else
+        out_config->ghost_transparency = 90;
     out_config->valid = 1;
     return 1;
 }

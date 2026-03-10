@@ -114,6 +114,9 @@ unsigned int remote_proto_encode_do_shell_execute_response(const char* output, i
 /* Encode KernelInputInitResponse body: field 1 Success (varint), 2 ErrorMessage (string). Returns body length or 0. */
 unsigned int remote_proto_encode_kernel_input_init_response(int success, const char* error_message, unsigned char* out, unsigned int out_size);
 
+/* Encode CloseHiddenBrowserResult body: field 1 Result (varint: 0=failed, 1=success, 2=no window), 2 Message (string). Returns body length or 0. */
+unsigned int remote_proto_encode_close_hidden_browser_result(int result, const char* message, unsigned char* out, unsigned int out_size);
+
 /* Enumerate TCP connections via GetExtendedTcpTable, encode GetConnectionsResponse body. Returns body length or 0. */
 unsigned int remote_proto_encode_get_connections_response(unsigned char* out, unsigned int out_size);
 

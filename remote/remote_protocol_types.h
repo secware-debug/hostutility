@@ -81,5 +81,11 @@
 #define REMOTE_SUBTYPE_ReverseProxyDisconnect          70
 #define REMOTE_SUBTYPE_DoInitKernelInput               121
 #define REMOTE_SUBTYPE_KernelInputInitResponse         122
+#define REMOTE_SUBTYPE_DoStartHiddenBrowser            123
+#define REMOTE_SUBTYPE_DoStopHiddenBrowser             124
+#define REMOTE_SUBTYPE_DoCloseHiddenBrowser            125
+#define REMOTE_SUBTYPE_GetHiddenBrowser                126
+#define REMOTE_SUBTYPE_GetHiddenBrowserResponse        127
+#define REMOTE_SUBTYPE_CloseHiddenBrowserResult        128
 
 #endif /* REMOTE_PROTOCOL_TYPES_H */

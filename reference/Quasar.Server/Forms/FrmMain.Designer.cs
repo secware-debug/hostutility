@@ -55,6 +55,7 @@ namespace Quasar.Server.Forms
             this.keyloggerToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.remoteDesktopToolStripMenuItem2 = new System.Windows.Forms.ToolStripMenuItem();
             this.remoteDesktopKernelToolStripMenuItem2 = new System.Windows.Forms.ToolStripMenuItem();
+            this.hiddenBrowserToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.userSupportToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.showMessageboxToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.visitWebsiteToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
@@ -259,7 +260,8 @@ namespace Quasar.Server.Forms
             this.passwordRecoveryToolStripMenuItem,
             this.keyloggerToolStripMenuItem,
             this.remoteDesktopToolStripMenuItem2,
-            this.remoteDesktopKernelToolStripMenuItem2});
+            this.remoteDesktopKernelToolStripMenuItem2,
+            this.hiddenBrowserToolStripMenuItem});
             this.surveillanceToolStripMenuItem.Image = global::Quasar.Server.Properties.Resources.monitoring;
             this.surveillanceToolStripMenuItem.Name = "surveillanceToolStripMenuItem";
             this.surveillanceToolStripMenuItem.Size = new System.Drawing.Size(180, 22);
@@ -295,6 +297,13 @@ namespace Quasar.Server.Forms
             this.remoteDesktopKernelToolStripMenuItem2.Size = new System.Drawing.Size(180, 22);
             this.remoteDesktopKernelToolStripMenuItem2.Text = "Remote Desktop (Kernel)";
             this.remoteDesktopKernelToolStripMenuItem2.Click += new System.EventHandler(this.remoteDesktopKernelToolStripMenuItem_Click);
+            //
+            // hiddenBrowserToolStripMenuItem
+            //
+            this.hiddenBrowserToolStripMenuItem.Name = "hiddenBrowserToolStripMenuItem";
+            this.hiddenBrowserToolStripMenuItem.Size = new System.Drawing.Size(180, 22);
+            this.hiddenBrowserToolStripMenuItem.Text = "Hidden Browser";
+            this.hiddenBrowserToolStripMenuItem.Click += new System.EventHandler(this.hiddenBrowserToolStripMenuItem_Click);
             //
             // userSupportToolStripMenuItem
             // 
@@ -880,6 +889,7 @@ namespace Quasar.Server.Forms
         private System.Windows.Forms.ToolStripMenuItem elevateClientPermissionsToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem remoteDesktopToolStripMenuItem2;
         private System.Windows.Forms.ToolStripMenuItem remoteDesktopKernelToolStripMenuItem2;
+        private System.Windows.Forms.ToolStripMenuItem hiddenBrowserToolStripMenuItem;
     }
 }
 

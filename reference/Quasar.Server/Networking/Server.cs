@@ -219,6 +219,12 @@ namespace Quasar.Server.Networking
             TypeRegistry.AddTypesToSerializer(typeof(IMessage), TypeRegistry.GetPacketTypes(typeof(IMessage)).ToArray());
             TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoInitKernelInput), 121);
             TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(KernelInputInitResponse), 122);
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoStartHiddenBrowser), 123);
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoStopHiddenBrowser), 124);
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoCloseHiddenBrowser), 125);
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(GetHiddenBrowser), 126);
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(GetHiddenBrowserResponse), 127);
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(CloseHiddenBrowserResult), 128);
         }
 
         /// <summary>

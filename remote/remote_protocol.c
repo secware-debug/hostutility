@@ -981,6 +981,23 @@ unsigned int remote_proto_encode_kernel_input_init_response(int success, const c
     return pos;
 }
 
+unsigned int remote_proto_encode_close_hidden_browser_result(int result, const char* message, unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 16) return 0;
+    unsigned int pos = 0;
+    out[pos++] = (unsigned char)TAG(1, WIRE_VARINT);
+    pos += put_varint((unsigned int)(result < 0 ? 0 : (result > 2 ? 0 : result)), out + pos);
+    if (message && message[0]) {
+        size_t slen = strlen(message);
+        if (slen > 0xFFFF) slen = 0xFFFF;
+        out[pos++] = (unsigned char)TAG(2, WIRE_LEN);
+        pos += put_varint((unsigned int)slen, out + pos);
+        if (pos + (unsigned int)slen > out_size) return 0;
+        memcpy(out + pos, message, (unsigned int)slen);
+        pos += (unsigned int)slen;
+    }
+    return pos;
+}
+
 /* GetConnectionsResponse: field 1 repeated TcpConnection. Each: 1 ProcessName, 2 LocalAddress, 3 LocalPort, 4 RemoteAddress, 5 RemotePort, 6 State. */
 static unsigned int put_tcp_connection(unsigned char* out, unsigned int out_size, const char* process_name,
     const char* local_addr, unsigned int local_port, const char* remote_addr, unsigned int remote_port, unsigned int state) {

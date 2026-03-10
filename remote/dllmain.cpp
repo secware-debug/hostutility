@@ -11,7 +11,9 @@ BOOL APIENTRY DllMain( HMODULE hModule,
     switch (ul_reason_for_call)
     {
     case DLL_PROCESS_ATTACH:
+        OutputDebugStringA("[remote] DllMain DLL_PROCESS_ATTACH\n");
         gdiplus_jpeg_init();
+        OutputDebugStringA("[remote] DllMain GDI+ init done\n");
         break;
     case DLL_PROCESS_DETACH:
         remote_input_interception_shutdown();

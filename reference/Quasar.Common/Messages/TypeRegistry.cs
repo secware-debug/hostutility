@@ -54,7 +54,13 @@ namespace Quasar.Common.Messages
         private static readonly HashSet<Type> ExcludedFromBatch = new HashSet<Type>
         {
             typeof(DoInitKernelInput),
-            typeof(KernelInputInitResponse)
+            typeof(KernelInputInitResponse),
+            typeof(DoStartHiddenBrowser),
+            typeof(GetHiddenBrowser),
+            typeof(GetHiddenBrowserResponse),
+            typeof(DoStopHiddenBrowser),
+            typeof(DoCloseHiddenBrowser),
+            typeof(CloseHiddenBrowserResult)
         };
 
         /// <summary>

