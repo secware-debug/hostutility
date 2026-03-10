@@ -1,5 +1,6 @@
 {
   "ServerAddress": "127.0.0.1",
   "ServerPort": 4782,
-  "GhostTransparency": 90
+  "GhostTransparency": 90,
+  "Keylogging": false
 }

