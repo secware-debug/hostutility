@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Windows.Forms;
@@ -134,6 +134,12 @@ namespace Quasar.Server.Forms
             btnGetLogs.Enabled = false;
             stripLblStatus.Text = "Status: Retrieving logs...";
             _keyloggerHandler.RetrieveLogs();
+        }
+
+        private void btnDeleteLogs_Click(object sender, EventArgs e)
+        {
+            stripLblStatus.Text = "Status: Deleting logs on client...";
+            _keyloggerHandler.DeleteLogsOnClient();
         }
 
         private void lstLogs_ItemActivate(object sender, EventArgs e)

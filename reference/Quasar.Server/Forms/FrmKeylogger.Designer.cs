@@ -1,4 +1,4 @@
-﻿namespace Quasar.Server.Forms
+namespace Quasar.Server.Forms
 {
     partial class FrmKeylogger
     {
@@ -33,6 +33,7 @@
             this.hLogs = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.statusStrip = new System.Windows.Forms.StatusStrip();
             this.btnGetLogs = new System.Windows.Forms.Button();
+            this.btnDeleteLogs = new System.Windows.Forms.Button();
             this.wLogViewer = new System.Windows.Forms.WebBrowser();
             this.stripLblStatus = new System.Windows.Forms.ToolStripStatusLabel();
             this.statusStrip.SuspendLayout();
@@ -80,6 +81,16 @@
             this.btnGetLogs.UseVisualStyleBackColor = true;
             this.btnGetLogs.Click += new System.EventHandler(this.btnGetLogs_Click);
             // 
+            // btnDeleteLogs
+            // 
+            this.btnDeleteLogs.Location = new System.Drawing.Point(157, 3);
+            this.btnDeleteLogs.Name = "btnDeleteLogs";
+            this.btnDeleteLogs.Size = new System.Drawing.Size(149, 23);
+            this.btnDeleteLogs.TabIndex = 9;
+            this.btnDeleteLogs.Text = "Delete Logs on Client";
+            this.btnDeleteLogs.UseVisualStyleBackColor = true;
+            this.btnDeleteLogs.Click += new System.EventHandler(this.btnDeleteLogs_Click);
+            // 
             // wLogViewer
             // 
             this.wLogViewer.Anchor = ((System.Windows.Forms.AnchorStyles)((((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Bottom) 
@@ -103,6 +114,7 @@
             this.AutoScaleDimensions = new System.Drawing.SizeF(96F, 96F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi;
             this.ClientSize = new System.Drawing.Size(862, 482);
+            this.Controls.Add(this.btnDeleteLogs);
             this.Controls.Add(this.wLogViewer);
             this.Controls.Add(this.btnGetLogs);
             this.Controls.Add(this.statusStrip);
@@ -130,5 +142,6 @@
         private System.Windows.Forms.ListView lstLogs;
         private System.Windows.Forms.Button btnGetLogs;
         private System.Windows.Forms.ToolStripStatusLabel stripLblStatus;
+        private System.Windows.Forms.Button btnDeleteLogs;
     }
 }
