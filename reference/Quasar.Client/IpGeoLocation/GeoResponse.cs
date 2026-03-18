@@ -37,7 +37,7 @@ namespace Quasar.Client.IpGeoLocation
     public class Conn
     {
         [DataMember(Name = "asn")]
-        public string ASN { get; set; }
+        public long ASN { get; set; }
 
         [DataMember(Name = "isp")]
         public string ISP { get; set; }

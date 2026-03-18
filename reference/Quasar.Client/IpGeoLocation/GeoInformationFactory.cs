@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace Quasar.Client.IpGeoLocation
 {
@@ -34,8 +34,13 @@ namespace Quasar.Client.IpGeoLocation
         public static GeoInformation GetGeoInformation()
         {
             var passedTime = new TimeSpan(DateTime.UtcNow.Ticks - _lastSuccessfulLocation.Ticks);
+            var shouldRefresh =
+                _geoInformation == null ||
+                passedTime.TotalMinutes > MINIMUM_VALID_TIME ||
+                string.Equals(_geoInformation.Country, "Unknown", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(_geoInformation.Timezone, "Unknown", StringComparison.OrdinalIgnoreCase);
 
-            if (_geoInformation == null || passedTime.TotalMinutes > MINIMUM_VALID_TIME)
+            if (shouldRefresh)
             {
                 _geoInformation = Retriever.Retrieve();
                 _lastSuccessfulLocation = DateTime.UtcNow;

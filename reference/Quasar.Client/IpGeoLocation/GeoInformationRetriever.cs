@@ -47,10 +47,23 @@ namespace Quasar.Client.IpGeoLocation
         /// <returns>The retrieved IP geolocation information.</returns>
         public GeoInformation Retrieve()
         {
-            var geo = TryRetrieveOnline() ?? TryRetrieveLocally();
+            var online = TryRetrieveOnline();
+            var local = TryRetrieveLocally();
+            var geo = online ?? local ?? new GeoInformation();
 
             if (string.IsNullOrEmpty(geo.IpAddress))
                 geo.IpAddress = TryGetWanIp();
+
+            // If the online response is incomplete, backfill from local region information.
+            if (local != null)
+            {
+                if (string.IsNullOrEmpty(geo.Country))
+                    geo.Country = local.Country;
+                if (string.IsNullOrEmpty(geo.CountryCode))
+                    geo.CountryCode = local.CountryCode;
+                if (string.IsNullOrEmpty(geo.Timezone))
+                    geo.Timezone = local.Timezone;
+            }
 
             geo.IpAddress = (string.IsNullOrEmpty(geo.IpAddress)) ? "Unknown" : geo.IpAddress;
             geo.Country = (string.IsNullOrEmpty(geo.Country)) ? "Unknown" : geo.Country;
@@ -92,14 +105,15 @@ namespace Quasar.Client.IpGeoLocation
                     {
                         var geoInfo = JsonHelper.Deserialize<GeoResponse>(dataStream);
 
+                        var conn = geoInfo?.Connection;
                         GeoInformation g = new GeoInformation
                         {
-                            IpAddress = geoInfo.Ip,
-                            Country = geoInfo.Country,
-                            CountryCode = geoInfo.CountryCode,
-                            Timezone = geoInfo.Timezone.UTC,
-                            Asn = geoInfo.Connection.ASN.ToString(),
-                            Isp = geoInfo.Connection.ISP
+                            IpAddress = geoInfo?.Ip,
+                            Country = geoInfo?.Country,
+                            CountryCode = geoInfo?.CountryCode,
+                            Timezone = geoInfo?.Timezone?.UTC,
+                            Asn = conn != null && conn.ASN != 0 ? conn.ASN.ToString() : "",
+                            Isp = conn?.ISP
                         };
 
                         return g;

