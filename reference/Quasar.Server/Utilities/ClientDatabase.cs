@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS Clients (
     Version TEXT,
     Status TEXT,
     UserStatus TEXT,
+    AcceptPing INTEGER NOT NULL DEFAULT 0,
     Country TEXT,
     CountryCode TEXT,
     OperatingSystem TEXT,
@@ -47,6 +48,25 @@ CREATE TABLE IF NOT EXISTS Clients (
     LastPingTimeUtc TEXT NULL
 );";
                         cmd.ExecuteNonQuery();
+
+                        /* If table already existed from a previous version, ensure AcceptPing column exists. */
+                        using (var alterCmd = conn.CreateCommand())
+                        {
+                            alterCmd.CommandText = @"
+SELECT COUNT(*)
+FROM pragma_table_info('Clients')
+WHERE name = 'AcceptPing';";
+                            var scalar = alterCmd.ExecuteScalar();
+                            long count = (scalar == null || scalar == DBNull.Value) ? 0 : Convert.ToInt64(scalar);
+                            if (count == 0)
+                            {
+                                using (var addCmd = conn.CreateCommand())
+                                {
+                                    addCmd.CommandText = @"ALTER TABLE Clients ADD COLUMN AcceptPing INTEGER NOT NULL DEFAULT 0;";
+                                    addCmd.ExecuteNonQuery();
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -138,7 +158,7 @@ CREATE TABLE IF NOT EXISTS Clients (
                     {
                         cmd.CommandText = @"
 SELECT
-    Uuid, IpAddress, Tag, UserPc, Version, Status, UserStatus,
+    Uuid, IpAddress, Tag, UserPc, Version, Status, UserStatus, AcceptPing,
     Country, CountryCode, OperatingSystem, AccountType,
     ImageIndex, InstallTimeUtc, LastPingTimeUtc
 FROM Clients
@@ -158,13 +178,14 @@ ORDER BY InstallTimeUtc ASC;";
                                     Version = reader.IsDBNull(4) ? "" : reader.GetString(4),
                                     Status = reader.IsDBNull(5) ? "Disconnected" : reader.GetString(5),
                                     UserStatus = reader.IsDBNull(6) ? "" : reader.GetString(6),
-                                    Country = reader.IsDBNull(7) ? "" : reader.GetString(7),
-                                    CountryCode = reader.IsDBNull(8) ? "" : reader.GetString(8),
-                                    OperatingSystem = reader.IsDBNull(9) ? "" : reader.GetString(9),
-                                    AccountType = reader.IsDBNull(10) ? "" : reader.GetString(10),
-                                    ImageIndex = reader.IsDBNull(11) ? 0 : reader.GetInt32(11),
-                                    InstallTimeUtc = ParseNullableUtc(reader.IsDBNull(12) ? null : reader.GetString(12)),
-                                    LastPingTimeUtc = ParseNullableUtc(reader.IsDBNull(13) ? null : reader.GetString(13))
+                                AcceptPing = !reader.IsDBNull(7) && reader.GetInt32(7) != 0,
+                                Country = reader.IsDBNull(8) ? "" : reader.GetString(8),
+                                CountryCode = reader.IsDBNull(9) ? "" : reader.GetString(9),
+                                OperatingSystem = reader.IsDBNull(10) ? "" : reader.GetString(10),
+                                AccountType = reader.IsDBNull(11) ? "" : reader.GetString(11),
+                                ImageIndex = reader.IsDBNull(12) ? 0 : reader.GetInt32(12),
+                                InstallTimeUtc = ParseNullableUtc(reader.IsDBNull(13) ? null : reader.GetString(13)),
+                                LastPingTimeUtc = ParseNullableUtc(reader.IsDBNull(14) ? null : reader.GetString(14))
                                 };
 
                                 result.Add(row);
@@ -216,6 +237,7 @@ ORDER BY InstallTimeUtc ASC;";
 
                     using (var cmd = conn.CreateCommand())
                     {
+                        DateTime? existingLastPingUtc = GetLastPingTimeUtc(conn, uuid);
                         cmd.CommandText = @"
 INSERT INTO Clients (
     Uuid, IpAddress, Tag, UserPc, Version, Status, UserStatus,
@@ -234,12 +256,12 @@ ON CONFLICT(Uuid) DO UPDATE SET
     Version = excluded.Version,
     Status = excluded.Status,
     UserStatus = excluded.UserStatus,
+    /* AcceptPing is intentionally not updated here (manual user choice). */
     Country = excluded.Country,
     CountryCode = excluded.CountryCode,
     OperatingSystem = excluded.OperatingSystem,
     AccountType = excluded.AccountType,
-    ImageIndex = excluded.ImageIndex,
-    LastPingTimeUtc = NULL;"; // keep InstallTimeUtc, force LastPingTimeUtc to remain NULL
+    ImageIndex = excluded.ImageIndex;"; // preserve LastPingTimeUtc (updated by ping handler)
                         cmd.Parameters.AddWithValue("@uuid", uuid);
                         cmd.Parameters.AddWithValue("@ip", ipAddress ?? "");
                         cmd.Parameters.AddWithValue("@tag", tag ?? "");
@@ -265,14 +287,73 @@ ON CONFLICT(Uuid) DO UPDATE SET
                             Version = version ?? "",
                             Status = status ?? "Disconnected",
                             UserStatus = userStatus ?? "",
+                            AcceptPing = false, // caller may re-load; UI reads from DB list.
                             Country = country ?? "",
                             CountryCode = countryCode ?? "",
                             OperatingSystem = operatingSystem ?? "",
                             AccountType = accountType ?? "",
                             ImageIndex = imageIndex,
                             InstallTimeUtc = existingInstallUtc,
-                            LastPingTimeUtc = null
+                            LastPingTimeUtc = existingLastPingUtc
                         };
+                    }
+                }
+            }
+        }
+
+        public bool GetClientAcceptPing(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return false;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"SELECT AcceptPing FROM Clients WHERE Uuid = @uuid;";
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        var scalar = cmd.ExecuteScalar();
+                        if (scalar == null || scalar == DBNull.Value) return false;
+                        return Convert.ToInt32(scalar) != 0;
+                    }
+                }
+            }
+        }
+
+        public void SetClientAcceptPing(string uuid, bool acceptPing)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"UPDATE Clients SET AcceptPing = @v WHERE Uuid = @uuid;";
+                        cmd.Parameters.AddWithValue("@v", acceptPing ? 1 : 0);
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
+        public void UpdateClientLastPingTimeUtc(string uuid, DateTime pingTimeUtc)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"UPDATE Clients SET LastPingTimeUtc = @v WHERE Uuid = @uuid;";
+                        cmd.Parameters.AddWithValue("@v", pingTimeUtc.ToString("o"));
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        cmd.ExecuteNonQuery();
                     }
                 }
             }
@@ -283,6 +364,27 @@ ON CONFLICT(Uuid) DO UPDATE SET
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = @"SELECT InstallTimeUtc FROM Clients WHERE Uuid = @uuid;";
+                cmd.Parameters.AddWithValue("@uuid", uuid);
+
+                var scalar = cmd.ExecuteScalar();
+                if (scalar == null || scalar == DBNull.Value) return null;
+
+                var iso = Convert.ToString(scalar);
+                if (string.IsNullOrWhiteSpace(iso)) return null;
+
+                DateTime dt;
+                if (DateTime.TryParse(iso, null, System.Globalization.DateTimeStyles.RoundtripKind, out dt))
+                    return dt.ToUniversalTime();
+
+                return null;
+            }
+        }
+
+        private static DateTime? GetLastPingTimeUtc(SqliteConnection conn, string uuid)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"SELECT LastPingTimeUtc FROM Clients WHERE Uuid = @uuid;";
                 cmd.Parameters.AddWithValue("@uuid", uuid);
 
                 var scalar = cmd.ExecuteScalar();
@@ -309,6 +411,7 @@ ON CONFLICT(Uuid) DO UPDATE SET
         public string Version { get; set; } = "";
         public string Status { get; set; } = "Disconnected";
         public string UserStatus { get; set; } = "";
+        public bool AcceptPing { get; set; } = false;
         public string Country { get; set; } = "";
         public string CountryCode { get; set; } = "";
         public string OperatingSystem { get; set; } = "";

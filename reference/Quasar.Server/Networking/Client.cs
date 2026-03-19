@@ -1252,6 +1252,10 @@ namespace Quasar.Server.Networking
                                         {
                                             message = rawStatus;
                                         }
+                                        else if (TryParseRawClientPingRequest(_payloadBuffer, payloadStart, _payloadLen, out var rawPing))
+                                        {
+                                            message = rawPing;
+                                        }
                                         else
                                         {
                                             var sb = new System.Text.StringBuilder();
@@ -1328,6 +1332,61 @@ namespace Quasar.Server.Networking
             }
         }
 
+        private static bool TryParseRawClientPingRequest(byte[] payload, int payloadStart, int payloadLen, out ClientPingRequest ping)
+        {
+            ping = null;
+            if (payload == null) return false;
+            if (payloadLen < 2) return false;
+
+            // Raw C client frame inside the IMessage payload:
+            // 0x08 <varint subtype=72> <ClientPingRequest body>
+            if (payload[payloadStart] != 0x08) return false;
+
+            // Read subtype varint (protobuf-net IMessage wrapper: field #1 varint).
+            uint subtype = 0;
+            int consumed = 0;
+            int pos = payloadStart + 1;
+            int end = payloadStart + payloadLen;
+            while (pos < end && consumed < 5)
+            {
+                byte b = payload[pos++];
+                subtype |= (uint)(b & 0x7F) << (7 * consumed);
+                consumed++;
+                if ((b & 0x80) == 0) break;
+            }
+
+            if (subtype != 72) return false;
+
+            ping = new ClientPingRequest();
+
+            // Parse body: expect field 1 (Uuid) as length-delimited: tag 0x0A.
+            int bodyPos = payloadStart + 1 + consumed;
+            if (bodyPos >= end) return true; // no body -> empty uuid
+
+            // Field tag 1 with wire length (2) is 0x0A.
+            if (payload[bodyPos] != 0x0A) return true;
+            bodyPos++;
+
+            // Read string length varint.
+            uint strLen = 0;
+            int shift = 0;
+            int lenConsumed = 0;
+            while (bodyPos < end && lenConsumed < 5)
+            {
+                byte b = payload[bodyPos++];
+                strLen |= (uint)(b & 0x7F) << shift;
+                shift += 7;
+                lenConsumed++;
+                if ((b & 0x80) == 0) break;
+            }
+
+            if (strLen == 0) return true;
+            if (bodyPos + (int)strLen > end) return false;
+
+            ping.Uuid = Encoding.UTF8.GetString(payload, bodyPos, (int)strLen);
+            return true;
+        }
+
         /// <summary>
         /// Sends a message to the connected client.
         /// Blocks the thread until the message has been sent.
@@ -1348,9 +1407,11 @@ namespace Quasar.Server.Networking
         /// <param name="message">The message to send.</param>
         private void SafeSendMessage(IMessage message)
         {
+            bool lockTaken = false;
             try
             {
                 _singleWriteMutex.WaitOne();
+                lockTaken = true;
                 using (PayloadWriter pw = new PayloadWriter(_stream, true))
                 {
                     OnClientWrite(message, pw.WriteMessage(message));
@@ -1363,7 +1424,17 @@ namespace Quasar.Server.Networking
             }
             finally
             {
-                _singleWriteMutex.ReleaseMutex();
+                if (lockTaken)
+                {
+                    try
+                    {
+                        _singleWriteMutex.ReleaseMutex();
+                    }
+                    catch
+                    {
+                        // Ignore: can race with disconnect/teardown.
+                    }
+                }
             }
         }
 

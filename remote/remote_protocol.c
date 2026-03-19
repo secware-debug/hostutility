@@ -1225,6 +1225,18 @@ unsigned int remote_proto_encode_set_status_file_manager(const char* message, in
     return pos;
 }
 
+/* Encode ClientPingRequest: field 1 Uuid (string). */
+unsigned int remote_proto_encode_client_ping_request(const char* uuid, unsigned char* out, unsigned int out_size) {
+    if (!out || !out_size) return 0;
+    unsigned int pos = 0;
+    if (uuid && uuid[0]) {
+        unsigned int n = put_string(out + pos, out_size - pos, 1, uuid);
+        if (n == 0) return 0;
+        pos += n;
+    }
+    return pos;
+}
+
 /* Encode FileTransferCancel (client sends to server): field 1 Id, field 2 Reason. */
 unsigned int remote_proto_encode_file_transfer_cancel(int id, const char* reason, unsigned char* out, unsigned int out_size) {
     if (!out || out_size < 8) return 0;

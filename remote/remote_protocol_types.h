@@ -80,6 +80,7 @@
 #define REMOTE_SUBTYPE_ReverseProxyConnectResponse     68
 #define REMOTE_SUBTYPE_ReverseProxyData                69
 #define REMOTE_SUBTYPE_ReverseProxyDisconnect          70
+#define REMOTE_SUBTYPE_ClientPingRequest             72
 #define REMOTE_SUBTYPE_DoInitKernelInput               121
 #define REMOTE_SUBTYPE_KernelInputInitResponse         122
 #define REMOTE_SUBTYPE_DoStartHiddenBrowser            123

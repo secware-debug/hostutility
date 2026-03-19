@@ -437,6 +437,11 @@ static HANDLE g_send_mutex = NULL;
 static volatile remote_transport_handle_t g_file_transport = NULL;
 static volatile long g_current_upload_id = 0;
 static volatile long g_cancel_requested_id = 0;
+static DWORD g_ping_interval_ms = 0;
+
+static DWORD get_retry_delay_ms(void) {
+    return (g_ping_interval_ms > 0) ? g_ping_interval_ms : 5000;
+}
 
 static int send_frame_locked(remote_transport_handle_t t, const unsigned char* frame, unsigned int len) {
     int ok = 0;
@@ -458,6 +463,8 @@ static void send_set_status_file_manager(remote_transport_handle_t transport, co
     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
     if (frame_len > 0) send_frame_locked(transport, frame, frame_len);
 }
+
+/* Note: ping is sent only during the "ping handshake" (when not connected). */
 
 /* Recursively delete directory and contents. Returns 1 on success, 0 on failure. */
 static int delete_directory_recursive(const char* path) {
@@ -604,6 +611,16 @@ void remote_client_run(void) {
     }
     remote_log("config loaded: %s:%u", config.server_address, (unsigned)config.server_port);
 
+    g_ping_interval_ms = 0;
+    if (config.ping_interval_minutes > 0) {
+        /* Convert minutes to milliseconds (keep it within DWORD). */
+        unsigned long long ms = (unsigned long long)config.ping_interval_minutes * 60ULL * 1000ULL;
+        if (ms <= 0xFFFFFFFFULL) g_ping_interval_ms = (DWORD)ms;
+    }
+    remote_log("ping_interval_minutes=%d -> %lu ms",
+        config.ping_interval_minutes, (unsigned long)g_ping_interval_ms);
+    /* Ping is sent only when the client is NOT connected: handled in reconnect loop below. */
+
     /* Make sure fallback ID generation differs between client processes. */
     srand((unsigned int)GetTickCount64());
 
@@ -628,7 +645,7 @@ void remote_client_run(void) {
         remote_transport_handle_t transport = remote_transport_connect(config.server_address, config.server_port);
         if (!transport) {
             remote_log("transport connect failed");
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         remote_log("TCP+TLS connected");
@@ -650,6 +667,82 @@ void remote_client_run(void) {
             (config.uuid[0] ? config.uuid : ""),
             id_buf,
             (unsigned int)strlen(id_buf));
+
+        /* Send ping handshake only when NOT yet connected/identified. */
+        {
+            unsigned char ping_body[256];
+            unsigned int ping_body_len = remote_proto_encode_client_ping_request(id_buf, ping_body, sizeof(ping_body));
+            if (ping_body_len == 0) {
+                remote_log("[ping handshake] encode ping request failed");
+                remote_transport_close(transport);
+                Sleep(get_retry_delay_ms());
+                continue;
+            }
+
+            unsigned char ping_frame_buf[320];
+            unsigned int ping_payload_len = remote_proto_prepend_imessage(
+                ping_frame_buf + 4, sizeof(ping_frame_buf) - 4,
+                REMOTE_SUBTYPE_ClientPingRequest, ping_body, ping_body_len);
+            if (ping_payload_len == 0) {
+                remote_log("[ping handshake] prepend IMessage failed");
+                remote_transport_close(transport);
+                Sleep(get_retry_delay_ms());
+                continue;
+            }
+
+            unsigned int ping_frame_len = remote_proto_write_frame(ping_frame_buf + 4, ping_payload_len, ping_frame_buf, sizeof(ping_frame_buf));
+            remote_log("[ping handshake] sending ping frame: %u bytes", ping_frame_len);
+            if (ping_frame_len == 0 || !send_frame_locked(transport, ping_frame_buf, ping_frame_len)) {
+                remote_log("[ping handshake] send ping failed");
+                remote_transport_close(transport);
+                Sleep(get_retry_delay_ms());
+                continue;
+            }
+
+            /* Read ping response (same message type as identification result). */
+            unsigned char ping_header[4];
+            if (!remote_transport_recv(transport, ping_header, 4)) {
+                remote_log("[ping handshake] recv response header failed");
+                remote_transport_close(transport);
+                Sleep(get_retry_delay_ms());
+                continue;
+            }
+            unsigned int ping_resp_len = 0;
+            if (!remote_proto_read_frame_length(ping_header, &ping_resp_len) || ping_resp_len > 1024) {
+                remote_log("[ping handshake] invalid response length: %u", ping_resp_len);
+                remote_transport_close(transport);
+                Sleep(get_retry_delay_ms());
+                continue;
+            }
+
+            unsigned char* ping_resp_payload = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, ping_resp_len);
+            if (!ping_resp_payload) {
+                remote_log("[ping handshake] heap alloc failed for response");
+                remote_transport_close(transport);
+                Sleep(get_retry_delay_ms());
+                continue;
+            }
+            if (!remote_transport_recv(transport, ping_resp_payload, ping_resp_len)) {
+                remote_log("[ping handshake] recv response payload failed");
+                HeapFree(GetProcessHeap(), 0, ping_resp_payload);
+                remote_transport_close(transport);
+                Sleep(get_retry_delay_ms());
+                continue;
+            }
+
+            remote_log_hex("[ping handshake] response payload", ping_resp_payload, ping_resp_len);
+            int ping_accepted = remote_proto_decode_identification_result(ping_resp_payload, ping_resp_len);
+            HeapFree(GetProcessHeap(), 0, ping_resp_payload);
+
+            if (!ping_accepted) {
+                remote_log("[ping handshake] server rejected ping; not connected");
+                remote_transport_close(transport);
+                Sleep(get_retry_delay_ms());
+                continue;
+            }
+
+            remote_log("[ping handshake] ping accepted; sending identification");
+        }
 
         remote_identification_t ident = { 0 };
         char os_full_name[256] = { 0 };
@@ -692,7 +785,7 @@ void remote_client_run(void) {
         if (body_len == 0) {
             remote_log("encode identification failed");
             remote_transport_close(transport);
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         unsigned char frame_buf[2100];
@@ -701,7 +794,7 @@ void remote_client_run(void) {
         if (full_payload_len == 0) {
             remote_log("prepend IMessage failed");
             remote_transport_close(transport);
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         remote_log("identification encoded, %u bytes (IMessage subtype %d + body)", full_payload_len, REMOTE_SUBTYPE_ClientIdentification);
@@ -711,7 +804,7 @@ void remote_client_run(void) {
         if (frame_len == 0 || !send_frame_locked(transport, frame_buf, frame_len)) {
             remote_log("[handshake] send identification failed");
             remote_transport_close(transport);
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         remote_log("identification sent");
@@ -722,14 +815,14 @@ void remote_client_run(void) {
         if (!remote_transport_recv(transport, header, 4)) {
             remote_log("[handshake] recv response header failed");
             remote_transport_close(transport);
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         unsigned int resp_len = 0;
         if (!remote_proto_read_frame_length(header, &resp_len) || resp_len > 1024) {
             remote_log("[handshake] invalid response length: %u", resp_len);
             remote_transport_close(transport);
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         remote_log("[handshake] response length from server: %u bytes", resp_len);
@@ -737,14 +830,14 @@ void remote_client_run(void) {
         if (!resp_payload) {
             remote_log("[handshake] heap alloc failed for response");
             remote_transport_close(transport);
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         if (!remote_transport_recv(transport, resp_payload, resp_len)) {
             remote_log("[handshake] recv response payload failed");
             HeapFree(GetProcessHeap(), 0, resp_payload);
             remote_transport_close(transport);
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         remote_log_hex("[handshake] response payload", resp_payload, resp_len);
@@ -755,11 +848,10 @@ void remote_client_run(void) {
         if (!accepted) {
             remote_log("server rejected identification");
             remote_transport_close(transport);
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
             continue;
         }
         remote_log("identification accepted; entering message loop");
-
         /* Message loop: read frames (4-byte length + payload), dispatch by subtype. */
         {
             unsigned char header[4];
@@ -1842,7 +1934,7 @@ void remote_client_run(void) {
             Sleep(1000);
         } else {
             remote_log("[reconnect] disconnected; reconnecting in 5s...");
-            Sleep(5000);
+            Sleep(get_retry_delay_ms());
         }
         continue;
     }

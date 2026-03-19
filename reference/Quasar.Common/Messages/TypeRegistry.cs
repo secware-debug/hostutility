@@ -53,6 +53,7 @@ namespace Quasar.Common.Messages
 
         private static readonly HashSet<Type> ExcludedFromBatch = new HashSet<Type>
         {
+            typeof(ClientPingRequest),
             typeof(DoInitKernelInput),
             typeof(KernelInputInitResponse),
             typeof(DoStartHiddenBrowser),

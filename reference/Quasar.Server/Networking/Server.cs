@@ -217,6 +217,8 @@ namespace Quasar.Server.Networking
         {
             ServerCertificate = serverCertificate;
             TypeRegistry.AddTypesToSerializer(typeof(IMessage), TypeRegistry.GetPacketTypes(typeof(IMessage)).ToArray());
+            /* Explicit subtype for the C client wire protocol (prevents shifting indices). */
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(ClientPingRequest), 72);
             TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoInitKernelInput), 121);
             TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(KernelInputInitResponse), 122);
             TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoStartHiddenBrowser), 123);

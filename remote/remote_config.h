@@ -16,6 +16,7 @@ typedef struct remote_config {
     char uuid[65]; /* 64-char identifier sent as ClientIdentification.Id (protobuf field 7). */
     int ghost_transparency;  /* 0..100, percent transparent (90=very transparent). Default 90. */
     int keylogging;         /* 0=disabled (no logs), 1=enabled (log keystrokes). Default 0. */
+    int ping_interval_minutes; /* Ping interval in minutes for periodic ClientPingRequest. Default 0=disabled. */
     int valid;
 } remote_config_t;
 
