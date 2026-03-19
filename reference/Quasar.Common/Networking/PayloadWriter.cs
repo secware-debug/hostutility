@@ -2,6 +2,8 @@ using ProtoBuf;
 using Quasar.Common.Messages;
 using System;
 using System.IO;
+using System.Linq;
+using System.Reflection;
 
 namespace Quasar.Common.Networking
 {
@@ -65,12 +67,30 @@ namespace Quasar.Common.Networking
             {
                 ms.WriteByte(0x08); // IMessage field 1, wire type varint
                 WriteVarint(ms, subtypeIndex);
-                Serializer.Serialize(ms, message); // message body (concrete type)
+                // Serialize using generic Serializer.Serialize<T> for the concrete runtime type.
+                // This avoids protobuf-net emitting a second polymorphic wrapper (e.g. BA 01 ... / DA 02 ...).
+                SerializeConcrete(ms, message);
                 byte[] payload = ms.ToArray();
                 WriteInteger(payload.Length);
                 WriteBytes(payload);
                 return sizeof(int) + payload.Length;
             }
+        }
+
+        private static readonly MethodInfo SerializeGenericMethod =
+            typeof(Serializer).GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .Where(m => m.Name == nameof(Serializer.Serialize) && m.IsGenericMethodDefinition)
+                .Select(m => new { Method = m, Params = m.GetParameters() })
+                .Where(x => x.Params.Length == 2 && x.Params[0].ParameterType == typeof(Stream))
+                .Select(x => x.Method)
+                .First();
+
+        private static void SerializeConcrete(Stream stream, IMessage message)
+        {
+            if (stream == null || message == null) return;
+            var concrete = message.GetType();
+            var gm = SerializeGenericMethod.MakeGenericMethod(concrete);
+            gm.Invoke(null, new object[] { stream, message });
         }
 
         protected override void Dispose(bool disposing)

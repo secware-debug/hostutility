@@ -10,7 +10,7 @@ namespace Quasar.Common.Messages
     [ProtoContract]
     public class DoSetRemoteControlMode : IMessage
     {
-        [ProtoMember(1)]
+        [ProtoMember(1, IsRequired = true)]
         public RemoteControlMode Mode { get; set; }
     }
 }

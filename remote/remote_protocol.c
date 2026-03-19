@@ -2097,6 +2097,9 @@ int remote_proto_decode_do_set_remote_control_mode(const unsigned char* body, un
     const unsigned char* parse = body;
     unsigned int parse_len = body_len;
     unwrap_optional_42(body, body_len, &parse, &parse_len);
+    /* Unwrap protobuf-net length-delimited envelope (e.g. field 23: BA 01 <len> ...). */
+    unwrap_body_once(parse, parse_len, &parse, &parse_len);
+    if (parse_len == 0) return 1; /* empty payload => default mode 0 (User) */
     if (parse_len >= 2 && parse[0] == 0xE8) {
         unsigned int len_consumed = 0;
         unsigned int inner_len = read_varint(parse + 1, parse_len - 1, &len_consumed);
