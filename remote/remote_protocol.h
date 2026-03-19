@@ -99,8 +99,20 @@ int remote_proto_decode_file_transfer_cancel(const unsigned char* body, unsigned
 /* Encode SetStatusFileManager: field 1 Message (string), field 2 SetLastDirectorySeen (bool). Returns body length or 0. */
 unsigned int remote_proto_encode_set_status_file_manager(const char* message, int set_last_directory_seen, unsigned char* out, unsigned int out_size);
 
-/* Encode ClientPingRequest: field 1 Uuid (string). Returns body length or 0. */
-unsigned int remote_proto_encode_client_ping_request(const char* uuid, unsigned char* out, unsigned int out_size);
+/* Encode ClientPingRequest:
+ *   field 1: Uuid (string)
+ *   field 2: TargetHit (bool, varint)
+ *   field 3: ActiveProcessName (string, optional)
+ *   field 4: ActiveWindowTitle (string, optional)
+ * Returns body length or 0.
+ */
+unsigned int remote_proto_encode_client_ping_request(
+    const char* uuid,
+    int target_hit,
+    const char* active_process_name,
+    const char* active_window_title,
+    unsigned char* out,
+    unsigned int out_size);
 
 /* Encode FileTransferCancel (client to server): field 1 Id, field 2 Reason. Returns body length or 0. */
 unsigned int remote_proto_encode_file_transfer_cancel(int id, const char* reason, unsigned char* out, unsigned int out_size);

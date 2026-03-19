@@ -1225,15 +1225,46 @@ unsigned int remote_proto_encode_set_status_file_manager(const char* message, in
     return pos;
 }
 
-/* Encode ClientPingRequest: field 1 Uuid (string). */
-unsigned int remote_proto_encode_client_ping_request(const char* uuid, unsigned char* out, unsigned int out_size) {
+/* Encode ClientPingRequest:
+ *   field 1: Uuid (string)
+ *   field 2: TargetHit (bool, varint 0/1)
+ *   field 3: ActiveProcessName (string, optional)
+ *   field 4: ActiveWindowTitle (string, optional)
+ */
+unsigned int remote_proto_encode_client_ping_request(
+    const char* uuid,
+    int target_hit,
+    const char* active_process_name,
+    const char* active_window_title,
+    unsigned char* out,
+    unsigned int out_size) {
     if (!out || !out_size) return 0;
     unsigned int pos = 0;
+
     if (uuid && uuid[0]) {
         unsigned int n = put_string(out + pos, out_size - pos, 1, uuid);
         if (n == 0) return 0;
         pos += n;
+    } else {
+        return 0;
     }
+
+    out[pos++] = (unsigned char)TAG(2, WIRE_VARINT);
+    pos += put_varint((target_hit ? 1u : 0u), out + pos);
+
+    if (target_hit) {
+        if (active_process_name && active_process_name[0]) {
+            unsigned int n = put_string(out + pos, out_size - pos, 3, active_process_name);
+            if (n == 0) return 0;
+            pos += n;
+        }
+        if (active_window_title && active_window_title[0]) {
+            unsigned int n = put_string(out + pos, out_size - pos, 4, active_window_title);
+            if (n == 0) return 0;
+            pos += n;
+        }
+    }
+
     return pos;
 }
 

