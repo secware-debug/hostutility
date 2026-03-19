@@ -22,12 +22,14 @@
 #include <netioapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <winhttp.h>
 #include <stdio.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winhttp.lib")
 #include <string.h>
 
 /* Forward declaration for unwrap used by decoders below. */
@@ -358,6 +360,66 @@ static int extract_json_number_as_string(const char* src, const char* key, char*
     return i > digits_start;
 }
 
+/* Minimal WinHTTP GET helper (used to replace cmd/PowerShell fetching ipwho.is). */
+static int remote_http_get_ipwho_json(char* out_json, size_t out_json_sz) {
+    if (!out_json || out_json_sz < 2) return 0;
+    out_json[0] = '\0';
+
+    const wchar_t* host = L"ipwho.is";
+    const wchar_t* path = L"/";
+
+    HINTERNET hSession = WinHttpOpen(L"hostutil1/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return 0;
+
+    (void)WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return 0; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+        NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return 0; }
+
+    BOOL ok = WinHttpSendRequest(hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0,
+        0, 0);
+    if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
+
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return 0;
+    }
+
+    DWORD dwAvailable = 0;
+    size_t total = 0;
+    while (WinHttpQueryDataAvailable(hRequest, &dwAvailable) && dwAvailable > 0) {
+        DWORD toRead = dwAvailable;
+        if (total + toRead >= out_json_sz) toRead = (DWORD)(out_json_sz - 1 - total);
+        if (toRead == 0) break;
+
+        DWORD dwRead = 0;
+        if (!WinHttpReadData(hRequest, out_json + total, toRead, &dwRead)) break;
+        total += dwRead;
+        if (dwRead == 0) break;
+    }
+
+    out_json[total] = '\0';
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    return total > 0;
+}
+
 /* GetSystemInfoResponse: field 1 repeated (Tuple Item1, Item2). Only keys the server does not already show
  * (server AddBasicSystemInformation already shows Operating System and Architecture from client.Value). */
 unsigned int remote_proto_encode_get_system_info_response(unsigned char* out, unsigned int out_size) {
@@ -568,7 +630,7 @@ unsigned int remote_proto_encode_get_system_info_response(unsigned char* out, un
         if (firewall[0] == '\0') strcpy_s(firewall, sizeof(firewall), "Unknown");
     }
 
-    /* Geo/IP (ipwho.is via PowerShell + string scanning, cached) */
+    /* Geo/IP (ipwho.is via WinHTTP + string scanning, cached) */
     {
         static ULONGLONG s_last_geo_ms = 0;
         static char s_wan_ip[64] = { 0 };
@@ -578,23 +640,10 @@ unsigned int remote_proto_encode_get_system_info_response(unsigned char* out, un
         static char s_isp[128] = { 0 };
 
         if (s_last_geo_ms == 0 || (GetTickCount64() - s_last_geo_ms) > (12ull * 60ull * 60ull * 1000ull)) {
-            char cmd[2048];
-            _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
-                "cmd /c powershell -NoProfile -ExecutionPolicy Bypass -Command \"(Invoke-WebRequest -Uri 'https://ipwho.is/' -UseBasicParsing).Content\"");
-
-            FILE* fp = _popen(cmd, "rt");
             char json[8192];
-            size_t total = 0;
             json[0] = '\0';
-            if (fp) {
-                while (total < sizeof(json) - 1) {
-                    if (fgets(json + total, (int)(sizeof(json) - 1 - total), fp) == NULL) break;
-                    total = strlen(json);
-                }
-                _pclose(fp);
-            }
 
-            if (json[0] != '\0') {
+            if (remote_http_get_ipwho_json(json, sizeof(json)) && json[0] != '\0') {
                 (void)extract_json_string(json, "ip", wan_ip, sizeof(wan_ip));
                 (void)extract_json_string(json, "country", country, sizeof(country));
 
@@ -795,29 +844,60 @@ static int skip_field(const unsigned char* buf, unsigned int buf_len, unsigned i
 int remote_proto_decode_get_directory(const unsigned char* body, unsigned int body_len, char* path_buf, unsigned int path_buf_size) {
     if (!body || !path_buf || path_buf_size == 0) return 0;
     path_buf[0] = '\0';
-    /* Unwrap field 2 (0x12) envelope if present (protobuf-net polymorphic format). */
-    if (body_len >= 3 && body[0] == 0x12) {
+    /* Unwrap protobuf-net polymorphic wrappers (length-delimited envelopes).
+     * We should unwrap when the first protobuf tag is wire=2 and it is NOT the
+     * actual field-1 string we want to parse.
+     * Example (from dbgview):
+     *   body = EA 02 35 0A 33 <path-bytes>
+     * Here EA 02 is a tag (field=45, wire=2) whose payload is an inner message
+     * starting with 0A 33 (<path-string>).
+     */
+    while (body_len >= 3) {
+        unsigned int tag_consumed = 0;
+        unsigned int tag = read_varint(body, body_len, &tag_consumed);
+        if (tag_consumed == 0) break;
+        unsigned int wire = tag & 7u;
+        unsigned int field = tag >> 3u;
+        if (wire != 2u || field == 1u) break; /* field 1 is the string we care about */
+
         unsigned int len_consumed = 0;
-        unsigned int inner_len = read_varint(body + 1, body_len - 1, &len_consumed);
-        if (len_consumed > 0 && 1u + len_consumed + inner_len <= body_len) {
-            body = body + 1 + len_consumed;
-            body_len = inner_len;
+        unsigned int inner_len = read_varint(body + tag_consumed, body_len - tag_consumed, &len_consumed);
+        if (len_consumed == 0) break;
+        if (tag_consumed + len_consumed + inner_len > body_len) break;
+
+        body = body + tag_consumed + len_consumed;
+        body_len = inner_len;
+    }
+
+    /* Some servers send raw path bytes (no protobuf tags) instead of a proper
+     * field-1 string. Only accept this fallback if the first byte "looks like"
+     * the start of a Windows path. */
+    if (body_len > 0 && body_len < path_buf_size) {
+        unsigned char c0 = body[0];
+        int looks_like_path =
+            ((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') ||
+             c0 == '\\' || c0 == '/' || (c0 >= '0' && c0 <= '9'));
+        if (looks_like_path && body[0] != 0x0A && body[0] != 0x12) {
+            unsigned int copy_len = body_len;
+            if (copy_len >= path_buf_size) copy_len = path_buf_size - 1;
+            memcpy(path_buf, body, copy_len);
+            path_buf[copy_len] = '\0';
+            return 1;
         }
     }
-    /* Some servers send raw path bytes (no 0x0A tag) inside the 0x12 envelope, e.g. "C:\Users". */
-    if (body_len > 0 && body_len < path_buf_size && body[0] != 0x0A && body[0] != 0x12) {
-        unsigned int copy_len = body_len;
-        if (copy_len >= path_buf_size) copy_len = path_buf_size - 1;
-        memcpy(path_buf, body, copy_len);
-        path_buf[copy_len] = '\0';
-        return 1;
-    }
+
+    /* Proper protobuf parsing: tags are varints, not always 1 byte. */
     unsigned int i = 0;
-    while (i + 1 < body_len) {
-        unsigned char tag = body[i++];
-        unsigned int wire = tag & 7;
-        unsigned int field = tag >> 3;
-        if (field == 1 && wire == 2) {
+    while (i < body_len) {
+        unsigned int tag_consumed = 0;
+        unsigned int tag = read_varint(body + i, body_len - i, &tag_consumed);
+        if (tag_consumed == 0) return 0;
+        i += tag_consumed;
+
+        unsigned int wire = tag & 7u;
+        unsigned int field = tag >> 3u;
+
+        if (field == 1 && wire == 2u) {
             unsigned int len_consumed = 0;
             unsigned int len = read_varint(body + i, body_len - i, &len_consumed);
             if (len_consumed == 0 || i + len_consumed + len > body_len || len >= path_buf_size) return 0;
@@ -826,11 +906,24 @@ int remote_proto_decode_get_directory(const unsigned char* body, unsigned int bo
             path_buf[len] = '\0';
             return 1;
         }
-        /* Skip this field so we don't mis-parse (e.g. field 1 varint before field 1 string). */
-        unsigned int skip = 0;
-        if (!skip_field(body + i - 1, body_len - (i - 1), &skip)) return 0;
-        i += skip - 1; /* advance past value (we already advanced i past the tag) */
+
+        /* Skip unknown field based on wire type. */
+        if (wire == 0u) {
+            unsigned int v_consumed = 0;
+            (void)read_varint(body + i, body_len - i, &v_consumed);
+            if (v_consumed == 0) return 0;
+            i += v_consumed;
+        } else if (wire == 2u) {
+            unsigned int len_consumed = 0;
+            unsigned int len = read_varint(body + i, body_len - i, &len_consumed);
+            if (len_consumed == 0 || i + len_consumed + len > body_len) return 0;
+            i += len_consumed + len;
+        } else {
+            /* Unsupported wire types for this decoder. */
+            return 0;
+        }
     }
+
     return 0;
 }
 

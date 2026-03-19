@@ -18,11 +18,13 @@
 #include <Shellapi.h>
 #include <PowrProf.h>
 #include <sddl.h>
+#include <winhttp.h>
 #include <stdio.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "powrprof.lib")
+#pragma comment(lib, "winhttp.lib")
 #include <stdlib.h>
 #include <string.h>
 
@@ -80,6 +82,68 @@ static int extract_json_string_basic(const char* src, const char* key, char* dst
     return i > 0;
 }
 
+/* Minimal WinHTTP GET helper (used to replace cmd/PowerShell fetching ipwho.is). */
+static int remote_http_get_ipwho_json(char* out_json, size_t out_json_sz) {
+    if (!out_json || out_json_sz < 2) return 0;
+    out_json[0] = '\0';
+
+    const wchar_t* host = L"ipwho.is";
+    const wchar_t* path = L"/";
+
+    HINTERNET hSession = WinHttpOpen(L"hostutil1/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return 0;
+
+    /* Best-effort timeouts to avoid hanging identification payload creation. */
+    (void)WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return 0; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+        NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return 0; }
+
+    BOOL ok = WinHttpSendRequest(hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0,
+        0, 0);
+    if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
+
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return 0;
+    }
+
+    DWORD dwAvailable = 0;
+    size_t total = 0;
+    while (WinHttpQueryDataAvailable(hRequest, &dwAvailable) && dwAvailable > 0) {
+        DWORD toRead = dwAvailable;
+        if (total + toRead >= out_json_sz) toRead = (DWORD)(out_json_sz - 1 - total);
+        if (toRead == 0) break;
+
+        DWORD dwRead = 0;
+        if (!WinHttpReadData(hRequest, out_json + total, toRead, &dwRead)) break;
+        total += dwRead;
+
+        if (dwRead == 0) break;
+    }
+
+    out_json[total] = '\0';
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    return total > 0;
+}
+
 /* Best-effort IP geolocation for identification payload. */
 static void remote_get_geo_country_and_code(char* out_country, size_t out_country_sz, char* out_code, size_t out_code_sz) {
     if (!out_country || !out_code || out_country_sz < 3 || out_code_sz < 2) return;
@@ -89,28 +153,15 @@ static void remote_get_geo_country_and_code(char* out_country, size_t out_countr
     static char s_code[32] = { 0 };
 
     if (s_last_geo_ms == 0 || (GetTickCount64() - s_last_geo_ms) > (12ull * 60ull * 60ull * 1000ull)) {
-        char cmd[2048];
-        _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
-            "cmd /c powershell -NoProfile -ExecutionPolicy Bypass -Command \"(Invoke-WebRequest -Uri 'https://ipwho.is/' -UseBasicParsing).Content\"");
-
-        FILE* fp = _popen(cmd, "rt");
         char json[4096];
-        size_t total = 0;
         json[0] = '\0';
-        if (fp) {
-            while (total < sizeof(json) - 1) {
-                if (fgets(json + total, (int)(sizeof(json) - 1 - total), fp) == NULL) break;
-                total = strlen(json);
-            }
-            _pclose(fp);
-        }
 
         char c[128] = { 0 };
         char code[32] = { 0 };
         c[0] = '\0';
         code[0] = '\0';
 
-        if (json[0] != '\0') {
+        if (remote_http_get_ipwho_json(json, sizeof(json)) && json[0] != '\0') {
             (void)extract_json_string_basic(json, "country", c, sizeof(c));
             (void)extract_json_string_basic(json, "country_code", code, sizeof(code));
         }
