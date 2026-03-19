@@ -129,7 +129,11 @@ namespace Quasar.Server.Networking
 
         private bool IdentifyClient(Client client, ClientIdentification packet)
         {
-            if (packet.Id.Length != 64)
+            if (string.IsNullOrWhiteSpace(packet.Id))
+                return false;
+
+            /* Support both legacy auto-generated 64-char IDs and user-provided GUID-style 36-char IDs. */
+            if (packet.Id.Length != 64 && packet.Id.Length != 36)
                 return false;
 
             client.Value.Version = packet.Version;

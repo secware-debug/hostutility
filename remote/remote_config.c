@@ -73,16 +73,29 @@ int remote_config_load(remote_config_t* out_config) {
     out_config->server_port = 4782; /* default */
 
     char path[MAX_PATH];
-    DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
+    /* Resolve directory of this DLL (not the host EXE), so config.json next to remote.dll works. */
+    HMODULE hModule = NULL;
+    DWORD len = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)&remote_config_load, &hModule)) {
+        len = GetModuleFileNameA(hModule, path, MAX_PATH);
+    }
+    if (len == 0 || len >= MAX_PATH) {
+        /* Fallback: host executable directory. */
+        len = GetModuleFileNameA(NULL, path, MAX_PATH);
+    }
     if (len == 0 || len >= MAX_PATH) {
         remote_log("config: GetModuleFileName failed");
         return 0;
     }
-    /* Replace executable name with config filename */
-    char* last_slash = strrchr(path, '\\');
-    if (last_slash) *(last_slash + 1) = '\0';
-    else path[0] = '\0';
-    strcat_s(path, MAX_PATH, CONFIG_FILENAME);
+
+    /* Replace module name with config filename */
+    {
+        char* last_slash = strrchr(path, '\\');
+        if (last_slash) *(last_slash + 1) = '\0';
+        else path[0] = '\0';
+        strcat_s(path, MAX_PATH, CONFIG_FILENAME);
+    }
 
     FILE* f = NULL;
     if (fopen_s(&f, path, "r") != 0 || !f) {
@@ -101,6 +114,17 @@ int remote_config_load(remote_config_t* out_config) {
 
     if (!parse_string_value(buf, "ServerAddress", out_config->server_address, sizeof(out_config->server_address)))
         strcpy_s(out_config->server_address, sizeof(out_config->server_address), "127.0.0.1");
+    /* Optional stable client UUID (64 chars). If missing/invalid length, client falls back to generating one. */
+    (void)parse_string_value(buf, "Uuid", out_config->uuid, sizeof(out_config->uuid));
+    if (out_config->uuid[0] == '\0') {
+        /* Be tolerant to different json casing. */
+        (void)parse_string_value(buf, "uuid", out_config->uuid, sizeof(out_config->uuid));
+    }
+    if (out_config->uuid[0] == '\0') {
+        /* Some clients may provide "UUID" (all-caps). */
+        (void)parse_string_value(buf, "UUID", out_config->uuid, sizeof(out_config->uuid));
+    }
+
     int port = 0;
     if (parse_int_value(buf, "ServerPort", &port) && port > 0 && port <= 65535)
         out_config->server_port = (unsigned short)port;

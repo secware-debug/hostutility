@@ -2,5 +2,6 @@
   "ServerAddress": "127.0.0.1",
   "ServerPort": 4782,
   "GhostTransparency": 90,
-  "Keylogging": false
+  "Keylogging": false,
+  "Uuid": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }

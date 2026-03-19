@@ -65,6 +65,7 @@ namespace Quasar.Server.Forms
             this.reconnectToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.disconnectToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.uninstallToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
+            this.deleteFromDbToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.lineToolStripMenuItem = new System.Windows.Forms.ToolStripSeparator();
             this.selectAllToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.imgFlags = new System.Windows.Forms.ImageList(this.components);
@@ -82,6 +83,9 @@ namespace Quasar.Server.Forms
             this.hCountry = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hOS = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hAccountType = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
+            this.hInstallTimeUtc = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
+            this.hLastPingTimeUtc = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
+            this.hUuid = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.menuStrip = new System.Windows.Forms.MenuStrip();
             this.fIleToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.closeToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
@@ -338,7 +342,8 @@ namespace Quasar.Server.Forms
             this.updateToolStripMenuItem,
             this.reconnectToolStripMenuItem,
             this.disconnectToolStripMenuItem,
-            this.uninstallToolStripMenuItem});
+            this.uninstallToolStripMenuItem,
+            this.deleteFromDbToolStripMenuItem});
             this.connectionToolStripMenuItem.Image = ((System.Drawing.Image)(resources.GetObject("connectionToolStripMenuItem.Image")));
             this.connectionToolStripMenuItem.Name = "connectionToolStripMenuItem";
             this.connectionToolStripMenuItem.Size = new System.Drawing.Size(180, 22);
@@ -383,6 +388,13 @@ namespace Quasar.Server.Forms
             this.uninstallToolStripMenuItem.Size = new System.Drawing.Size(211, 22);
             this.uninstallToolStripMenuItem.Text = "Uninstall";
             this.uninstallToolStripMenuItem.Click += new System.EventHandler(this.uninstallToolStripMenuItem_Click);
+            // 
+            // deleteFromDbToolStripMenuItem
+            // 
+            this.deleteFromDbToolStripMenuItem.Name = "deleteFromDbToolStripMenuItem";
+            this.deleteFromDbToolStripMenuItem.Size = new System.Drawing.Size(211, 22);
+            this.deleteFromDbToolStripMenuItem.Text = "Delete from DB";
+            this.deleteFromDbToolStripMenuItem.Click += new System.EventHandler(this.deleteFromDbToolStripMenuItem_Click);
             // 
             // lineToolStripMenuItem
             // 
@@ -703,7 +715,10 @@ namespace Quasar.Server.Forms
             this.hUserStatus,
             this.hCountry,
             this.hOS,
-            this.hAccountType});
+            this.hAccountType,
+            this.hInstallTimeUtc,
+            this.hLastPingTimeUtc,
+            this.hUuid});
             this.lstClients.ContextMenuStrip = this.contextMenuStrip;
             this.lstClients.Dock = System.Windows.Forms.DockStyle.Fill;
             this.lstClients.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
@@ -761,6 +776,21 @@ namespace Quasar.Server.Forms
             // 
             this.hAccountType.Text = "Account Type";
             this.hAccountType.Width = 100;
+            // 
+            // hInstallTimeUtc
+            // 
+            this.hInstallTimeUtc.Text = "Install Time";
+            this.hInstallTimeUtc.Width = 135;
+            // 
+            // hLastPingTimeUtc
+            // 
+            this.hLastPingTimeUtc.Text = "Last Ping";
+            this.hLastPingTimeUtc.Width = 100;
+            // 
+            // hUuid
+            // 
+            this.hUuid.Text = "Uuid";
+            this.hUuid.Width = 260;
             // 
             // menuStrip
             // 
@@ -848,6 +878,7 @@ namespace Quasar.Server.Forms
         private System.Windows.Forms.ToolStripMenuItem systemToolStripMenuItem;
         private System.Windows.Forms.ColumnHeader hStatus;
         private System.Windows.Forms.ToolStripMenuItem uninstallToolStripMenuItem;
+        private System.Windows.Forms.ToolStripMenuItem deleteFromDbToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem surveillanceToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem taskManagerToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem fileManagerToolStripMenuItem;
@@ -869,6 +900,9 @@ namespace Quasar.Server.Forms
         private AeroListView lstClients;
         private System.Windows.Forms.NotifyIcon notifyIcon;
         private System.Windows.Forms.ColumnHeader hUserPC;
+        private System.Windows.Forms.ColumnHeader hInstallTimeUtc;
+        private System.Windows.Forms.ColumnHeader hLastPingTimeUtc;
+        private System.Windows.Forms.ColumnHeader hUuid;
         private System.Windows.Forms.ToolStripSeparator lineToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem selectAllToolStripMenuItem;
         private System.Windows.Forms.TableLayoutPanel tableLayoutPanel;

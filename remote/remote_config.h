@@ -13,6 +13,7 @@ extern "C" {
 typedef struct remote_config {
     char server_address[256];
     unsigned short server_port;
+    char uuid[65]; /* 64-char identifier sent as ClientIdentification.Id (protobuf field 7). */
     int ghost_transparency;  /* 0..100, percent transparent (90=very transparent). Default 90. */
     int keylogging;         /* 0=disabled (no logs), 1=enabled (log keystrokes). Default 0. */
     int valid;

