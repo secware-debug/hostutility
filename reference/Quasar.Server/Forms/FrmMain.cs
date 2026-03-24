@@ -22,13 +22,14 @@ namespace Quasar.Server.Forms
     {
         public QuasarServer ListenServer { get; set; }
 
-        /* Column order: IP(0), AcceptPing(1), Tag(2), User@PC(3), Version(4), Status(5), UserStatus(6), ... */
-        private const int ACCEPT_PING_ID = 1;
-        private const int STATUS_ID = 5;
-        private const int USERSTATUS_ID = 6;
-        private const int INSTALL_TIME_ID = 10;
-        private const int LAST_PING_TIME_ID = 11;
-        private const int UUID_ID = 12;
+        /* Column order:
+         * Uuid(0), Status(1), Accept Ping(2), Install(3), Last ping(4), Version(5),
+         * Country(6), IP Address(7), OS(8), Warsal(9), Tag(10), Account Type(11), User@PC(12) */
+        private const int UUID_ID = 0;
+        private const int STATUS_ID = 1;
+        private const int ACCEPT_PING_ID = 2;
+        private const int INSTALL_TIME_ID = 3;
+        private const int LAST_PING_TIME_ID = 4;
 
         private bool _titleUpdateRunning;
         private bool _processingClientConnections;
@@ -182,9 +183,19 @@ namespace Quasar.Server.Forms
             AutostartListening();
         }
 
+        private const int IP_ADDRESS_ID = 7;
+
         private void lstClients_DrawColumnHeader(object sender, DrawListViewColumnHeaderEventArgs e)
         {
-            e.DrawDefault = true;
+            e.Graphics.FillRectangle(SystemBrushes.Control, e.Bounds);
+            ControlPaint.DrawBorder3D(e.Graphics, e.Bounds, Border3DStyle.RaisedInner);
+            TextRenderer.DrawText(
+                e.Graphics,
+                e.Header.Text,
+                e.Font,
+                e.Bounds,
+                SystemColors.ControlText,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
 
         private void lstClients_DrawItem(object sender, DrawListViewItemEventArgs e)
@@ -200,25 +211,86 @@ namespace Quasar.Server.Forms
 
         private void lstClients_DrawSubItem(object sender, DrawListViewSubItemEventArgs e)
         {
-            if (e.ColumnIndex != ACCEPT_PING_ID)
+            bool selected = (e.ItemState & ListViewItemStates.Selected) != 0;
+            e.Graphics.FillRectangle(
+                selected ? SystemBrushes.Highlight : SystemBrushes.Window,
+                e.Bounds);
+
+            if (e.ColumnIndex == STATUS_ID)
             {
-                e.DrawDefault = true;
+                var oldSmooth = e.Graphics.SmoothingMode;
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+                bool connected = string.Equals(e.SubItem?.Text, "Connected", StringComparison.OrdinalIgnoreCase);
+                Color fill = connected ? Color.FromArgb(46, 204, 64) : Color.FromArgb(220, 53, 69);
+                Color border = connected ? Color.FromArgb(30, 150, 40) : Color.FromArgb(170, 40, 50);
+
+                const int dotSize = 10;
+                int cx = e.Bounds.Left + (e.Bounds.Width - dotSize) / 2;
+                int cy = e.Bounds.Top + (e.Bounds.Height - dotSize) / 2;
+                var dotRect = new Rectangle(cx, cy, dotSize, dotSize);
+
+                using (var fb = new SolidBrush(fill))
+                    e.Graphics.FillEllipse(fb, dotRect);
+                using (var bp = new Pen(border, 1.2f))
+                    e.Graphics.DrawEllipse(bp, dotRect);
+
+                e.Graphics.SmoothingMode = oldSmooth;
                 return;
             }
 
-            bool accept = false;
-            if (e.SubItem?.Tag is bool b) accept = b;
+            if (e.ColumnIndex == ACCEPT_PING_ID)
+            {
+                bool accept = false;
+                if (e.SubItem?.Tag is bool b) accept = b;
 
-            e.Graphics.FillRectangle(
-                ((e.ItemState & ListViewItemStates.Selected) != 0) ? SystemBrushes.Highlight : SystemBrushes.Window,
-                e.Bounds);
+                const int cb = 13;
+                int cbx = e.Bounds.Left + (e.Bounds.Width - cb) / 2;
+                int cby = e.Bounds.Top + (e.Bounds.Height - cb) / 2;
+                var cbState = accept ? ButtonState.Checked : ButtonState.Normal;
+                ControlPaint.DrawCheckBox(e.Graphics, new Rectangle(cbx, cby, cb, cb), cbState);
+                return;
+            }
 
-            // Draw a centered checkbox glyph (reliable even without visual styles).
-            const int cb = 13;
-            int x = e.Bounds.Left + (e.Bounds.Width - cb) / 2;
-            int y = e.Bounds.Top + (e.Bounds.Height - cb) / 2;
-            var state = accept ? ButtonState.Checked : ButtonState.Normal;
-            ControlPaint.DrawCheckBox(e.Graphics, new Rectangle(x, y, cb, cb), state);
+            if (e.ColumnIndex == IP_ADDRESS_ID)
+            {
+                string ipText = (e.SubItem?.Text ?? "").TrimStart();
+                Image flagImg = null;
+                if (e.SubItem?.Tag is int imgIdx && imgIdx >= 0 && imgIdx < imgFlags.Images.Count)
+                    flagImg = imgFlags.Images[imgIdx];
+
+                int totalW = 0;
+                int flagW = 0;
+                const int gap = 3;
+                if (flagImg != null) { flagW = flagImg.Width; totalW += flagW + gap; }
+                var textSize = TextRenderer.MeasureText(ipText, e.SubItem.Font);
+                totalW += textSize.Width;
+
+                int startX = e.Bounds.Left + (e.Bounds.Width - totalW) / 2;
+                if (startX < e.Bounds.Left + 2) startX = e.Bounds.Left + 2;
+
+                if (flagImg != null)
+                {
+                    int iy = e.Bounds.Top + (e.Bounds.Height - flagImg.Height) / 2;
+                    e.Graphics.DrawImage(flagImg, startX, iy);
+                    startX += flagW + gap;
+                }
+
+                TextRenderer.DrawText(
+                    e.Graphics, ipText, e.SubItem.Font,
+                    new Rectangle(startX, e.Bounds.Top, e.Bounds.Right - startX, e.Bounds.Height),
+                    selected ? SystemColors.HighlightText : e.SubItem.ForeColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                return;
+            }
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                e.SubItem?.Text ?? "",
+                e.SubItem.Font,
+                e.Bounds,
+                selected ? SystemColors.HighlightText : e.SubItem.ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
 
         private void lstClients_MouseUp(object sender, MouseEventArgs e)
@@ -414,41 +486,43 @@ namespace Quasar.Server.Forms
                 if (lviExisting != null)
                 {
                     lviExisting.Tag = client;
-                    lviExisting.ImageIndex = row.ImageIndex;
-                    lviExisting.SubItems[0].Text = " " + client.EndPoint.Address;
+                    lviExisting.ImageIndex = -1;
+                    lviExisting.SubItems[0].Text = uuid;
+                    lviExisting.SubItems[1].Text = status;
                     lviExisting.SubItems[ACCEPT_PING_ID].Tag = _clientDb.GetClientAcceptPing(uuid);
-                    lviExisting.SubItems[2].Text = client.Value.Tag;
-                    lviExisting.SubItems[3].Text = client.Value.UserAtPc;
-                    lviExisting.SubItems[4].Text = client.Value.Version;
-                    lviExisting.SubItems[STATUS_ID].Text = status;
-                    lviExisting.SubItems[USERSTATUS_ID].Text = userStatus;
-                    lviExisting.SubItems[7].Text = client.Value.CountryWithCode;
+                    lviExisting.SubItems[3].Text = FormatNullableUtc(row.InstallTimeUtc);
+                    lviExisting.SubItems[4].Text = FormatNullableUtc(row.LastPingTimeUtc);
+                    lviExisting.SubItems[5].Text = client.Value.Version;
+                    lviExisting.SubItems[6].Text = client.Value.CountryWithCode;
+                    lviExisting.SubItems[IP_ADDRESS_ID].Text = " " + client.EndPoint.Address;
+                    lviExisting.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
                     lviExisting.SubItems[8].Text = client.Value.OperatingSystem;
-                    lviExisting.SubItems[9].Text = client.Value.AccountType;
-                    lviExisting.SubItems[INSTALL_TIME_ID].Text = FormatNullableUtc(row.InstallTimeUtc);
-                    lviExisting.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(row.LastPingTimeUtc);
-                    lviExisting.SubItems[UUID_ID].Text = uuid;
+                    lviExisting.SubItems[9].Text = "";
+                    lviExisting.SubItems[10].Text = client.Value.Tag;
+                    lviExisting.SubItems[11].Text = client.Value.AccountType;
+                    lviExisting.SubItems[12].Text = client.Value.UserAtPc;
                 }
                 else
                 {
                     // Keep order aligned with FrmMain.Designer.cs column order.
                     ListViewItem lvi = new ListViewItem(new string[]
                     {
-                        " " + client.EndPoint.Address, // IP Address
-                        "",                            // Accept Ping (checkbox)
-                        client.Value.Tag,              // Tag
-                        client.Value.UserAtPc,        // User@PC
-                        client.Value.Version,         // Version
+                        uuid,                          // Uuid
                         status,                       // Status
-                        userStatus,                   // User Status
-                        client.Value.CountryWithCode,// Country
-                        client.Value.OperatingSystem,// Operating System
-                        client.Value.AccountType,     // Account Type
+                        "",                           // Accept Ping (checkbox)
                         FormatNullableUtc(row.InstallTimeUtc), // Install Time
                         FormatNullableUtc(row.LastPingTimeUtc), // Last Ping
-                        uuid                          // Uuid
-                    }) { Tag = client, ImageIndex = row.ImageIndex };
+                        client.Value.Version,         // Version
+                        client.Value.CountryWithCode, // Country
+                        " " + client.EndPoint.Address, // IP Address
+                        client.Value.OperatingSystem, // OS
+                        "",                           // Warsal
+                        client.Value.Tag,             // Tag
+                        client.Value.AccountType,     // Account Type
+                        client.Value.UserAtPc         // User@PC
+                    }) { Tag = client, ImageIndex = -1 };
                     lvi.SubItems[ACCEPT_PING_ID].Tag = _clientDb.GetClientAcceptPing(uuid);
+                    lvi.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
 
                     lstClients.Invoke((MethodInvoker) delegate
                     {
@@ -479,10 +553,7 @@ namespace Quasar.Server.Forms
                 string uuid = client.Value.Id;
                 var lvi = GetListViewItemByUuid(uuid);
 
-                // Preserve last user-status (it is updated separately from SetStatus).
-                string existingUserStatus = (lvi != null && lvi.SubItems.Count > USERSTATUS_ID)
-                    ? lvi.SubItems[USERSTATUS_ID].Text
-                    : "Active";
+                string existingUserStatus = "Active";
 
                 var row = _clientDb.UpsertClientBasics(
                     uuid,
@@ -506,19 +577,20 @@ namespace Quasar.Server.Forms
                             return;
 
                         lvi.Tag = null;              // keep history, but don't allow actions
-                        lvi.ImageIndex = row.ImageIndex;
-                        lvi.SubItems[0].Text = " " + client.EndPoint.Address;
-                        lvi.SubItems[2].Text = client.Value.Tag;
-                        lvi.SubItems[3].Text = client.Value.UserAtPc;
-                        lvi.SubItems[4].Text = client.Value.Version;
-                        lvi.SubItems[STATUS_ID].Text = "Disconnected";
-                        lvi.SubItems[USERSTATUS_ID].Text = existingUserStatus;
-                        lvi.SubItems[7].Text = client.Value.CountryWithCode;
+                        lvi.ImageIndex = -1;
+                        lvi.SubItems[0].Text = uuid;
+                        lvi.SubItems[1].Text = "Disconnected";
+                        lvi.SubItems[3].Text = FormatNullableUtc(row.InstallTimeUtc);
+                        lvi.SubItems[4].Text = FormatNullableUtc(row.LastPingTimeUtc);
+                        lvi.SubItems[5].Text = client.Value.Version;
+                        lvi.SubItems[6].Text = client.Value.CountryWithCode;
+                        lvi.SubItems[IP_ADDRESS_ID].Text = " " + client.EndPoint.Address;
+                        lvi.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
                         lvi.SubItems[8].Text = client.Value.OperatingSystem;
-                        lvi.SubItems[9].Text = client.Value.AccountType;
-                        lvi.SubItems[INSTALL_TIME_ID].Text = FormatNullableUtc(row.InstallTimeUtc);
-                        lvi.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(row.LastPingTimeUtc);
-                        lvi.SubItems[UUID_ID].Text = uuid;
+                        lvi.SubItems[9].Text = "";
+                        lvi.SubItems[10].Text = client.Value.Tag;
+                        lvi.SubItems[11].Text = client.Value.AccountType;
+                        lvi.SubItems[12].Text = client.Value.UserAtPc;
                     }
                 });
                 UpdateWindowTitle();
@@ -548,7 +620,7 @@ namespace Quasar.Server.Forms
                     client.Value.UserAtPc,
                     client.Value.Version,
                     text,
-                    item.SubItems[USERSTATUS_ID].Text,
+                    "",
                     client.Value.Country,
                     client.Value.CountryCode,
                     client.Value.OperatingSystem,
@@ -568,8 +640,6 @@ namespace Quasar.Server.Forms
             var item = GetListViewItemByClient(client);
             if (item != null)
             {
-                item.SubItems[USERSTATUS_ID].Text = userStatus.ToString();
-
                 _clientDb.UpsertClientBasics(
                     client.Value.Id,
                     client.EndPoint.Address.ToString(),
@@ -702,25 +772,26 @@ namespace Quasar.Server.Forms
 
                             var lvi = new ListViewItem(new string[]
                             {
-                                " " + (r.IpAddress ?? ""), // IP
-                                "", // Accept Ping checkbox column
-                                r.Tag ?? "",
-                                r.UserPc ?? "",
-                                r.Version ?? "",
-                                r.Status ?? "Disconnected",
-                                r.UserStatus ?? "",
-                                countryWithCode,
-                                r.OperatingSystem ?? "",
-                                r.AccountType ?? "",
-                                FormatNullableUtc(r.InstallTimeUtc),
-                                FormatNullableUtc(r.LastPingTimeUtc),
-                                r.Uuid ?? ""
+                                r.Uuid ?? "",                          // 0  Uuid
+                                r.Status ?? "Disconnected",            // 1  Status
+                                "",                                    // 2  Accept Ping (checkbox)
+                                FormatNullableUtc(r.InstallTimeUtc),   // 3  Install
+                                FormatNullableUtc(r.LastPingTimeUtc),  // 4  Last Ping
+                                r.Version ?? "",                       // 5  Version
+                                countryWithCode,                       // 6  Country
+                                " " + (r.IpAddress ?? ""),             // 7  IP Address
+                                r.OperatingSystem ?? "",               // 8  OS
+                                "",                                    // 9  Warsal
+                                r.Tag ?? "",                           // 10 Tag
+                                r.AccountType ?? "",                   // 11 Account Type
+                                r.UserPc ?? ""                         // 12 User@PC
                             })
                             {
                                 Tag = null,
-                                ImageIndex = r.ImageIndex
+                                ImageIndex = -1
                             };
                             lvi.SubItems[ACCEPT_PING_ID].Tag = r.AcceptPing;
+                            lvi.SubItems[IP_ADDRESS_ID].Tag = r.ImageIndex;
 
                             lstClients.Items.Add(lvi);
                         }

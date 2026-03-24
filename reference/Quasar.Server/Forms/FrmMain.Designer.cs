@@ -80,7 +80,7 @@ namespace Quasar.Server.Forms
             this.hUserPC = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hVersion = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hStatus = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
-            this.hUserStatus = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
+            this.hWarsal = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hCountry = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hOS = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hAccountType = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
@@ -708,19 +708,19 @@ namespace Quasar.Server.Forms
             // lstClients
             // 
             this.lstClients.Columns.AddRange(new System.Windows.Forms.ColumnHeader[] {
-            this.hIP,
-            this.hAcceptPing,
-            this.hTag,
-            this.hUserPC,
-            this.hVersion,
+            this.hUuid,
             this.hStatus,
-            this.hUserStatus,
-            this.hCountry,
-            this.hOS,
-            this.hAccountType,
+            this.hAcceptPing,
             this.hInstallTimeUtc,
             this.hLastPingTimeUtc,
-            this.hUuid});
+            this.hVersion,
+            this.hCountry,
+            this.hIP,
+            this.hOS,
+            this.hWarsal,
+            this.hTag,
+            this.hAccountType,
+            this.hUserPC});
             this.lstClients.ContextMenuStrip = this.contextMenuStrip;
             this.lstClients.Dock = System.Windows.Forms.DockStyle.Fill;
             this.lstClients.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
@@ -743,7 +743,8 @@ namespace Quasar.Server.Forms
             // hAcceptPing
             // 
             this.hAcceptPing.Text = "Accept Ping";
-            this.hAcceptPing.Width = 100;
+            this.hAcceptPing.TextAlign = System.Windows.Forms.HorizontalAlignment.Center;
+            this.hAcceptPing.Width = 85;
             // 
             // hTag
             // 
@@ -762,12 +763,8 @@ namespace Quasar.Server.Forms
             // hStatus
             // 
             this.hStatus.Text = "Status";
-            this.hStatus.Width = 78;
-            // 
-            // hUserStatus
-            // 
-            this.hUserStatus.Text = "User Status";
-            this.hUserStatus.Width = 72;
+            this.hStatus.TextAlign = System.Windows.Forms.HorizontalAlignment.Center;
+            this.hStatus.Width = 90;
             // 
             // hCountry
             // 
@@ -778,6 +775,11 @@ namespace Quasar.Server.Forms
             // 
             this.hOS.Text = "Operating System";
             this.hOS.Width = 222;
+            // 
+            // hWarsal
+            // 
+            this.hWarsal.Text = "Warsal";
+            this.hWarsal.Width = 80;
             // 
             // hAccountType
             // 
@@ -892,7 +894,7 @@ namespace Quasar.Server.Forms
         private System.Windows.Forms.ToolStripMenuItem fileManagerToolStripMenuItem;
         private System.Windows.Forms.ColumnHeader hAccountType;
         private System.Windows.Forms.ToolStripMenuItem systemInformationToolStripMenuItem;
-        private System.Windows.Forms.ColumnHeader hUserStatus;
+        private System.Windows.Forms.ColumnHeader hWarsal;
         private System.Windows.Forms.ToolStripMenuItem passwordRecoveryToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem updateToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem remoteShellToolStripMenuItem;
