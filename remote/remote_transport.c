@@ -262,6 +262,27 @@ int remote_transport_recv(remote_transport_handle_t h, unsigned char* buf, unsig
     return do_recv_byte((transport_state_t*)h, buf, len);
 }
 
+int remote_transport_poll_read(remote_transport_handle_t h, unsigned int timeout_ms) {
+    if (!h) return -1;
+    transport_state_t* t = (transport_state_t*)h;
+
+    if (t->available > 0) return 1; /* already decrypted bytes pending */
+    if (t->received > 0) return 1;  /* encrypted bytes buffered, DecryptMessage may consume */
+
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(t->sock, &rfds);
+
+    struct timeval tv;
+    tv.tv_sec = (long)(timeout_ms / 1000);
+    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+
+    int r = select(0, &rfds, NULL, NULL, &tv);
+    if (r > 0 && FD_ISSET(t->sock, &rfds)) return 1;
+    if (r == 0) return 0;
+    return -1;
+}
+
 void remote_transport_close(remote_transport_handle_t h) {
     if (!h) return;
     transport_state_t* t = (transport_state_t*)h;

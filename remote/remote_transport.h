@@ -20,6 +20,10 @@ int remote_transport_send(remote_transport_handle_t h, const unsigned char* data
 /* Receive exactly len bytes into buf. Returns 1 on success, 0 on failure or disconnect. */
 int remote_transport_recv(remote_transport_handle_t h, unsigned char* buf, unsigned int len);
 
+/* Poll socket readability (TLS payload may be pending).
+ * Returns 1 when readable, 0 on timeout, -1 on error. */
+int remote_transport_poll_read(remote_transport_handle_t h, unsigned int timeout_ms);
+
 /* Close and free. */
 void remote_transport_close(remote_transport_handle_t h);
 

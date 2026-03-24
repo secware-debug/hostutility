@@ -11,7 +11,7 @@ namespace Quasar.Server.Messages
     /// </summary>
     public class ClientPingRequestHandler : MessageProcessorBase<object>
     {
-        public delegate void PingReceivedEventHandler(object sender, Client client, DateTime pingTimeUtc);
+        public delegate void PingReceivedEventHandler(object sender, Client client, DateTime pingTimeUtc, ClientPingRequest ping);
 
         public event PingReceivedEventHandler PingReceived;
 
@@ -38,7 +38,7 @@ namespace Quasar.Server.Messages
             var nowUtc = DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Utc);
             SynchronizationContext.Post(_ =>
             {
-                PingReceived?.Invoke(this, client, nowUtc);
+                PingReceived?.Invoke(this, client, nowUtc, ping);
             }, null);
         }
     }

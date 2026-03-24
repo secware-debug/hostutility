@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS Clients (
 );";
                         cmd.ExecuteNonQuery();
 
+                        using (var tagsCmd = conn.CreateCommand())
+                        {
+                            tagsCmd.CommandText = @"
+CREATE TABLE IF NOT EXISTS Tags (
+    Name TEXT PRIMARY KEY NOT NULL,
+    Color TEXT,
+    Sound TEXT
+);";
+                            tagsCmd.ExecuteNonQuery();
+                        }
+
                         /* If table already existed from a previous version, ensure AcceptPing column exists. */
                         using (var alterCmd = conn.CreateCommand())
                         {
@@ -359,6 +370,146 @@ ON CONFLICT(Uuid) DO UPDATE SET
             }
         }
 
+        public string GetClientTag(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return "";
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"SELECT Tag FROM Clients WHERE Uuid = @uuid;";
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        var scalar = cmd.ExecuteScalar();
+                        return (scalar == null || scalar == DBNull.Value) ? "" : Convert.ToString(scalar) ?? "";
+                    }
+                }
+            }
+        }
+
+        public void SetClientTag(string uuid, string tag)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"UPDATE Clients SET Tag = @tag WHERE Uuid = @uuid;";
+                        cmd.Parameters.AddWithValue("@tag", tag ?? "");
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
+        public List<TagRow> LoadAllTags()
+        {
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"SELECT Name, Color, Sound FROM Tags ORDER BY Name COLLATE NOCASE ASC;";
+                        using (var reader = cmd.ExecuteReader())
+                        {
+                            var rows = new List<TagRow>();
+                            while (reader.Read())
+                            {
+                                rows.Add(new TagRow
+                                {
+                                    Name = reader.IsDBNull(0) ? "" : reader.GetString(0),
+                                    Color = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                                    Sound = reader.IsDBNull(2) ? "" : reader.GetString(2)
+                                });
+                            }
+                            return rows;
+                        }
+                    }
+                }
+            }
+        }
+
+        public void UpsertTag(string name, string color, string sound)
+        {
+            name = (name ?? "").Trim();
+            if (name.Length == 0) return;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"
+INSERT INTO Tags (Name, Color, Sound)
+VALUES (@name, @color, @sound)
+ON CONFLICT(Name) DO UPDATE SET
+    Color = excluded.Color,
+    Sound = excluded.Sound;";
+                        cmd.Parameters.AddWithValue("@name", name);
+                        cmd.Parameters.AddWithValue("@color", color ?? "");
+                        cmd.Parameters.AddWithValue("@sound", sound ?? "");
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
+        public void DeleteTag(string name)
+        {
+            name = (name ?? "").Trim();
+            if (name.Length == 0) return;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"DELETE FROM Tags WHERE Name = @name;";
+                        cmd.Parameters.AddWithValue("@name", name);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
+        public TagRow GetTag(string name)
+        {
+            name = (name ?? "").Trim();
+            if (name.Length == 0) return null;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"SELECT Name, Color, Sound FROM Tags WHERE Name = @name;";
+                        cmd.Parameters.AddWithValue("@name", name);
+                        using (var reader = cmd.ExecuteReader())
+                        {
+                            if (!reader.Read()) return null;
+                            return new TagRow
+                            {
+                                Name = reader.IsDBNull(0) ? "" : reader.GetString(0),
+                                Color = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                                Sound = reader.IsDBNull(2) ? "" : reader.GetString(2)
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
         private static DateTime? GetInstallTimeUtc(SqliteConnection conn, string uuid)
         {
             using (var cmd = conn.CreateCommand())
@@ -419,6 +570,13 @@ ON CONFLICT(Uuid) DO UPDATE SET
         public int ImageIndex { get; set; }
         public DateTime? InstallTimeUtc { get; set; }
         public DateTime? LastPingTimeUtc { get; set; }
+    }
+
+    public sealed class TagRow
+    {
+        public string Name { get; set; } = "";
+        public string Color { get; set; } = "";
+        public string Sound { get; set; } = "";
     }
 }
 
