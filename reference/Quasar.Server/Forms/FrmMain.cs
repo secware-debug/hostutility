@@ -45,6 +45,14 @@ namespace Quasar.Server.Forms
         private ToolStripMenuItem _manageTagsMenuItem;
         private ToolStripMenuItem _setTagToolStripMenuItem;
         private readonly Dictionary<string, Color> _tagBackColors = new Dictionary<string, Color>(StringComparer.OrdinalIgnoreCase);
+        private Panel _clientAreaPanel;
+        private Panel _filterPanel;
+        private TextBox _txtFilterSearch;
+        private ComboBox _cmbOnlineFilter;
+        private ComboBox _cmbTagFilter;
+        private ToolStripStatusLabel _countsStatusLabel;
+        private ToolStripStatusLabel _filteredStatusLabel;
+        private ToolStripStatusLabel _statusSpacer;
 
         public FrmMain()
         {
@@ -58,6 +66,7 @@ namespace Quasar.Server.Forms
             lstClients.DrawItem += lstClients_DrawItem;
             lstClients.DrawSubItem += lstClients_DrawSubItem;
             lstClients.MouseUp += lstClients_MouseUp;
+            InitializeFilterUi();
             InitializeTagMenus();
         }
 
@@ -125,6 +134,148 @@ namespace Quasar.Server.Forms
                 contextMenuStrip.Items.Add(_setTagToolStripMenuItem);
         }
 
+        private void InitializeFilterUi()
+        {
+            _clientAreaPanel = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) };
+            _filterPanel = new Panel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(6, 4, 6, 4) };
+
+            _txtFilterSearch = new TextBox { Left = 6, Top = 5, Width = 320, Anchor = AnchorStyles.Left | AnchorStyles.Top };
+            _txtFilterSearch.TextChanged += FilterControls_Changed;
+
+            _cmbOnlineFilter = new ComboBox
+            {
+                Left = 334,
+                Top = 5,
+                Width = 120,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            _cmbOnlineFilter.Items.AddRange(new object[] { "All", "Online", "Offline" });
+            _cmbOnlineFilter.SelectedIndex = 0;
+            _cmbOnlineFilter.SelectedIndexChanged += FilterControls_Changed;
+
+            _cmbTagFilter = new ComboBox
+            {
+                Left = 462,
+                Top = 5,
+                Width = 170,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            _cmbTagFilter.SelectedIndexChanged += FilterControls_Changed;
+
+            _filterPanel.Controls.Add(_txtFilterSearch);
+            _filterPanel.Controls.Add(_cmbOnlineFilter);
+            _filterPanel.Controls.Add(_cmbTagFilter);
+
+            tableLayoutPanel.Controls.Remove(lstClients);
+            lstClients.Dock = DockStyle.Fill;
+            _clientAreaPanel.Controls.Add(lstClients);
+            _clientAreaPanel.Controls.Add(_filterPanel);
+            tableLayoutPanel.Controls.Add(_clientAreaPanel, 0, 1);
+
+            _countsStatusLabel = new ToolStripStatusLabel("Total: 0 | Online: 0 | Offline: 0");
+            _statusSpacer = new ToolStripStatusLabel { Spring = true };
+            _filteredStatusLabel = new ToolStripStatusLabel("Filtered: 0");
+            statusStrip.Items.Add(_countsStatusLabel);
+            statusStrip.Items.Add(_statusSpacer);
+            statusStrip.Items.Add(_filteredStatusLabel);
+
+            RefreshTagFilterOptions();
+        }
+
+        private void RefreshTagFilterOptions()
+        {
+            if (_cmbTagFilter == null) return;
+
+            string selected = _cmbTagFilter.SelectedItem as string ?? "All";
+            _cmbTagFilter.BeginUpdate();
+            _cmbTagFilter.Items.Clear();
+            _cmbTagFilter.Items.Add("All");
+            foreach (var tag in _clientDb.LoadAllTags())
+            {
+                if (!string.IsNullOrWhiteSpace(tag.Name))
+                    _cmbTagFilter.Items.Add(tag.Name.Trim());
+            }
+            int idx = _cmbTagFilter.FindStringExact(selected);
+            _cmbTagFilter.SelectedIndex = idx >= 0 ? idx : 0;
+            _cmbTagFilter.EndUpdate();
+        }
+
+        private void FilterControls_Changed(object sender, EventArgs e)
+        {
+            ApplyFilters(reloadFromDb: true);
+        }
+
+        private void ApplyFilters(bool reloadFromDb)
+        {
+            if (reloadFromDb) LoadClientsFromDatabase();
+
+            string term = (_txtFilterSearch?.Text ?? "").Trim();
+            string termLower = term.ToLowerInvariant();
+            string onlineFilter = _cmbOnlineFilter?.SelectedItem as string ?? "All";
+            string tagFilter = _cmbTagFilter?.SelectedItem as string ?? "All";
+
+            var toRemove = new List<ListViewItem>();
+            foreach (ListViewItem item in lstClients.Items)
+            {
+                bool keep = true;
+                if (item == null || item.SubItems.Count <= TAG_ID) keep = false;
+                if (!keep) { toRemove.Add(item); continue; }
+
+                string uuid = item.SubItems[UUID_ID].Text ?? "";
+                string status = item.SubItems[STATUS_ID].Text ?? "";
+                string version = item.SubItems[5].Text ?? "";
+                string country = item.SubItems[6].Text ?? "";
+                string ip = item.SubItems[IP_ADDRESS_ID].Text ?? "";
+                string os = item.SubItems[8].Text ?? "";
+                string tag = item.SubItems[TAG_ID].Text ?? "";
+
+                if (termLower.Length > 0)
+                {
+                    var hay = (uuid + " " + version + " " + country + " " + ip + " " + os + " " + tag).ToLowerInvariant();
+                    if (!hay.Contains(termLower)) keep = false;
+                }
+
+                if (keep && string.Equals(onlineFilter, "Online", StringComparison.OrdinalIgnoreCase))
+                    keep = string.Equals(status, "Connected", StringComparison.OrdinalIgnoreCase);
+                else if (keep && string.Equals(onlineFilter, "Offline", StringComparison.OrdinalIgnoreCase))
+                    keep = !string.Equals(status, "Connected", StringComparison.OrdinalIgnoreCase);
+
+                if (keep && !string.Equals(tagFilter, "All", StringComparison.OrdinalIgnoreCase))
+                    keep = string.Equals(tag, tagFilter, StringComparison.OrdinalIgnoreCase);
+
+                if (!keep) toRemove.Add(item);
+            }
+
+            foreach (var item in toRemove) lstClients.Items.Remove(item);
+
+            UpdateStatusCounts();
+            lstClients.Invalidate();
+        }
+
+        private void UpdateStatusCounts()
+        {
+            try
+            {
+                var rows = _clientDb.LoadAllClients();
+                int total = rows.Count;
+                int online = rows.Count(r => string.Equals(r.Status, "Connected", StringComparison.OrdinalIgnoreCase));
+                int offline = total - online;
+
+                if (_countsStatusLabel != null)
+                    _countsStatusLabel.Text = $"Total: {total} | Online: {online} | Offline: {offline}";
+                if (_filteredStatusLabel != null)
+                {
+                    string term = (_txtFilterSearch?.Text ?? "").Trim();
+                    _filteredStatusLabel.Text = term.Length == 0
+                        ? $"Filtered: {lstClients.Items.Count}"
+                        : $"Filtered ({term}): {lstClients.Items.Count}";
+                }
+            }
+            catch
+            {
+            }
+        }
+
         private void setTagToolStripMenuItem_DropDownOpening(object sender, EventArgs e)
         {
             _setTagToolStripMenuItem.DropDownItems.Clear();
@@ -165,7 +316,9 @@ namespace Quasar.Server.Forms
                 lvi.SubItems[TAG_ID].Text = tagName;
             }
 
+            RefreshTagFilterOptions();
             lstClients.Invalidate();
+            UpdateStatusCounts();
         }
 
         private void manageTagsMenuItem_Click(object sender, EventArgs e)
@@ -173,6 +326,8 @@ namespace Quasar.Server.Forms
             using (var frm = new FrmManageTags(_clientDb, () =>
             {
                 RefreshTagColorsCache();
+                RefreshTagFilterOptions();
+                ApplyFilters(reloadFromDb: true);
                 lstClients.Invalidate();
             }))
             {
@@ -299,6 +454,7 @@ namespace Quasar.Server.Forms
             _clientDb.Initialize();
             _clientDb.SetAllClientsDisconnected();
             RefreshTagColorsCache();
+            RefreshTagFilterOptions();
             LoadClientsFromDatabase();
             AutostartListening();
         }
@@ -668,6 +824,7 @@ namespace Quasar.Server.Forms
                 }
 
                 UpdateWindowTitle();
+                ApplyFilters(reloadFromDb: false);
             }
             catch (InvalidOperationException)
             {
@@ -731,6 +888,7 @@ namespace Quasar.Server.Forms
                     }
                 });
                 UpdateWindowTitle();
+                ApplyFilters(reloadFromDb: false);
             }
             catch (InvalidOperationException)
             {
@@ -763,6 +921,7 @@ namespace Quasar.Server.Forms
                     client.Value.OperatingSystem,
                     client.Value.AccountType,
                     client.Value.ImageIndex);
+                ApplyFilters(reloadFromDb: false);
             }
         }
 
@@ -808,6 +967,7 @@ namespace Quasar.Server.Forms
             {
                 item.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(pingTimeUtc);
             }
+            UpdateStatusCounts();
 
             /* Always show a toast on ping, regardless of Accept Ping. */
             try
@@ -938,11 +1098,13 @@ namespace Quasar.Server.Forms
                     }
                 });
                 _loadingDbRows = 0;
+                ApplyFilters(reloadFromDb: false);
             }
             catch (Exception)
             {
                 // Non-fatal: UI will still update from connected clients.
                 _loadingDbRows = 0;
+                UpdateStatusCounts();
             }
         }
 
