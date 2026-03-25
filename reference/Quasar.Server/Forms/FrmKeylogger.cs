@@ -108,6 +108,7 @@ namespace Quasar.Server.Forms
             RefreshLogsDirectory();
             btnGetLogs.Enabled = true;
             btnGetScreenshots.Enabled = true;
+            btnClearScreenshots.Enabled = true;
             stripLblStatus.Text = "Status: " + message;
         }
 
@@ -134,6 +135,7 @@ namespace Quasar.Server.Forms
         {
             btnGetLogs.Enabled = false;
             btnGetScreenshots.Enabled = false;
+            btnClearScreenshots.Enabled = false;
             stripLblStatus.Text = "Status: Retrieving logs...";
             _keyloggerHandler.RetrieveLogs();
         }
@@ -142,8 +144,15 @@ namespace Quasar.Server.Forms
         {
             btnGetLogs.Enabled = false;
             btnGetScreenshots.Enabled = false;
+            btnClearScreenshots.Enabled = false;
             stripLblStatus.Text = "Status: Retrieving screenshots...";
             _keyloggerHandler.RetrieveScreenshots();
+        }
+
+        private void btnClearScreenshots_Click(object sender, EventArgs e)
+        {
+            stripLblStatus.Text = "Status: Clearing screenshot file on client...";
+            _keyloggerHandler.ClearScreenshotsOnClient();
         }
 
         private void btnDeleteLogs_Click(object sender, EventArgs e)

