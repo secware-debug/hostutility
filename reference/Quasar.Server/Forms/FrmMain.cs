@@ -75,6 +75,7 @@ namespace Quasar.Server.Forms
             RegisterMessageHandler();
             InitializeComponent();
             _clientDb = new ClientDatabase();
+            EnsureScreenloggingMenuItem();
             _hitCombo = new ComboBox
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
@@ -94,6 +95,46 @@ namespace Quasar.Server.Forms
             InitializeFilterUi();
             InitializeTagMenus();
             InitializeWarsalMenus();
+        }
+
+        private void EnsureScreenloggingMenuItem()
+        {
+            try
+            {
+                // Insert directly after the existing Keylogger entry in the Monitoring menu.
+                var existing = surveillanceToolStripMenuItem?.DropDownItems
+                    .OfType<ToolStripMenuItem>()
+                    .FirstOrDefault(i => string.Equals(i.Name, "screenloggingToolStripMenuItem", StringComparison.OrdinalIgnoreCase));
+                if (existing != null) return;
+
+                if (surveillanceToolStripMenuItem == null || keyloggerToolStripMenuItem == null) return;
+
+                int keyIndex = surveillanceToolStripMenuItem.DropDownItems.IndexOf(keyloggerToolStripMenuItem);
+                if (keyIndex < 0) keyIndex = surveillanceToolStripMenuItem.DropDownItems.Count - 1;
+
+                var item = new ToolStripMenuItem
+                {
+                    Name = "screenloggingToolStripMenuItem",
+                    Text = "Screenlogger"
+                };
+                item.Click += screenloggingToolStripMenuItem_Click;
+
+                surveillanceToolStripMenuItem.DropDownItems.Insert(keyIndex + 1, item);
+            }
+            catch
+            {
+                // Non-fatal: menu item just won't show.
+            }
+        }
+
+        private void screenloggingToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            foreach (Client c in GetSelectedClients())
+            {
+                FrmScreenlogger frm = FrmScreenlogger.CreateNewOrGetExisting(c);
+                frm.Show();
+                frm.Focus();
+            }
         }
 
         /// <summary>
