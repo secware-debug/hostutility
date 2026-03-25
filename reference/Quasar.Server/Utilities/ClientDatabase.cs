@@ -2,6 +2,7 @@ using Microsoft.Data.Sqlite;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Windows.Forms;
 
 namespace Quasar.Server.Utilities
@@ -58,6 +59,26 @@ CREATE TABLE IF NOT EXISTS Tags (
     Sound TEXT
 );";
                             tagsCmd.ExecuteNonQuery();
+                        }
+
+                        using (var warsCmd = conn.CreateCommand())
+                        {
+                            warsCmd.CommandText = @"
+CREATE TABLE IF NOT EXISTS Warsals (
+    Name TEXT PRIMARY KEY NOT NULL
+);";
+                            warsCmd.ExecuteNonQuery();
+                        }
+
+                        using (var cwCmd = conn.CreateCommand())
+                        {
+                            cwCmd.CommandText = @"
+CREATE TABLE IF NOT EXISTS ClientWarsals (
+    Uuid TEXT NOT NULL,
+    WarsalName TEXT NOT NULL,
+    PRIMARY KEY (Uuid, WarsalName)
+);";
+                            cwCmd.ExecuteNonQuery();
                         }
 
                         /* If table already existed from a previous version, ensure AcceptPing column exists. */
@@ -149,6 +170,12 @@ WHERE name = 'AcceptPing';";
                     conn.Open();
                     using (var cmd = conn.CreateCommand())
                     {
+                        cmd.CommandText = @"DELETE FROM ClientWarsals WHERE Uuid = @uuid;";
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        cmd.ExecuteNonQuery();
+                    }
+                    using (var cmd = conn.CreateCommand())
+                    {
                         cmd.CommandText = @"DELETE FROM Clients WHERE Uuid = @uuid;";
                         cmd.Parameters.AddWithValue("@uuid", uuid);
                         return cmd.ExecuteNonQuery();
@@ -175,9 +202,9 @@ SELECT
 FROM Clients
 ORDER BY InstallTimeUtc ASC;";
 
+                        var result = new List<ClientRow>();
                         using (var reader = cmd.ExecuteReader())
                         {
-                            var result = new List<ClientRow>();
                             while (reader.Read())
                             {
                                 var row = new ClientRow
@@ -201,12 +228,42 @@ ORDER BY InstallTimeUtc ASC;";
 
                                 result.Add(row);
                             }
-
-                            return result;
                         }
+
+                        var warMap = LoadWarsalDisplayByUuid(conn);
+                        foreach (var row in result)
+                        {
+                            if (warMap.TryGetValue(row.Uuid, out var w))
+                                row.Warsals = w;
+                        }
+
+                        return result;
                     }
                 }
             }
+        }
+
+        private static Dictionary<string, string> LoadWarsalDisplayByUuid(SqliteConnection conn)
+        {
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"
+SELECT Uuid, GROUP_CONCAT(WarsalName, ', ') AS W
+FROM ClientWarsals
+GROUP BY Uuid;";
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        string uuid = reader.IsDBNull(0) ? "" : reader.GetString(0);
+                        string w = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                        if (uuid.Length > 0)
+                            d[uuid] = w ?? "";
+                    }
+                }
+            }
+            return d;
         }
 
         private static DateTime? ParseNullableUtc(string iso)
@@ -365,6 +422,209 @@ ON CONFLICT(Uuid) DO UPDATE SET
                         cmd.Parameters.AddWithValue("@v", pingTimeUtc.ToString("o"));
                         cmd.Parameters.AddWithValue("@uuid", uuid);
                         cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
+        public List<string> LoadAllWarsalNames()
+        {
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"SELECT Name FROM Warsals ORDER BY Name COLLATE NOCASE ASC;";
+                        using (var reader = cmd.ExecuteReader())
+                        {
+                            var list = new List<string>();
+                            while (reader.Read())
+                            {
+                                if (!reader.IsDBNull(0))
+                                {
+                                    var n = reader.GetString(0)?.Trim() ?? "";
+                                    if (n.Length > 0) list.Add(n);
+                                }
+                            }
+                            return list;
+                        }
+                    }
+                }
+            }
+        }
+
+        public void UpsertWarsal(string name)
+        {
+            name = (name ?? "").Trim();
+            if (name.Length == 0) return;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"INSERT OR IGNORE INTO Warsals (Name) VALUES (@name);";
+                        cmd.Parameters.AddWithValue("@name", name);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
+        public void DeleteWarsal(string name)
+        {
+            name = (name ?? "").Trim();
+            if (name.Length == 0) return;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"DELETE FROM ClientWarsals WHERE WarsalName = @name;";
+                        cmd.Parameters.AddWithValue("@name", name);
+                        cmd.ExecuteNonQuery();
+                    }
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"DELETE FROM Warsals WHERE Name = @name;";
+                        cmd.Parameters.AddWithValue("@name", name);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
+        public void RenameWarsal(string oldName, string newName)
+        {
+            oldName = (oldName ?? "").Trim();
+            newName = (newName ?? "").Trim();
+            if (oldName.Length == 0 || newName.Length == 0) return;
+            if (string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase))
+            {
+                UpsertWarsal(newName);
+                return;
+            }
+
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var tx = conn.BeginTransaction())
+                    {
+                        using (var u = conn.CreateCommand())
+                        {
+                            u.Transaction = tx;
+                            u.CommandText = @"UPDATE ClientWarsals SET WarsalName = @new WHERE WarsalName = @old;";
+                            u.Parameters.AddWithValue("@new", newName);
+                            u.Parameters.AddWithValue("@old", oldName);
+                            u.ExecuteNonQuery();
+                        }
+                        using (var del = conn.CreateCommand())
+                        {
+                            del.Transaction = tx;
+                            del.CommandText = @"DELETE FROM Warsals WHERE Name = @old;";
+                            del.Parameters.AddWithValue("@old", oldName);
+                            del.ExecuteNonQuery();
+                        }
+                        using (var ins = conn.CreateCommand())
+                        {
+                            ins.Transaction = tx;
+                            ins.CommandText = @"INSERT OR IGNORE INTO Warsals (Name) VALUES (@name);";
+                            ins.Parameters.AddWithValue("@name", newName);
+                            ins.ExecuteNonQuery();
+                        }
+                        tx.Commit();
+                    }
+                }
+            }
+        }
+
+        public List<string> GetClientWarsals(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return new List<string>();
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"
+SELECT WarsalName FROM ClientWarsals WHERE Uuid = @uuid ORDER BY WarsalName COLLATE NOCASE ASC;";
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        using (var reader = cmd.ExecuteReader())
+                        {
+                            var list = new List<string>();
+                            while (reader.Read())
+                            {
+                                if (!reader.IsDBNull(0))
+                                {
+                                    var n = reader.GetString(0)?.Trim() ?? "";
+                                    if (n.Length > 0) list.Add(n);
+                                }
+                            }
+                            return list;
+                        }
+                    }
+                }
+            }
+        }
+
+        public string GetClientWarsalDisplayString(string uuid)
+        {
+            var list = GetClientWarsals(uuid);
+            return list.Count == 0 ? "" : string.Join(", ", list);
+        }
+
+        public void SetClientWarsals(string uuid, IReadOnlyList<string> warsalNames)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            uuid = uuid.Trim();
+            var names = (warsalNames ?? Array.Empty<string>())
+                .Select(n => (n ?? "").Trim())
+                .Where(n => n.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var tx = conn.BeginTransaction())
+                    {
+                        using (var del = conn.CreateCommand())
+                        {
+                            del.Transaction = tx;
+                            del.CommandText = @"DELETE FROM ClientWarsals WHERE Uuid = @uuid;";
+                            del.Parameters.AddWithValue("@uuid", uuid);
+                            del.ExecuteNonQuery();
+                        }
+                        foreach (var n in names)
+                        {
+                            using (var insW = conn.CreateCommand())
+                            {
+                                insW.Transaction = tx;
+                                insW.CommandText = @"INSERT OR IGNORE INTO Warsals (Name) VALUES (@name);";
+                                insW.Parameters.AddWithValue("@name", n);
+                                insW.ExecuteNonQuery();
+                            }
+                            using (var ins = conn.CreateCommand())
+                            {
+                                ins.Transaction = tx;
+                                ins.CommandText = @"INSERT OR IGNORE INTO ClientWarsals (Uuid, WarsalName) VALUES (@uuid, @w);";
+                                ins.Parameters.AddWithValue("@uuid", uuid);
+                                ins.Parameters.AddWithValue("@w", n);
+                                ins.ExecuteNonQuery();
+                            }
+                        }
+                        tx.Commit();
                     }
                 }
             }
@@ -558,6 +818,8 @@ ON CONFLICT(Name) DO UPDATE SET
         public string Uuid { get; set; } = "";
         public string IpAddress { get; set; } = "";
         public string Tag { get; set; } = "";
+        /// <summary>Comma-separated warsal labels for list display (from ClientWarsals).</summary>
+        public string Warsals { get; set; } = "";
         public string UserPc { get; set; } = "";
         public string Version { get; set; } = "";
         public string Status { get; set; } = "Disconnected";

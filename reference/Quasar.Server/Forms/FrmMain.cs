@@ -30,6 +30,8 @@ namespace Quasar.Server.Forms
         private const int ACCEPT_PING_ID = 2;
         private const int INSTALL_TIME_ID = 3;
         private const int LAST_PING_TIME_ID = 4;
+        private const int IP_ADDRESS_ID = 7;
+        private const int WARSAL_ID = 9;
         private const int TAG_ID = 10;
 
         private bool _titleUpdateRunning;
@@ -44,12 +46,16 @@ namespace Quasar.Server.Forms
         private ToolStripMenuItem _tagsMenuStripItem;
         private ToolStripMenuItem _manageTagsMenuItem;
         private ToolStripMenuItem _setTagToolStripMenuItem;
+        private ToolStripMenuItem _warsalMenuStripItem;
+        private ToolStripMenuItem _manageWarsalsMenuItem;
+        private ToolStripMenuItem _setWarsalToolStripMenuItem;
         private readonly Dictionary<string, Color> _tagBackColors = new Dictionary<string, Color>(StringComparer.OrdinalIgnoreCase);
         private Panel _clientAreaPanel;
         private Panel _filterPanel;
         private TextBox _txtFilterSearch;
         private ComboBox _cmbOnlineFilter;
         private ComboBox _cmbTagFilter;
+        private ComboBox _cmbWarsalFilter;
         private ToolStripStatusLabel _countsStatusLabel;
         private ToolStripStatusLabel _filteredStatusLabel;
         private ToolStripStatusLabel _statusSpacer;
@@ -68,6 +74,7 @@ namespace Quasar.Server.Forms
             lstClients.MouseUp += lstClients_MouseUp;
             InitializeFilterUi();
             InitializeTagMenus();
+            InitializeWarsalMenus();
         }
 
         /// <summary>
@@ -134,6 +141,96 @@ namespace Quasar.Server.Forms
                 contextMenuStrip.Items.Add(_setTagToolStripMenuItem);
         }
 
+        private void InitializeWarsalMenus()
+        {
+            _warsalMenuStripItem = new ToolStripMenuItem("Warsal");
+            _manageWarsalsMenuItem = new ToolStripMenuItem("Manage Warsals...");
+            _manageWarsalsMenuItem.Click += manageWarsalsMenuItem_Click;
+            _warsalMenuStripItem.DropDownItems.Add(_manageWarsalsMenuItem);
+            menuStrip.Items.Insert(3, _warsalMenuStripItem);
+
+            _setWarsalToolStripMenuItem = new ToolStripMenuItem("Set Warsal");
+            _setWarsalToolStripMenuItem.Click += setWarsalToolStripMenuItem_Click;
+            int clientMgmtIdx = contextMenuStrip.Items.IndexOf(connectionToolStripMenuItem);
+            if (clientMgmtIdx >= 0)
+                contextMenuStrip.Items.Insert(clientMgmtIdx + 2, _setWarsalToolStripMenuItem);
+            else
+                contextMenuStrip.Items.Add(_setWarsalToolStripMenuItem);
+        }
+
+        private void manageWarsalsMenuItem_Click(object sender, EventArgs e)
+        {
+            using (var frm = new FrmManageWarsals(_clientDb, () =>
+            {
+                RefreshAllWarsalCellsFromDb();
+                RefreshWarsalFilterOptions();
+                ApplyFilters(reloadFromDb: false);
+            }))
+                frm.ShowDialog(this);
+        }
+
+        private void setWarsalToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            var uuids = new List<string>();
+            foreach (ListViewItem lvi in lstClients.SelectedItems)
+            {
+                if (lvi?.SubItems == null || lvi.SubItems.Count <= UUID_ID) continue;
+                var u = lvi.SubItems[UUID_ID].Text?.Trim();
+                if (!string.IsNullOrEmpty(u)) uuids.Add(u);
+            }
+            if (uuids.Count == 0) return;
+
+            using (var frm = new FrmSetClientWarsals(_clientDb, uuids, () =>
+            {
+                foreach (var u in uuids)
+                    RefreshWarsalCellForUuid(u);
+                ApplyFilters(reloadFromDb: false);
+            }))
+                frm.ShowDialog(this);
+        }
+
+        private void RefreshWarsalCellForUuid(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            try
+            {
+                lstClients.Invoke((MethodInvoker)delegate
+                {
+                    var lvi = GetListViewItemByUuid(uuid);
+                    if (lvi != null && lvi.SubItems.Count > WARSAL_ID)
+                        lvi.SubItems[WARSAL_ID].Text = _clientDb.GetClientWarsalDisplayString(uuid);
+                    lstClients.Invalidate();
+                });
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
+        private void RefreshAllWarsalCellsFromDb()
+        {
+            try
+            {
+                lstClients.Invoke((MethodInvoker)delegate
+                {
+                    lock (_lockClients)
+                    {
+                        foreach (ListViewItem lvi in lstClients.Items)
+                        {
+                            if (lvi == null || lvi.SubItems.Count <= WARSAL_ID) continue;
+                            string uuid = lvi.SubItems[UUID_ID].Text?.Trim() ?? "";
+                            if (uuid.Length == 0) continue;
+                            lvi.SubItems[WARSAL_ID].Text = _clientDb.GetClientWarsalDisplayString(uuid);
+                        }
+                    }
+                    lstClients.Invalidate();
+                });
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
         private void InitializeFilterUi()
         {
             _clientAreaPanel = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) };
@@ -162,9 +259,19 @@ namespace Quasar.Server.Forms
             };
             _cmbTagFilter.SelectedIndexChanged += FilterControls_Changed;
 
+            _cmbWarsalFilter = new ComboBox
+            {
+                Left = 640,
+                Top = 5,
+                Width = 170,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            _cmbWarsalFilter.SelectedIndexChanged += FilterControls_Changed;
+
             _filterPanel.Controls.Add(_txtFilterSearch);
             _filterPanel.Controls.Add(_cmbOnlineFilter);
             _filterPanel.Controls.Add(_cmbTagFilter);
+            _filterPanel.Controls.Add(_cmbWarsalFilter);
 
             tableLayoutPanel.Controls.Remove(lstClients);
             lstClients.Dock = DockStyle.Fill;
@@ -180,6 +287,7 @@ namespace Quasar.Server.Forms
             statusStrip.Items.Add(_filteredStatusLabel);
 
             RefreshTagFilterOptions();
+            RefreshWarsalFilterOptions();
         }
 
         private void RefreshTagFilterOptions()
@@ -200,6 +308,39 @@ namespace Quasar.Server.Forms
             _cmbTagFilter.EndUpdate();
         }
 
+        private void RefreshWarsalFilterOptions()
+        {
+            if (_cmbWarsalFilter == null) return;
+
+            string selected = _cmbWarsalFilter.SelectedItem as string ?? "All";
+            _cmbWarsalFilter.BeginUpdate();
+            _cmbWarsalFilter.Items.Clear();
+            _cmbWarsalFilter.Items.Add("All");
+            foreach (var name in _clientDb.LoadAllWarsalNames())
+            {
+                if (!string.IsNullOrWhiteSpace(name))
+                    _cmbWarsalFilter.Items.Add(name.Trim());
+            }
+            int idx = _cmbWarsalFilter.FindStringExact(selected);
+            _cmbWarsalFilter.SelectedIndex = idx >= 0 ? idx : 0;
+            _cmbWarsalFilter.EndUpdate();
+        }
+
+        /// <summary>True if the warsal cell (comma-separated) contains the given warsal name.</summary>
+        private static bool ClientRowHasWarsalFilter(string warsalCellText, string filterWarsalName)
+        {
+            if (string.IsNullOrWhiteSpace(filterWarsalName) ||
+                string.Equals(filterWarsalName, "All", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (string.IsNullOrWhiteSpace(warsalCellText)) return false;
+            foreach (var part in warsalCellText.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (string.Equals(part.Trim(), filterWarsalName.Trim(), StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
         private void FilterControls_Changed(object sender, EventArgs e)
         {
             ApplyFilters(reloadFromDb: true);
@@ -213,6 +354,7 @@ namespace Quasar.Server.Forms
             string termLower = term.ToLowerInvariant();
             string onlineFilter = _cmbOnlineFilter?.SelectedItem as string ?? "All";
             string tagFilter = _cmbTagFilter?.SelectedItem as string ?? "All";
+            string warsalFilter = _cmbWarsalFilter?.SelectedItem as string ?? "All";
 
             var toRemove = new List<ListViewItem>();
             foreach (ListViewItem item in lstClients.Items)
@@ -227,11 +369,12 @@ namespace Quasar.Server.Forms
                 string country = item.SubItems[6].Text ?? "";
                 string ip = item.SubItems[IP_ADDRESS_ID].Text ?? "";
                 string os = item.SubItems[8].Text ?? "";
+                string warsal = item.SubItems.Count > WARSAL_ID ? (item.SubItems[WARSAL_ID].Text ?? "") : "";
                 string tag = item.SubItems[TAG_ID].Text ?? "";
 
                 if (termLower.Length > 0)
                 {
-                    var hay = (uuid + " " + version + " " + country + " " + ip + " " + os + " " + tag).ToLowerInvariant();
+                    var hay = (uuid + " " + version + " " + country + " " + ip + " " + os + " " + warsal + " " + tag).ToLowerInvariant();
                     if (!hay.Contains(termLower)) keep = false;
                 }
 
@@ -242,6 +385,9 @@ namespace Quasar.Server.Forms
 
                 if (keep && !string.Equals(tagFilter, "All", StringComparison.OrdinalIgnoreCase))
                     keep = string.Equals(tag, tagFilter, StringComparison.OrdinalIgnoreCase);
+
+                if (keep && !string.Equals(warsalFilter, "All", StringComparison.OrdinalIgnoreCase))
+                    keep = ClientRowHasWarsalFilter(warsal, warsalFilter);
 
                 if (!keep) toRemove.Add(item);
             }
@@ -455,11 +601,10 @@ namespace Quasar.Server.Forms
             _clientDb.SetAllClientsDisconnected();
             RefreshTagColorsCache();
             RefreshTagFilterOptions();
+            RefreshWarsalFilterOptions();
             LoadClientsFromDatabase();
             AutostartListening();
         }
-
-        private const int IP_ADDRESS_ID = 7;
 
         private void lstClients_DrawColumnHeader(object sender, DrawListViewColumnHeaderEventArgs e)
         {
@@ -757,6 +902,7 @@ namespace Quasar.Server.Forms
                 if (string.IsNullOrWhiteSpace(serverTag))
                     serverTag = client.Value.Tag ?? "";
                 client.Value.Tag = serverTag;
+                string warsalDisplay = _clientDb.GetClientWarsalDisplayString(uuid);
 
                 var row = _clientDb.UpsertClientBasics(
                     uuid,
@@ -787,7 +933,7 @@ namespace Quasar.Server.Forms
                     lviExisting.SubItems[IP_ADDRESS_ID].Text = " " + client.EndPoint.Address;
                     lviExisting.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
                     lviExisting.SubItems[8].Text = client.Value.OperatingSystem;
-                    lviExisting.SubItems[9].Text = "";
+                    lviExisting.SubItems[WARSAL_ID].Text = warsalDisplay;
                     lviExisting.SubItems[TAG_ID].Text = serverTag;
                     lviExisting.SubItems[11].Text = client.Value.AccountType;
                     lviExisting.SubItems[12].Text = client.Value.UserAtPc;
@@ -806,7 +952,7 @@ namespace Quasar.Server.Forms
                         client.Value.CountryWithCode, // Country
                         " " + client.EndPoint.Address, // IP Address
                         client.Value.OperatingSystem, // OS
-                        "",                           // Warsal
+                        warsalDisplay,                // Warsal
                         serverTag,                    // Tag
                         client.Value.AccountType,     // Account Type
                         client.Value.UserAtPc         // User@PC
@@ -846,6 +992,7 @@ namespace Quasar.Server.Forms
                 string serverTag = _clientDb.GetClientTag(uuid);
                 if (string.IsNullOrWhiteSpace(serverTag))
                     serverTag = client.Value.Tag ?? "";
+                string warsalDisplay = _clientDb.GetClientWarsalDisplayString(uuid);
 
                 string existingUserStatus = "Active";
 
@@ -881,7 +1028,7 @@ namespace Quasar.Server.Forms
                         lvi.SubItems[IP_ADDRESS_ID].Text = " " + client.EndPoint.Address;
                         lvi.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
                         lvi.SubItems[8].Text = client.Value.OperatingSystem;
-                        lvi.SubItems[9].Text = "";
+                        lvi.SubItems[WARSAL_ID].Text = warsalDisplay;
                         lvi.SubItems[TAG_ID].Text = serverTag;
                         lvi.SubItems[11].Text = client.Value.AccountType;
                         lvi.SubItems[12].Text = client.Value.UserAtPc;
@@ -1081,7 +1228,7 @@ namespace Quasar.Server.Forms
                                 countryWithCode,                       // 6  Country
                                 " " + (r.IpAddress ?? ""),             // 7  IP Address
                                 r.OperatingSystem ?? "",               // 8  OS
-                                "",                                    // 9  Warsal
+                                r.Warsals ?? "",                       // 9  Warsal
                                 r.Tag ?? "",                           // 10 Tag
                                 r.AccountType ?? "",                   // 11 Account Type
                                 r.UserPc ?? ""                         // 12 User@PC
