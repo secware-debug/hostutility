@@ -34,6 +34,7 @@ namespace Quasar.Server.Forms
             this.statusStrip = new System.Windows.Forms.StatusStrip();
             this.btnGetLogs = new System.Windows.Forms.Button();
             this.btnDeleteLogs = new System.Windows.Forms.Button();
+            this.btnGetScreenshots = new System.Windows.Forms.Button();
             this.wLogViewer = new System.Windows.Forms.WebBrowser();
             this.stripLblStatus = new System.Windows.Forms.ToolStripStatusLabel();
             this.statusStrip.SuspendLayout();
@@ -91,6 +92,16 @@ namespace Quasar.Server.Forms
             this.btnDeleteLogs.UseVisualStyleBackColor = true;
             this.btnDeleteLogs.Click += new System.EventHandler(this.btnDeleteLogs_Click);
             // 
+            // btnGetScreenshots
+            // 
+            this.btnGetScreenshots.Location = new System.Drawing.Point(312, 3);
+            this.btnGetScreenshots.Name = "btnGetScreenshots";
+            this.btnGetScreenshots.Size = new System.Drawing.Size(149, 23);
+            this.btnGetScreenshots.TabIndex = 10;
+            this.btnGetScreenshots.Text = "Get Screenshots";
+            this.btnGetScreenshots.UseVisualStyleBackColor = true;
+            this.btnGetScreenshots.Click += new System.EventHandler(this.btnGetScreenshots_Click);
+            // 
             // wLogViewer
             // 
             this.wLogViewer.Anchor = ((System.Windows.Forms.AnchorStyles)((((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Bottom) 
@@ -115,6 +126,7 @@ namespace Quasar.Server.Forms
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi;
             this.ClientSize = new System.Drawing.Size(862, 482);
             this.Controls.Add(this.btnDeleteLogs);
+            this.Controls.Add(this.btnGetScreenshots);
             this.Controls.Add(this.wLogViewer);
             this.Controls.Add(this.btnGetLogs);
             this.Controls.Add(this.statusStrip);
@@ -143,5 +155,6 @@ namespace Quasar.Server.Forms
         private System.Windows.Forms.Button btnGetLogs;
         private System.Windows.Forms.ToolStripStatusLabel stripLblStatus;
         private System.Windows.Forms.Button btnDeleteLogs;
+        private System.Windows.Forms.Button btnGetScreenshots;
     }
 }

