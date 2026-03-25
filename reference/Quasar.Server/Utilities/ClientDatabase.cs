@@ -141,13 +141,41 @@ WHERE name = 'HitState';";
                 //   win-x64/e_sqlite3.dll
                 // So we stage it at runtime before using SqliteConnection.
 
-                StageNativeDll(
-                    Path.Combine(baseDir, "win-x64", "e_sqlite3.dll"),
-                    Path.Combine(baseDir, "runtimes", "win-x64", "native", "e_sqlite3.dll"));
+                var x64Source = Path.Combine(baseDir, "win-x64", "e_sqlite3.dll");
+                var x86Source = Path.Combine(baseDir, "win-x86", "e_sqlite3.dll");
 
-                StageNativeDll(
-                    Path.Combine(baseDir, "win-x86", "e_sqlite3.dll"),
-                    Path.Combine(baseDir, "runtimes", "win-x86", "native", "e_sqlite3.dll"));
+                // Fallback: some fresh deployments may not keep the repo's folder layout.
+                // If expected sources don't exist, locate any e_sqlite3.dll under baseDir.
+                string anySource = null;
+                if (!File.Exists(x64Source) && !File.Exists(x86Source))
+                {
+                    try
+                    {
+                        anySource = Directory.EnumerateFiles(baseDir, "e_sqlite3.dll", SearchOption.AllDirectories)
+                            .FirstOrDefault();
+                    }
+                    catch
+                    {
+                        // Best-effort only.
+                    }
+                }
+
+                // Always try to stage x64 (viewer is built as x64 in csproj).
+                string stageX64Source = File.Exists(x64Source) ? x64Source : anySource;
+                if (!string.IsNullOrWhiteSpace(stageX64Source))
+                {
+                    StageNativeDll(
+                        stageX64Source,
+                        Path.Combine(baseDir, "runtimes", "win-x64", "native", "e_sqlite3.dll"));
+                }
+
+                // Also try x86 if its expected source exists (harmless if unused).
+                if (File.Exists(x86Source))
+                {
+                    StageNativeDll(
+                        x86Source,
+                        Path.Combine(baseDir, "runtimes", "win-x86", "native", "e_sqlite3.dll"));
+                }
             }
             catch
             {
@@ -462,6 +490,25 @@ ON CONFLICT(Uuid) DO UPDATE SET
                         var scalar = cmd.ExecuteScalar();
                         if (scalar == null || scalar == DBNull.Value) return false;
                         return Convert.ToInt32(scalar) != 0;
+                    }
+                }
+            }
+        }
+
+        public bool ClientExists(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return false;
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"SELECT 1 FROM Clients WHERE Uuid = @uuid LIMIT 1;";
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        var scalar = cmd.ExecuteScalar();
+                        return scalar != null && scalar != DBNull.Value;
                     }
                 }
             }

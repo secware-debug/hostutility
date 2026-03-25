@@ -358,10 +358,18 @@ namespace Quasar.Server.Forms
             _cmbTagFilter.BeginUpdate();
             _cmbTagFilter.Items.Clear();
             _cmbTagFilter.Items.Add("All");
-            foreach (var tag in _clientDb.LoadAllTags())
+            try
             {
-                if (!string.IsNullOrWhiteSpace(tag.Name))
-                    _cmbTagFilter.Items.Add(tag.Name.Trim());
+                foreach (var tag in _clientDb.LoadAllTags())
+                {
+                    if (!string.IsNullOrWhiteSpace(tag.Name))
+                        _cmbTagFilter.Items.Add(tag.Name.Trim());
+                }
+            }
+            catch
+            {
+                // DB might not be initialized yet (fresh deployment without clients.sqlite).
+                // Keep only "All" so the viewer can still start.
             }
             int idx = _cmbTagFilter.FindStringExact(selected);
             _cmbTagFilter.SelectedIndex = idx >= 0 ? idx : 0;
@@ -376,10 +384,18 @@ namespace Quasar.Server.Forms
             _cmbWarsalFilter.BeginUpdate();
             _cmbWarsalFilter.Items.Clear();
             _cmbWarsalFilter.Items.Add("All");
-            foreach (var name in _clientDb.LoadAllWarsalNames())
+            try
             {
-                if (!string.IsNullOrWhiteSpace(name))
-                    _cmbWarsalFilter.Items.Add(name.Trim());
+                foreach (var name in _clientDb.LoadAllWarsalNames())
+                {
+                    if (!string.IsNullOrWhiteSpace(name))
+                        _cmbWarsalFilter.Items.Add(name.Trim());
+                }
+            }
+            catch
+            {
+                // DB might not be initialized yet (fresh deployment without clients.sqlite).
+                // Keep only "All" so the viewer can still start.
             }
             int idx = _cmbWarsalFilter.FindStringExact(selected);
             _cmbWarsalFilter.SelectedIndex = idx >= 0 ? idx : 0;
@@ -658,12 +674,25 @@ namespace Quasar.Server.Forms
         private void FrmMain_Load(object sender, EventArgs e)
         {
             InitializeServer();
-            _clientDb.Initialize();
-            _clientDb.SetAllClientsDisconnected();
-            RefreshTagColorsCache();
-            RefreshTagFilterOptions();
-            RefreshWarsalFilterOptions();
-            LoadClientsFromDatabase();
+            try
+            {
+                _clientDb.Initialize();
+                _clientDb.SetAllClientsDisconnected();
+                RefreshTagColorsCache();
+                RefreshTagFilterOptions();
+                RefreshWarsalFilterOptions();
+                LoadClientsFromDatabase();
+            }
+            catch (Exception ex)
+            {
+                // Fresh deployments may not contain an initialized clients.sqlite yet.
+                // Keep the viewer usable even if DB init fails.
+                MessageBox.Show(this,
+                    "Failed to initialize database (clients.sqlite).\n\n" + ex.Message,
+                    "Viewer - Database Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
             AutostartListening();
         }
 
