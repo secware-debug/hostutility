@@ -1,4 +1,4 @@
-﻿using Quasar.Client.ReverseProxy;
+using Quasar.Client.ReverseProxy;
 using Quasar.Common.Extensions;
 using Quasar.Common.Messages;
 using Quasar.Common.Messages.ReverseProxy;
@@ -253,6 +253,7 @@ namespace Quasar.Client.Networking
             _serverCertificate = serverCertificate;
             _readBuffer = new byte[BUFFER_SIZE];
             TypeRegistry.AddTypesToSerializer(typeof(IMessage), TypeRegistry.GetPacketTypes(typeof(IMessage)).ToArray());
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoStopRemoteDesktop), 129);
         }
 
         /// <summary>

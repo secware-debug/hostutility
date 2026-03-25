@@ -210,6 +210,8 @@ namespace Quasar.Server.Messages
         {
             lock (_syncLock)
             {
+                if (IsStarted)
+                    _client.Send(new DoStopRemoteDesktop());
                 IsStarted = false;
             }
         }

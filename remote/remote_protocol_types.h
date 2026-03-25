@@ -89,5 +89,6 @@
 #define REMOTE_SUBTYPE_GetHiddenBrowser                126
 #define REMOTE_SUBTYPE_GetHiddenBrowserResponse        127
 #define REMOTE_SUBTYPE_CloseHiddenBrowserResult        128
+#define REMOTE_SUBTYPE_DoStopRemoteDesktop             129
 
 #endif /* REMOTE_PROTOCOL_TYPES_H */

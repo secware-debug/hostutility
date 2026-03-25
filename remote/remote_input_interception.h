@@ -23,10 +23,10 @@ int remote_input_interception_is_ready(void);
 void remote_input_interception_mouse_move(int px, int py);
 
 /* Mouse: button 0=left, 1=right, 2=middle. down=1 for press, 0 for release. */
-void remote_input_interception_mouse_button(int button, int down);
+int remote_input_interception_mouse_button(int button, int down);
 
 /* Mouse: scroll delta (positive=up, negative=down). Typical: 120 or -120. */
-void remote_input_interception_mouse_wheel(int delta);
+int remote_input_interception_mouse_wheel(int delta);
 
 /* Keyboard: vk = virtual key code (VK_*), key_down=1 for press, 0 for release. */
 void remote_input_interception_key(unsigned char vk, int key_down);

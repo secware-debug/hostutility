@@ -61,7 +61,8 @@ namespace Quasar.Common.Messages
             typeof(GetHiddenBrowserResponse),
             typeof(DoStopHiddenBrowser),
             typeof(DoCloseHiddenBrowser),
-            typeof(CloseHiddenBrowserResult)
+            typeof(CloseHiddenBrowserResult),
+            typeof(DoStopRemoteDesktop)
         };
 
         /// <summary>

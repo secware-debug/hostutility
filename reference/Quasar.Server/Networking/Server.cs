@@ -227,6 +227,7 @@ namespace Quasar.Server.Networking
             TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(GetHiddenBrowser), 126);
             TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(GetHiddenBrowserResponse), 127);
             TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(CloseHiddenBrowserResult), 128);
+            TypeRegistry.AddTypeWithExplicitSubtype(typeof(IMessage), typeof(DoStopRemoteDesktop), 129);
         }
 
         /// <summary>

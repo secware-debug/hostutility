@@ -18,6 +18,13 @@
 
 static InterceptionContext g_ctx = NULL;
 
+/* Last normalized absolute mouse position (0..65535) for button/wheel strokes.
+ * Some Interception/driver setups ignore button/wheel strokes when x/y are zero
+ * or when stroke flags don't match the device expectation. */
+static int g_last_nx = 0;
+static int g_last_ny = 0;
+static int g_has_last_pos = 0;
+
 static unsigned short vk_to_scan(unsigned char vk, int* out_extended) {
     UINT sc = MapVirtualKeyExA(vk, MAPVK_VK_TO_VSC_EX, NULL);
     *out_extended = (sc >> 8) & 0x01;
@@ -63,6 +70,10 @@ void remote_input_interception_mouse_move(int px, int py) {
     if (ny < 0) ny = 0;
     if (ny > 65535) ny = 65535;
 
+    g_last_nx = nx;
+    g_last_ny = ny;
+    g_has_last_pos = 1;
+
     InterceptionMouseStroke ms = { 0 };
     ms.state = 0;
     ms.flags = INTERCEPTION_MOUSE_MOVE_ABSOLUTE | INTERCEPTION_MOUSE_VIRTUAL_DESKTOP;
@@ -73,7 +84,7 @@ void remote_input_interception_mouse_move(int px, int py) {
     interception_send(g_ctx, DEF_MOU, (const InterceptionStroke*)&ms, 1);
 }
 
-void remote_input_interception_mouse_button(int button, int down) {
+int remote_input_interception_mouse_button(int button, int down) {
     if (!g_ctx) return;
     unsigned short state = 0;
     if (button == 0) state = down ? INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN : INTERCEPTION_MOUSE_LEFT_BUTTON_UP;
@@ -83,24 +94,31 @@ void remote_input_interception_mouse_button(int button, int down) {
 
     InterceptionMouseStroke ms = { 0 };
     ms.state = state;
-    ms.flags = INTERCEPTION_MOUSE_MOVE_RELATIVE;
+    // Use absolute coordinates for button strokes (more reliable across systems).
+    ms.flags = INTERCEPTION_MOUSE_MOVE_ABSOLUTE | INTERCEPTION_MOUSE_VIRTUAL_DESKTOP;
     ms.rolling = 0;
-    ms.x = 0;
-    ms.y = 0;
+    ms.x = g_has_last_pos ? g_last_nx : 0;
+    ms.y = g_has_last_pos ? g_last_ny : 0;
     ms.information = 0;
-    interception_send(g_ctx, DEF_MOU, (const InterceptionStroke*)&ms, 1);
+    int sent = interception_send(g_ctx, DEF_MOU, (const InterceptionStroke*)&ms, 1);
+    remote_log("[interception] mouse_button button=%d down=%d state=0x%X flags=0x%X x=%d y=%d sent=%d",
+        button, down, (unsigned int)state, (unsigned int)ms.flags, ms.x, ms.y, sent);
+    return sent;
 }
 
-void remote_input_interception_mouse_wheel(int delta) {
+int remote_input_interception_mouse_wheel(int delta) {
     if (!g_ctx) return;
     InterceptionMouseStroke ms = { 0 };
     ms.state = INTERCEPTION_MOUSE_WHEEL;
-    ms.flags = INTERCEPTION_MOUSE_MOVE_RELATIVE;
+    ms.flags = INTERCEPTION_MOUSE_MOVE_ABSOLUTE | INTERCEPTION_MOUSE_VIRTUAL_DESKTOP;
     ms.rolling = (short)delta;
-    ms.x = 0;
-    ms.y = 0;
+    ms.x = g_has_last_pos ? g_last_nx : 0;
+    ms.y = g_has_last_pos ? g_last_ny : 0;
     ms.information = 0;
-    interception_send(g_ctx, DEF_MOU, (const InterceptionStroke*)&ms, 1);
+    int sent = interception_send(g_ctx, DEF_MOU, (const InterceptionStroke*)&ms, 1);
+    remote_log("[interception] mouse_wheel delta=%d state=0x%X flags=0x%X x=%d y=%d sent=%d",
+        delta, (unsigned int)ms.state, (unsigned int)ms.flags, ms.x, ms.y, sent);
+    return sent;
 }
 
 void remote_input_interception_key(unsigned char vk, int key_down) {
