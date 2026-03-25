@@ -74,6 +74,7 @@ namespace Quasar.Server.Forms
             this.statusStrip = new System.Windows.Forms.StatusStrip();
             this.listenToolStripStatusLabel = new System.Windows.Forms.ToolStripStatusLabel();
             this.lstClients = new Quasar.Server.Controls.AeroListView();
+            this.hHit = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hAcceptPing = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hIP = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
             this.hTag = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
@@ -710,6 +711,7 @@ namespace Quasar.Server.Forms
             this.lstClients.Columns.AddRange(new System.Windows.Forms.ColumnHeader[] {
             this.hUuid,
             this.hStatus,
+            this.hHit,
             this.hAcceptPing,
             this.hInstallTimeUtc,
             this.hLastPingTimeUtc,
@@ -765,6 +767,12 @@ namespace Quasar.Server.Forms
             this.hStatus.Text = "Status";
             this.hStatus.TextAlign = System.Windows.Forms.HorizontalAlignment.Center;
             this.hStatus.Width = 90;
+            // 
+            // hHit
+            // 
+            this.hHit.Text = "Hit";
+            this.hHit.TextAlign = System.Windows.Forms.HorizontalAlignment.Center;
+            this.hHit.Width = 90;
             // 
             // hCountry
             // 
@@ -887,6 +895,7 @@ namespace Quasar.Server.Forms
         private System.Windows.Forms.ImageList imgFlags;
         private System.Windows.Forms.ToolStripMenuItem systemToolStripMenuItem;
         private System.Windows.Forms.ColumnHeader hStatus;
+        private System.Windows.Forms.ColumnHeader hHit;
         private System.Windows.Forms.ToolStripMenuItem uninstallToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem deleteFromDbToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem surveillanceToolStripMenuItem;

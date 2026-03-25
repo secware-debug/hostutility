@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS Clients (
     AccountType TEXT,
     ImageIndex INTEGER,
     InstallTimeUtc TEXT NOT NULL,
-    LastPingTimeUtc TEXT NULL
+    LastPingTimeUtc TEXT NULL,
+    HitState TEXT NOT NULL DEFAULT 'Viewed'
 );";
                         cmd.ExecuteNonQuery();
 
@@ -98,6 +99,30 @@ WHERE name = 'AcceptPing';";
                                     addCmd.ExecuteNonQuery();
                                 }
                             }
+                        }
+
+                        using (var alterHitCmd = conn.CreateCommand())
+                        {
+                            alterHitCmd.CommandText = @"
+SELECT COUNT(*)
+FROM pragma_table_info('Clients')
+WHERE name = 'HitState';";
+                            var hitScalar = alterHitCmd.ExecuteScalar();
+                            long hitCount = (hitScalar == null || hitScalar == DBNull.Value) ? 0 : Convert.ToInt64(hitScalar);
+                            if (hitCount == 0)
+                            {
+                                using (var addHit = conn.CreateCommand())
+                                {
+                                    addHit.CommandText = @"ALTER TABLE Clients ADD COLUMN HitState TEXT NOT NULL DEFAULT 'Viewed';";
+                                    addHit.ExecuteNonQuery();
+                                }
+                            }
+                        }
+
+                        using (var normHitCmd = conn.CreateCommand())
+                        {
+                            normHitCmd.CommandText = @"UPDATE Clients SET HitState = 'Viewed' WHERE HitState = 'Viewed.';";
+                            normHitCmd.ExecuteNonQuery();
                         }
                     }
                 }
@@ -198,7 +223,7 @@ WHERE name = 'AcceptPing';";
 SELECT
     Uuid, IpAddress, Tag, UserPc, Version, Status, UserStatus, AcceptPing,
     Country, CountryCode, OperatingSystem, AccountType,
-    ImageIndex, InstallTimeUtc, LastPingTimeUtc
+    ImageIndex, InstallTimeUtc, LastPingTimeUtc, HitState
 FROM Clients
 ORDER BY InstallTimeUtc ASC;";
 
@@ -223,7 +248,8 @@ ORDER BY InstallTimeUtc ASC;";
                                 AccountType = reader.IsDBNull(11) ? "" : reader.GetString(11),
                                 ImageIndex = reader.IsDBNull(12) ? 0 : reader.GetInt32(12),
                                 InstallTimeUtc = ParseNullableUtc(reader.IsDBNull(13) ? null : reader.GetString(13)),
-                                LastPingTimeUtc = ParseNullableUtc(reader.IsDBNull(14) ? null : reader.GetString(14))
+                                LastPingTimeUtc = ParseNullableUtc(reader.IsDBNull(14) ? null : reader.GetString(14)),
+                                HitState = NormalizeHitState(reader.IsDBNull(15) ? null : reader.GetString(15))
                                 };
 
                                 result.Add(row);
@@ -264,6 +290,57 @@ GROUP BY Uuid;";
                 }
             }
             return d;
+        }
+
+        /// <summary>Stored values: "Pending" or "Viewed" (default).</summary>
+        public static string NormalizeHitState(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return "Viewed";
+            string t = value.Trim();
+            if (string.Equals(t, "Pending", StringComparison.OrdinalIgnoreCase)) return "Pending";
+            /* Legacy "Viewed." → "Viewed"; any other non-Pending value → "Viewed". */
+            if (string.Equals(t, "Viewed.", StringComparison.OrdinalIgnoreCase)) return "Viewed";
+            return "Viewed";
+        }
+
+        public string GetClientHitState(string uuid)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return "Viewed";
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"SELECT HitState FROM Clients WHERE Uuid = @uuid;";
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        var scalar = cmd.ExecuteScalar();
+                        if (scalar == null || scalar == DBNull.Value) return "Viewed";
+                        return NormalizeHitState(Convert.ToString(scalar));
+                    }
+                }
+            }
+        }
+
+        public void SetClientHitState(string uuid, string hitState)
+        {
+            if (string.IsNullOrWhiteSpace(uuid)) return;
+            string v = NormalizeHitState(hitState);
+            lock (_sync)
+            {
+                using (var conn = new SqliteConnection(_connectionString))
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = @"UPDATE Clients SET HitState = @v WHERE Uuid = @uuid;";
+                        cmd.Parameters.AddWithValue("@v", v);
+                        cmd.Parameters.AddWithValue("@uuid", uuid);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
         }
 
         private static DateTime? ParseNullableUtc(string iso)
@@ -362,7 +439,8 @@ ON CONFLICT(Uuid) DO UPDATE SET
                             AccountType = accountType ?? "",
                             ImageIndex = imageIndex,
                             InstallTimeUtc = existingInstallUtc,
-                            LastPingTimeUtc = existingLastPingUtc
+                            LastPingTimeUtc = existingLastPingUtc,
+                            HitState = "Viewed"
                         };
                     }
                 }
@@ -832,6 +910,8 @@ ON CONFLICT(Name) DO UPDATE SET
         public int ImageIndex { get; set; }
         public DateTime? InstallTimeUtc { get; set; }
         public DateTime? LastPingTimeUtc { get; set; }
+        /// <summary>"Pending" or "Viewed"</summary>
+        public string HitState { get; set; } = "Viewed";
     }
 
     public sealed class TagRow
