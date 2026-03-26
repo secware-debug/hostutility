@@ -269,6 +269,28 @@ int remote_transport_poll_read(remote_transport_handle_t h, unsigned int timeout
     if (t->available > 0) return 1; /* already decrypted bytes pending */
     if (t->received > 0) return 1;  /* encrypted bytes buffered, DecryptMessage may consume */
 
+    /* Prefer WSAPoll over select: some VPN/proxy products hook select() and can recurse/overflow. */
+    {
+        static FARPROC s_wsapoll = NULL;
+        static int s_wsapoll_inited = 0;
+        if (!s_wsapoll_inited) {
+            HMODULE hWs2 = GetModuleHandleW(L"ws2_32.dll");
+            if (hWs2) s_wsapoll = GetProcAddress(hWs2, "WSAPoll");
+            s_wsapoll_inited = 1;
+        }
+        if (s_wsapoll) {
+            typedef int (WSAAPI *PFN_WSAPoll)(LPWSAPOLLFD, ULONG, INT);
+            WSAPOLLFD pfd;
+            pfd.fd = t->sock;
+            pfd.events = POLLRDNORM;
+            pfd.revents = 0;
+            int r = ((PFN_WSAPoll)s_wsapoll)(&pfd, 1, (INT)timeout_ms);
+            if (r > 0 && (pfd.revents & (POLLRDNORM | POLLIN))) return 1;
+            if (r == 0) return 0;
+            return -1;
+        }
+    }
+
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(t->sock, &rfds);
