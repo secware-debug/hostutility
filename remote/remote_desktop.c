@@ -81,6 +81,46 @@ void remote_desktop_get_monitor_bounds(int display_index, int* out_x, int* out_y
     *out_height = r.height;
 }
 
+static int  g_virt_x = 0, g_virt_y = 0, g_virt_w = 0, g_virt_h = 0;
+static DWORD g_virt_tick = 0;
+#define VIRT_CACHE_MS 5000
+
+void remote_desktop_get_virtual_bounds(int* out_x, int* out_y, int* out_w, int* out_h) {
+    if (!out_x || !out_y || !out_w || !out_h) return;
+    DWORD now = GetTickCount();
+    if (g_virt_w > 0 && g_virt_h > 0 && (now - g_virt_tick) < VIRT_CACHE_MS) {
+        *out_x = g_virt_x; *out_y = g_virt_y;
+        *out_w = g_virt_w;  *out_h = g_virt_h;
+        return;
+    }
+    g_monitor_count = 0;
+    EnumDisplayMonitors(NULL, NULL, enum_monitor_collect, 0);
+    ensure_monitors_sorted();
+    if (g_monitor_count <= 0) {
+        g_virt_x = 0; g_virt_y = 0;
+        g_virt_w = (int)GetSystemMetrics(SM_CXSCREEN);
+        g_virt_h = (int)GetSystemMetrics(SM_CYSCREEN);
+    } else {
+        int minx = g_monitors[0].rect.x, miny = g_monitors[0].rect.y;
+        int maxx = minx + (int)g_monitors[0].rect.width;
+        int maxy = miny + (int)g_monitors[0].rect.height;
+        for (int i = 1; i < g_monitor_count; i++) {
+            int lx = g_monitors[i].rect.x, ly = g_monitors[i].rect.y;
+            int rx = lx + (int)g_monitors[i].rect.width;
+            int ry = ly + (int)g_monitors[i].rect.height;
+            if (lx < minx) minx = lx;
+            if (ly < miny) miny = ly;
+            if (rx > maxx) maxx = rx;
+            if (ry > maxy) maxy = ry;
+        }
+        g_virt_x = minx; g_virt_y = miny;
+        g_virt_w = maxx - minx; g_virt_h = maxy - miny;
+    }
+    g_virt_tick = now;
+    *out_x = g_virt_x; *out_y = g_virt_y;
+    *out_w = g_virt_w;  *out_h = g_virt_h;
+}
+
 static void scale_to_max(unsigned int* w, unsigned int* h) {
     unsigned int width = *w, height = *h;
     if (width <= REMOTE_DESKTOP_MAX_WIDTH && height <= REMOTE_DESKTOP_MAX_HEIGHT) return;

